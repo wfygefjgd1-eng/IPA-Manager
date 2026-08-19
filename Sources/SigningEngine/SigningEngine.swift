@@ -28,13 +28,17 @@ final class SigningEngine: SigningEngineProtocol {
         // 若直接进入导出流程，zsign 桥接层会报 "Input file not found" 这类不友好的英文错误。
         // 在导出/签名任何操作之前先校验源文件是否存在，给出友好中文提示。
         guard FileManager.default.fileExists(atPath: sourcePath) else {
-            throw AppError.signFailed("源文件已被删除或移动，请返回列表重新导入该应用后再签名")
+            let reason = "源文件已被删除或移动，请返回列表重新导入该应用后再签名"
+            Logger.error("签名失败: \(reason)")
+            throw AppError.signFailed(reason)
         }
 
         Logger.info("开始签名: \(sourcePath)")
 
         guard let keychainID = certificate.keychainIdentifier else {
-            throw AppError.signFailed("证书缺少 Keychain 标识")
+            let reason = "证书缺少 Keychain 标识"
+            Logger.error("签名失败: \(reason)")
+            throw AppError.signFailed(reason)
         }
 
         let certPassword = certManager.readPassword(for: certificate) ?? ""
@@ -95,6 +99,7 @@ final class SigningEngine: SigningEngineProtocol {
 
         if result != 0 {
             let message = zsign_last_error().map { String(cString: $0) } ?? "未知错误"
+            Logger.error("签名失败: \(sourcePath) - \(message)")
             throw AppError.signFailed(message)
         }
 
@@ -107,7 +112,9 @@ final class SigningEngine: SigningEngineProtocol {
     /// iOS 静态 OpenSSL 对 PBES2/AES p12 的 PKCS12_parse 可能失败，而系统实现可靠。
     private func exportPrivateKeyPEM(from p12URL: URL, password: String) throws -> URL {
         guard let data = try? Data(contentsOf: p12URL) else {
-            throw AppError.signFailed("无法读取证书数据")
+            let reason = "无法读取证书数据"
+            Logger.error("导出 PEM 私钥失败: \(reason)")
+            throw AppError.signFailed(reason)
         }
 
         let options: [String: Any] = [
@@ -119,18 +126,24 @@ final class SigningEngine: SigningEngineProtocol {
               let array = items as? [[String: Any]],
               let first = array.first,
               let rawIdentity = first[kSecImportItemIdentity as String] else {
-            throw AppError.signFailed("系统无法解析此证书 (错误码 \(status))")
+            let reason = "系统无法解析此证书 (错误码 \(status))"
+            Logger.error("导出 PEM 私钥失败: \(reason)")
+            throw AppError.signFailed(reason)
         }
         let identity = rawIdentity as! SecIdentity
 
         var privateKey: SecKey?
         let keyStatus = SecIdentityCopyPrivateKey(identity, &privateKey)
         guard keyStatus == errSecSuccess, let key = privateKey else {
-            throw AppError.signFailed("证书中未找到私钥")
+            let reason = "证书中未找到私钥"
+            Logger.error("导出 PEM 私钥失败: \(reason)")
+            throw AppError.signFailed(reason)
         }
 
         guard let keyData = SecKeyCopyExternalRepresentation(key, nil) as Data? else {
-            throw AppError.signFailed("无法导出私钥")
+            let reason = "无法导出私钥"
+            Logger.error("导出 PEM 私钥失败: \(reason)")
+            throw AppError.signFailed(reason)
         }
 
         // ECC 私钥是 SEC1 格式（BEGIN EC PRIVATE KEY）；RSA 是 PKCS#1 格式（BEGIN RSA PRIVATE KEY）
@@ -172,7 +185,13 @@ final class SigningEngine: SigningEngineProtocol {
 
         let outputURL = URL(fileURLWithPath: NSTemporaryDirectory())
             .appendingPathComponent("sign-key-\(UUID().uuidString).pem")
-        try pem.write(to: outputURL, atomically: true, encoding: .utf8)
+        do {
+            try pem.write(to: outputURL, atomically: true, encoding: .utf8)
+        } catch {
+            let reason = "无法写入 PEM 私钥文件 (\(error.localizedDescription))"
+            Logger.error("导出 PEM 私钥失败: \(reason)")
+            throw AppError.signFailed(reason)
+        }
         Logger.info("已导出 PEM 私钥: \(isEC ? "ECC" : isRSA ? "RSA" : "PKCS8")")
         return outputURL
     }

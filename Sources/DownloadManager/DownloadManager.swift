@@ -23,7 +23,14 @@ final class DownloadManager: NSObject {
         super.init()
         let configuration = URLSessionConfiguration.default
         configuration.allowsCellularAccess = true
-        configuration.timeoutIntervalForRequest = 60
+        // GitHub releases 等站点对不带浏览器标识的请求会返回 HTML/错误页或 403，
+        // 这就是下载到的"文件损坏"（实际是网页）的根因。补上完整浏览器 UA + 常规请求头。
+        configuration.timeoutIntervalForRequest = 120
+        configuration.httpAdditionalHeaders = [
+            "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8"
+        ]
         session = URLSession(configuration: configuration, delegate: self, delegateQueue: .main)
 
         // 启动时恢复上次持久化的下载任务。放到下一 runloop 执行，避免在 init 阶段
@@ -131,6 +138,7 @@ final class DownloadManager: NSObject {
                 // 下载到的是网页而非文件（404 / 重定向错误页 / 拦截页）
                 updated.status = .failed
                 updated.error = "下载到的是网页而非文件（可能链接失效或被拦截），请检查链接后重试"
+                Logger.error("下载校验失败: \(updated.error ?? "")")
                 try? AppFileManager.shared.deleteItem(at: destination)
                 retryableFailure = true
             case .other:
@@ -141,12 +149,14 @@ final class DownloadManager: NSObject {
                 } else {
                     updated.error = "下载的文件无法识别，可能已损坏"
                 }
+                Logger.error("下载校验失败: \(updated.error ?? "")")
                 try? AppFileManager.shared.deleteItem(at: destination)
                 retryableFailure = true
             }
         } catch {
             updated.status = .failed
             updated.error = error.localizedDescription
+            Logger.error("下载文件移动失败: \(error.localizedDescription)")
         }
 
         tasks.removeValue(forKey: id)
@@ -251,6 +261,7 @@ extension DownloadManager: URLSessionDownloadDelegate {
         guard let id = tasks.first(where: { $0.value == task })?.key else { return }
         taskModels[id]?.status = .failed
         taskModels[id]?.error = error.localizedDescription
+        Logger.error("下载失败: \(error.localizedDescription)")
         tasks.removeValue(forKey: id)
         retryCounts.removeValue(forKey: id)
         persistTasks()

@@ -73,7 +73,42 @@ int zsign_sign(const ZSignOptions* options) {
     // 1. Initialize signing asset (P12 + provisioning profile)
     ZSignAsset zsa;
     if (!zsa.Init(strCertFile, strPKeyFile, strProvFile, strEntitleFile, strPassword, false, true, false)) {
-        g_lastError = "Failed to initialize signing asset. Check certificate or profile.";
+        // Init 失败后逐项排查具体原因：仅依赖 ZSignAsset 的 public 成员/静态方法，
+        // 以及 ZFile::IsFileExists 与 zsign_p12_info，全部为空值安全（不崩溃）。
+        std::string strDiagnostics;
+        std::string strProvContent;
+
+        if (zsa.m_strProvData.empty()) {
+            strDiagnostics += "| 描述文件读取失败（文件不存在或无法读取）";
+        } else if (!ZSignAsset::GetCMSContent(zsa.m_strProvData, strProvContent)) {
+            strDiagnostics += "| 描述文件 CMS 解析失败";
+        } else if (zsa.m_strTeamId.empty()) {
+            strDiagnostics += "| 描述文件缺少 TeamIdentifier";
+        }
+
+        if (!ZFile::IsFileExists(strPKeyFile.c_str())) {
+            strDiagnostics += "| 私钥文件不存在";
+        } else {
+            // zsign_p12_info 成功时会清空 g_lastError，故调用前先暂存、调用后取回；
+            // 其失败返回 -1（格式/打开失败）或 -2（密码/格式错误）前会写入具体原因。
+            std::string strSavedError = g_lastError;
+            ZSignP12Info p12Info;
+            int nP12Ret = zsign_p12_info(strPKeyFile.c_str(), strPassword.c_str(), &p12Info);
+            std::string strP12Reason = g_lastError;
+            g_lastError = strSavedError;
+
+            if (nP12Ret != 0) {
+                std::string strDetail = strP12Reason;
+                if (strDetail.empty()) {
+                    strDetail = (nP12Ret == -2) ? "密码错误或格式不支持" : "证书/私钥文件无效";
+                }
+                strDiagnostics += "| 证书/私钥加载失败：" + strDetail;
+            } else {
+                strDiagnostics += "| 证书与私钥可正常解析";
+            }
+        }
+
+        g_lastError = "签名初始化失败：证书或描述文件无效" + strDiagnostics;
         return -1;
     }
 

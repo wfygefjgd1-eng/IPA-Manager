@@ -12,8 +12,11 @@ enum Logger {
     }
 
     private static let maxEntries = 300
+    private static let maxFailureEntries = 100
     private static let lock = NSLock()
     private(set) static var recentEntries: [LogEntry] = []
+    /// 失败与异常专区：只收集 ERROR / warning（DEFAULT）等非 INFO/DEBUG 的消息，供诊断报告使用。
+    private(set) static var failureEntries: [LogEntry] = []
 
     static func log(_ message: String, level: OSLogType = .info, file: String = #file, line: Int = #line) {
         let fileName = (file as NSString).lastPathComponent
@@ -25,9 +28,17 @@ enum Logger {
 
         lock.lock()
         defer { lock.unlock() }
-        recentEntries.append(LogEntry(timestamp: Date(), level: level.description, message: "[\(fileName):\(line)] \(message)"))
+        let entry = LogEntry(timestamp: Date(), level: level.description, message: "[\(fileName):\(line)] \(message)")
+        recentEntries.append(entry)
         if recentEntries.count > maxEntries {
             recentEntries.removeFirst(recentEntries.count - maxEntries)
+        }
+        // 错误类消息（error / warning，即非 info/debug）自动进入失败专区
+        if level != .info && level != .debug {
+            failureEntries.append(entry)
+            if failureEntries.count > maxFailureEntries {
+                failureEntries.removeFirst(failureEntries.count - maxFailureEntries)
+            }
         }
     }
 
@@ -47,6 +58,11 @@ enum Logger {
         log(message, level: .debug, file: file, line: line)
     }
 
+    /// 记录一条失败信息（等价于 error 级记录，同时进入普通日志与失败专区）。
+    static func recordFailure(_ message: String, file: String = #file, line: Int = #line) {
+        log(message, level: .error, file: file, line: line)
+    }
+
     static func diagnosticsReport() -> String {
         let timestampFormatter = DateFormatter()
         timestampFormatter.dateFormat = "yyyy-MM-dd HH:mm:ss"
@@ -59,32 +75,42 @@ enum Logger {
         let build = bundle?["CFBundleVersion"] as? String ?? "未知"
 
         lock.lock()
-        let entries = Array(recentEntries.suffix(100).reversed())
+        let recent = Array(recentEntries.suffix(100).reversed())
+        let failures = Array(failureEntries.reversed())
         lock.unlock()
 
         var lines: [String] = []
         lines.append("IPA Manager 诊断报告")
-        lines.append("生成时间：\(timestampFormatter.string(from: Date()))")
         lines.append("")
-        lines.append("设备信息")
-        lines.append("型号：\(device.model)")
-        lines.append("系统：\(device.systemName) \(device.systemVersion)")
+        lines.append("===== 基本信息 =====")
+        lines.append("时间：\(timestampFormatter.string(from: Date()))")
+        lines.append("设备型号：\(device.model)")
+        lines.append("系统版本：\(device.systemName) \(device.systemVersion)")
+        lines.append("App 版本：\(version) (构建 \(build))")
         lines.append("")
-        lines.append("App 信息")
-        lines.append("版本：\(version) (\(build))")
-        lines.append("")
-        lines.append("最近日志")
+        lines.append("===== 失败与异常（按时间倒序）=====")
 
-        if entries.isEmpty {
-            lines.append("（无日志记录）")
+        if failures.isEmpty {
+            lines.append("（无失败记录）")
         } else {
-            for entry in entries {
+            for entry in failures {
                 lines.append("[\(timeFormatter.string(from: entry.timestamp))][\(entry.level)] \(entry.message)")
             }
         }
 
         lines.append("")
-        lines.append("由 IPA Manager 诊断功能生成")
+        lines.append("===== 最近日志（最近 100 条含 INFO）=====")
+
+        if recent.isEmpty {
+            lines.append("（无日志记录）")
+        } else {
+            for entry in recent {
+                lines.append("[\(timeFormatter.string(from: entry.timestamp))][\(entry.level)] \(entry.message)")
+            }
+        }
+
+        lines.append("")
+        lines.append("由 IPA Manager 诊断功能导出")
 
         return lines.joined(separator: "\n")
     }

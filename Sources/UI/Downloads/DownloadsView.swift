@@ -3,6 +3,9 @@ import SwiftUI
 struct DownloadsView: View {
     @EnvironmentObject private var appState: AppState
     @State private var showBrowser = false
+    @State private var showBookmarks = false
+    /// 从书签选中后待打开的 URL；为 nil 时浏览器加载默认主页
+    @State private var initialBrowserURL: URL?
     @State private var tasks: [DownloadTask] = []
     @State private var timer: Timer?
     @State private var selectedApp: AppInfo?
@@ -36,15 +39,36 @@ struct DownloadsView: View {
                     }
                 }
                 ToolbarItem(placement: .navigationBarTrailing) {
-                    Button {
-                        showBrowser = true
-                    } label: {
-                        Image(systemName: "safari")
+                    HStack(spacing: 16) {
+                        Button {
+                            showBookmarks = true
+                        } label: {
+                            Image(systemName: "bookmark.fill")
+                        }
+                        Button {
+                            // 直接打开浏览器：清除上次书签跳转遗留的初始 URL
+                            initialBrowserURL = nil
+                            showBrowser = true
+                        } label: {
+                            Image(systemName: "safari")
+                        }
                     }
                 }
             }
             .sheet(isPresented: $showBrowser) {
-                BrowserView()
+                if let url = initialBrowserURL {
+                    BrowserView(initialURL: url)
+                } else {
+                    BrowserView()
+                }
+            }
+            .sheet(isPresented: $showBookmarks) {
+                BookmarkView { url in
+                    // 点书签 → 关闭书签 sheet → 记录待打开 URL → 打开浏览器
+                    initialBrowserURL = url
+                    showBookmarks = false
+                    showBrowser = true
+                }
             }
             .sheet(item: $selectedApp) { app in
                 AppDetailView(app: app)

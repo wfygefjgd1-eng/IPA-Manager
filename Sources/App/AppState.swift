@@ -80,13 +80,13 @@ final class AppState: ObservableObject {
                 case .unknown:
                     let message = "该 ZIP 不是应用包（无 Payload/*.app 结构）也不是证书包（无 .p12/.mobileprovision）"
                     DispatchQueue.main.async {
-                        Logger.error("自动解析失败: \(message)")
+                        Logger.error("自动解析失败: \(url.lastPathComponent) - \(message)")
                         completion?(.failure(AppError.operationFailed(message)))
                     }
                 }
             } catch {
                 DispatchQueue.main.async {
-                    Logger.error("自动解析失败: \(error.localizedDescription)")
+                    Logger.error("自动解析失败: \(url.lastPathComponent) - \(error.localizedDescription)")
                     completion?(.failure(error))
                 }
             }
@@ -117,6 +117,7 @@ final class AppState: ObservableObject {
             // 透传 ZipManager 的 ZipError（errorDescription 已是中文，区分“非 zip / 网页错误页 / 损坏不完整”）：
             // “该文件不是有效的 ZIP 压缩包” / “下载到的是网页而不是文件（…）” /
             // “ZIP 文件已损坏或下载不完整，请删除后重新下载”
+            Logger.error("压缩包分类失败: \(url.lastPathComponent) - \(error.localizedDescription)")
             throw error
         }
 
@@ -142,6 +143,8 @@ final class AppState: ObservableObject {
 
         if hasCertificate { return .certificateBundle }
         if hasAppBundle { return .appPackage }
+        // 压缩包能正常解压但内部既无 .app 也无证书结构 → 未知类型（下游会报“不是应用包也不是证书包”）
+        Logger.error("压缩包分类失败: \(url.lastPathComponent) - 压缩包内未发现 .app（应用包）或 .p12/.pfx/.mobileprovision（证书包）结构")
         return .unknown
     }
 

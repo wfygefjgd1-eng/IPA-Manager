@@ -18,9 +18,9 @@ struct SettingsView: View {
                         reportToShare = Logger.diagnosticsReport()
                         showShare = true
                     } label: {
-                        Label("收集失败信息并导出", systemImage: "ant.circle")
+                        Label("收集全部错误并导出", systemImage: "ant.circle")
                     }
-                    Text("导出后可直接发送给开发者排查问题")
+                    Text("导出 ZIP/签名/安装等失败原因，直接发送给开发者")
                         .font(.footnote)
                         .foregroundColor(.secondary)
                 }

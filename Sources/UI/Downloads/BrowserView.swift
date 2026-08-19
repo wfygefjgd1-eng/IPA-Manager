@@ -4,13 +4,22 @@ import WebKit
 struct BrowserView: View {
     @Environment(\.dismiss) private var dismiss
     @EnvironmentObject private var appState: AppState
-    @State private var urlString = "https://github.com"
+    @State private var urlString: String
     @State private var isLoading = false
     @State private var canGoBack = false
     @State private var canGoForward = false
     @State private var showBookmarks = false
     @State private var showToast = false
     @State private var toastMessage = ""
+
+    /// 外部传入的初始 URL（例如从书签跳转）；为 nil 时加载默认主页。
+    let initialURL: URL?
+
+    init(initialURL: URL? = nil) {
+        self.initialURL = initialURL
+        // 有 initialURL 就作为初始页，否则回落到默认主页
+        _urlString = State(initialValue: initialURL?.absoluteString ?? "https://github.com")
+    }
 
     var body: some View {
         NavigationView {
