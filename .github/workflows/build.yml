@@ -55,16 +55,15 @@ jobs:
           make -j4 build_libs || make build_libs
           make install_dev
 
-          # Combine into xcframework (device arm64 + simulator arm64)
+          # Copy static libs and headers for SDK-conditional linking
           mkdir -p "$GITHUB_WORKSPACE/Vendor/openssl/include"
+          mkdir -p "$GITHUB_WORKSPACE/Vendor/openssl/lib"
           cp -R "$OUTDIR/device/include/openssl" "$GITHUB_WORKSPACE/Vendor/openssl/include/openssl"
-
-          xcodebuild -create-xcframework \
-            -library "$OUTDIR/device/lib/libcrypto.a" -headers "$GITHUB_WORKSPACE/Vendor/openssl/include" \
-            -library "$OUTDIR/device/lib/libssl.a" \
-            -library "$OUTDIR/sim-arm64/lib/libcrypto.a" -headers "$GITHUB_WORKSPACE/Vendor/openssl/include" \
-            -library "$OUTDIR/sim-arm64/lib/libssl.a" \
-            -output "$GITHUB_WORKSPACE/Vendor/openssl/openssl.xcframework"
+          cp "$OUTDIR/device/lib/libcrypto.a" "$GITHUB_WORKSPACE/Vendor/openssl/lib/libcrypto-device.a"
+          cp "$OUTDIR/device/lib/libssl.a" "$GITHUB_WORKSPACE/Vendor/openssl/lib/libssl-device.a"
+          cp "$OUTDIR/sim-arm64/lib/libcrypto.a" "$GITHUB_WORKSPACE/Vendor/openssl/lib/libcrypto-sim.a"
+          cp "$OUTDIR/sim-arm64/lib/libssl.a" "$GITHUB_WORKSPACE/Vendor/openssl/lib/libssl-sim.a"
+          echo "OpenSSL libs ready"
 
       - name: Generate Xcode Project
         run: xcodegen generate
