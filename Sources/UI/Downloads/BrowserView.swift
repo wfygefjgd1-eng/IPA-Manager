@@ -45,7 +45,7 @@ struct BrowserView: View {
                     Button {
                         addCurrentPageToBookmarks()
                     } label: {
-                        Image(systemName: "bookmark.badge.plus")
+                        Image(systemName: "plus")
                     }
                 }
             }
@@ -64,6 +64,23 @@ struct BrowserView: View {
                 }
             } message: {
                 Text(pendingDownloadURL?.absoluteString ?? "")
+            }
+            // 轻提示：收藏当前页面等操作结果
+            .overlay(alignment: .bottom) {
+                if showToast {
+                    Text(toastMessage)
+                        .font(.footnote)
+                        .padding(.horizontal, 16)
+                        .padding(.vertical, 8)
+                        .background(Capsule().fill(Color.black.opacity(0.75)))
+                        .foregroundColor(.white)
+                        .padding(.bottom, 20)
+                        .transition(.opacity)
+                }
+            }
+            .animation(.easeInOut(duration: 0.25), value: showToast)
+            .onAppear {
+                showToast = false
             }
         }
     }
@@ -126,7 +143,7 @@ struct BrowserView: View {
 
     private func addCurrentPageToBookmarks() {
         let ok = BookmarkStore.shared.addCurrentPage(urlString)
-        toastMessage = ok ? "已收藏当前页面" : "当前页面无法收藏"
+        toastMessage = ok ? "已添加到我的书签" : "当前页面无法收藏"
         showToast = true
         DispatchQueue.main.asyncAfter(deadline: .now() + 2) {
             showToast = false
@@ -157,10 +174,11 @@ private struct WebView: UIViewRepresentable {
         webView.allowsBackForwardNavigationGestures = true
 
         if let url = URL(string: url) {
+            context.coordinator.currentURL = url
             webView.load(URLRequest(url: url))
         }
 
-        subscribeActions(for: webView, context: context)
+        context.coordinator.attach(webView: webView)
         return webView
     }
 
@@ -175,45 +193,71 @@ private struct WebView: UIViewRepresentable {
         Coordinator(parent: self)
     }
 
-    private func subscribeActions(for webView: WKWebView, context: Context) {
-        NotificationCenter.default.addObserver(
-            context.coordinator,
-            selector: #selector(Coordinator.goBack),
-            name: .browserGoBack,
-            object: nil
-        )
-        NotificationCenter.default.addObserver(
-            context.coordinator,
-            selector: #selector(Coordinator.goForward),
-            name: .browserGoForward,
-            object: nil
-        )
-        NotificationCenter.default.addObserver(
-            context.coordinator,
-            selector: #selector(Coordinator.openInBrowser),
-            name: .browserOpenBrowser,
-            object: nil
-        )
-    }
-
     class Coordinator: NSObject, WKNavigationDelegate, WKUIDelegate {
         var parent: WebView
         weak var webView: WKWebView?
         var currentURL: URL?
 
+        /// block 版 NotificationCenter 观察者 token，deinit 时统一移除，避免悬垂指针
+        private var notificationTokens: [NSObjectProtocol] = []
+
         init(parent: WebView) {
             self.parent = parent
         }
 
-        @objc func goBack() {
+        deinit {
+            for token in notificationTokens {
+                NotificationCenter.default.removeObserver(token)
+            }
+            notificationTokens.removeAll()
+        }
+
+        /// 绑定 webView 并注册通知（幂等，重复调用不会重复注册）
+        func attach(webView: WKWebView) {
+            self.webView = webView
+            subscribeActions()
+        }
+
+        private func subscribeActions() {
+            guard notificationTokens.isEmpty else { return }
+            notificationTokens.append(
+                NotificationCenter.default.addObserver(
+                    forName: .browserGoBack,
+                    object: nil,
+                    queue: .main
+                ) { [weak self] _ in
+                    self?.goBack()
+                }
+            )
+            notificationTokens.append(
+                NotificationCenter.default.addObserver(
+                    forName: .browserGoForward,
+                    object: nil,
+                    queue: .main
+                ) { [weak self] _ in
+                    self?.goForward()
+                }
+            )
+            notificationTokens.append(
+                NotificationCenter.default.addObserver(
+                    forName: .browserOpenBrowser,
+                    object: nil,
+                    queue: .main
+                ) { [weak self] _ in
+                    self?.openInBrowser()
+                }
+            )
+        }
+
+        func goBack() {
             webView?.goBack()
         }
 
-        @objc func goForward() {
+        func goForward() {
             webView?.goForward()
         }
 
-        @objc func openInBrowser() {
+        func openInBrowser() {
             guard let url = webView?.url else { return }
             UIApplication.shared.open(url)
         }
@@ -255,7 +299,7 @@ private struct WebView: UIViewRepresentable {
 
             let urlStr = url.absoluteString.lowercased()
             let ext = url.pathExtension.lowercased()
-            let isDownloadExt = ext == "ipa" || ext == "zip" || ext == "tar" || ext == "tar.gz" || ext == "apk"
+            let isDownloadExt = ext == "ipa" || ext == "zip" || ext == "tar" || ext == "apk" || urlStr.hasSuffix(".tar.gz")
             let isReleaseDownload = urlStr.contains("releases/download")
             let isNewWindow = navigationAction.targetFrame == nil
 
@@ -297,7 +341,7 @@ private struct WebView: UIViewRepresentable {
             if let url = navigationAction.request.url {
                 let urlStr = url.absoluteString.lowercased()
                 let ext = url.pathExtension.lowercased()
-                let isDownload = ext == "ipa" || ext == "zip" || ext == "tar" || ext == "tar.gz" || urlStr.contains("releases/download")
+                let isDownload = ext == "ipa" || ext == "zip" || ext == "tar" || urlStr.hasSuffix(".tar.gz") || urlStr.contains("releases/download")
                 if isDownload {
                     parent.onDownloadDetected(url)
                     return nil

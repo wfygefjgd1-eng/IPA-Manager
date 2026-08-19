@@ -7,6 +7,7 @@ struct DownloadsView: View {
     @State private var timer: Timer?
     @State private var selectedApp: AppInfo?
     @State private var showUnrecognizedAlert = false
+    @State private var unrecognizedMessage = ""
 
     var body: some View {
         NavigationView {
@@ -41,7 +42,7 @@ struct DownloadsView: View {
             .alert("无法识别", isPresented: $showUnrecognizedAlert) {
                 Button("好", role: .cancel) {}
             } message: {
-                Text("文件已下载，但未能识别为可签名应用")
+                Text(unrecognizedMessage)
             }
             .onAppear {
                 refreshTasks()
@@ -49,6 +50,10 @@ struct DownloadsView: View {
             }
             .onDisappear {
                 stopTimer()
+            }
+            .onChange(of: appState.importedApps) { _ in
+                // 自动导入完成（importedApps 更新）后立刻刷新，及时呈现可点击状态
+                refreshTasks()
             }
         }
     }
@@ -117,6 +122,7 @@ struct DownloadsView: View {
             if let app = matchedApp(for: task) {
                 selectedApp = app
             } else {
+                unrecognizedMessage = unrecognizedReason(for: task)
                 showUnrecognizedAlert = true
             }
         }
@@ -124,12 +130,40 @@ struct DownloadsView: View {
 
     private func matchedApp(for task: DownloadTask) -> AppInfo? {
         let fileName = task.fileName
+        let baseName = (fileName as NSString).deletingPathExtension
+
         return appState.importedApps.first { app in
+            // 1) 优先：导入后应用路径与任务目标路径一致 → 直接命中
             if !task.destinationPath.isEmpty, app.path == task.destinationPath {
                 return true
             }
-            let appPathName = (app.path as NSString).lastPathComponent
-            return app.name == fileName || appPathName == fileName
+            // 2) 文件名（原始 + 去扩展名）与 app.name 比较
+            if app.name == fileName || app.name == baseName {
+                return true
+            }
+            // 3) 与 app.path 的 lastPathComponent（原始 + 去扩展名）比较
+            let appPathLast = (app.path as NSString).lastPathComponent
+            let appPathBase = (appPathLast as NSString).deletingPathExtension
+            return appPathLast == fileName || appPathBase == baseName
+        }
+    }
+
+    /// 已 completed 但未匹配到已导入应用时，给出具体导入失败原因而非笼统的“无法识别”。
+    private func unrecognizedReason(for task: DownloadTask) -> String {
+        let path = task.destinationPath
+        let exists = !path.isEmpty && FileManager.default.fileExists(atPath: path)
+
+        if !exists {
+            return "文件已下载，但目标文件不存在（可能已被移动或清理）。可重新下载后再试。"
+        }
+
+        switch (path as NSString).pathExtension.lowercased() {
+        case "zip":
+            return "自动导入失败：该文件为 ZIP，需按证书包（.p12 / .mobileprovision）处理，目前未识别为可签名应用。"
+        case "ipa":
+            return "自动导入失败：IPA 解析未生成应用记录，文件可能损坏或不是有效的 IPA 包，可重新下载验证。"
+        default:
+            return "自动导入失败：无法将“\(task.fileName)”识别为可签名应用（文件已存在但解析失败）。"
         }
     }
 
@@ -151,7 +185,12 @@ struct DownloadsView: View {
     }
 
     private func refreshTasks() {
-        tasks = DownloadManager.shared.snapshotTasks()
+        // 排序保证顺序稳定；仅当快照确实变化时才替换数组，避免 0.5s 轮询造成无谓重绘
+        let snapshot = DownloadManager.shared.snapshotTasks()
+            .sorted { $0.createdAt < $1.createdAt }
+        if snapshot != tasks {
+            tasks = snapshot
+        }
     }
 
     private func startTimer() {

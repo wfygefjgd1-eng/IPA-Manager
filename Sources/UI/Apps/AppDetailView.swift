@@ -12,6 +12,31 @@ struct AppDetailView: View {
     @State private var alertMessage = ""
     @State private var isSigning = false
     @State private var signProgress: Double = 0
+    /// 本次会话中签名完成后的输出路径，用于在详情页实时反映“已签名”状态
+    @State private var signedOutputPath: String?
+
+    /// 展示层使用的“实时”AppInfo：
+    /// - 签名刚完成 → 以签名输出为准（合并原快照的元数据，isSigned = true，path 指向签名产物）；
+    /// - 否则优先 importedApps 中 id 相同的最新副本，其次 installedApps 中 path 相同的条目；
+    /// - 兜底使用传入快照。
+    private var liveApp: AppInfo {
+        if let signedPath = signedOutputPath,
+           let installed = appState.installedApps.first(where: { $0.path == signedPath }) {
+            var merged = app
+            merged.isSigned = true
+            merged.path = installed.path
+            merged.signedPath = installed.path
+            merged.size = installed.size
+            return merged
+        }
+        if let imported = appState.importedApps.first(where: { $0.id == app.id }) {
+            return imported
+        }
+        if let installed = appState.installedApps.first(where: { $0.path == app.path }) {
+            return installed
+        }
+        return app
+    }
 
     var body: some View {
         NavigationView {
@@ -47,7 +72,7 @@ struct AppDetailView: View {
             .sheet(isPresented: $showInstallCertificatePicker) {
                 InstallCertificatePicker { cert in
                     do {
-                        try appState.installApp(app, certificate: cert)
+                        try appState.installApp(liveApp, certificate: cert)
                         alertMessage = "安装请求已发出"
                     } catch {
                         alertMessage = error.localizedDescription
@@ -56,9 +81,8 @@ struct AppDetailView: View {
                 }
             }
             .sheet(isPresented: $showShareSheet) {
-                if let url = URL(string: app.path) {
-                    ShareSheet(items: [url])
-                }
+                // 用 fileURLWithPath 构造 URL，避免路径含空格/中文时分享失效
+                ShareSheet(items: [URL(fileURLWithPath: liveApp.path)])
             }
             .alert("提示", isPresented: $showAlert) {
                 Button("确定", role: .cancel) {}
@@ -70,14 +94,14 @@ struct AppDetailView: View {
 
     private var headerSection: some View {
         VStack(spacing: 12) {
-            AppIconView(iconPath: app.iconPath)
+            AppIconView(iconPath: liveApp.iconPath)
                 .frame(width: 80, height: 80)
 
-            Text(app.name.isEmpty ? "未命名" : app.name)
+            Text(liveApp.name.isEmpty ? "未命名" : liveApp.name)
                 .font(.title2)
                 .fontWeight(.semibold)
 
-            if app.isSigned {
+            if liveApp.isSigned {
                 Label("已签名", systemImage: "checkmark.seal.fill")
                     .font(.subheadline)
                     .foregroundColor(.green)
@@ -91,11 +115,11 @@ struct AppDetailView: View {
 
     private var infoList: some View {
         List {
-            infoRow("Bundle ID", app.bundleID.isEmpty ? "未知" : app.bundleID)
-            infoRow("版本", app.version.isEmpty ? "未知" : app.version)
-            infoRow("构建号", app.build.isEmpty ? "未知" : app.build)
-            infoRow("文件大小", app.sizeDescription)
-            infoRow("最低系统", app.minimumOSVersion ?? "未知")
+            infoRow("Bundle ID", liveApp.bundleID.isEmpty ? "未知" : liveApp.bundleID)
+            infoRow("版本", liveApp.version.isEmpty ? "未知" : liveApp.version)
+            infoRow("构建号", liveApp.build.isEmpty ? "未知" : liveApp.build)
+            infoRow("文件大小", liveApp.sizeDescription)
+            infoRow("最低系统", liveApp.minimumOSVersion ?? "未知")
         }
         .listStyle(.insetGrouped)
     }
@@ -122,7 +146,7 @@ struct AppDetailView: View {
 
     private var actionButtons: some View {
         VStack(spacing: 12) {
-            if app.isSigned {
+            if liveApp.isSigned {
                 Button {
                     showInstallCertificatePicker = true
                 } label: {
@@ -136,7 +160,7 @@ struct AppDetailView: View {
             Button {
                 showSignOptions = true
             } label: {
-                Label(app.isSigned ? "重新签名" : "签名", systemImage: "pencil.circle.fill")
+                Label(liveApp.isSigned ? "重新签名" : "签名", systemImage: "pencil.circle.fill")
                     .frame(maxWidth: .infinity)
             }
             .buttonStyle(.bordered)
@@ -152,7 +176,7 @@ struct AppDetailView: View {
             .disabled(isSigning)
 
             Button(role: .destructive) {
-                appState.removeSignedApp(app)
+                appState.removeSignedApp(liveApp)
                 dismiss()
             } label: {
                 Label("删除", systemImage: "trash")
@@ -173,6 +197,8 @@ struct AppDetailView: View {
             switch result {
             case .success(let signedPath):
                 isSigning = false
+                // 记录签名产物路径，供 liveApp 实时反映“已签名”状态（installedApps 会在回调前由 refreshInstalledApps 刷新）
+                signedOutputPath = signedPath
                 if installAfter {
                     do {
                         try appState.installSignedPath(signedPath, certificate: certificate)

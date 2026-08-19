@@ -52,8 +52,18 @@ int zsign_sign(const ZSignOptions* options) {
         return -1;
     }
 
-    const char* szTempFolder = ZFile::GetTempFolder();
-    if (szTempFolder == NULL || !ZFile::IsFolder(szTempFolder)) {
+    // 优先使用调用方传入的临时目录（iOS 沙箱内 NSTemporaryDirectory 保证可写）；
+    // 未传入时回退到 ZFile::GetTempFolder()。
+    std::string strTempRoot;
+    if (options->tempFolder && options->tempFolder[0] != '\0') {
+        strTempRoot = options->tempFolder;
+    } else {
+        const char* szTempFolder = ZFile::GetTempFolder();
+        if (szTempFolder != NULL) {
+            strTempRoot = szTempFolder;
+        }
+    }
+    if (strTempRoot.empty() || !ZFile::IsFolder(strTempRoot.c_str())) {
         g_lastError = "Invalid temp folder";
         return -1;
     }
@@ -75,7 +85,7 @@ int zsign_sign(const ZSignOptions* options) {
     }
 
     std::string strTempFolder = ZFile::GetRealPathV("%s/zsign_folder_%llu",
-        szTempFolder, ZUtil::GetMicroSecond());
+        strTempRoot.c_str(), ZUtil::GetMicroSecond());
 
     if (options->progressCallback) {
         options->progressCallback(options->context, 5, "正在解压 IPA...");
@@ -119,7 +129,12 @@ int zsign_sign(const ZSignOptions* options) {
     }
 
     std::string strBaseFolder = bundle.m_strAppFolder.substr(0, pos - 1);
-    if (!Zip::Archive(strBaseFolder.c_str(), strOutputPath.c_str(), (uint32_t)(options->zipLevel >= 0 ? options->zipLevel : -1))) {
+    // zipLevel 直接传 int（0-9 为合法压缩级别；-1 由 Zip::Archive 解释为默认级别）
+    int nZipLevel = options->zipLevel;
+    if (nZipLevel < -1 || nZipLevel > 9) {
+        nZipLevel = 6;
+    }
+    if (!Zip::Archive(strBaseFolder.c_str(), strOutputPath.c_str(), nZipLevel)) {
         g_lastError = "Failed to archive signed IPA";
         ZFile::RemoveFolder(strTempFolder.c_str());
         return -1;
@@ -157,6 +172,18 @@ static void CopyField(char* dst, size_t dstSize, const char* src) {
     dst[dstSize - 1] = '\0';
 }
 
+static std::string GetOpenSSLErrors(const char* prefix) {
+    std::string result = prefix ? prefix : "";
+    unsigned long err = 0;
+    char buf[256] = {0};
+    while ((err = ERR_get_error()) != 0) {
+        ERR_error_string_n(err, buf, sizeof(buf));
+        result += " | ";
+        result += buf;
+    }
+    return result;
+}
+
 int zsign_p12_info(const char* p12Path, const char* password, ZSignP12Info* info) {
     if (!p12Path || !info) {
         g_lastError = "Invalid p12 info arguments";
@@ -178,7 +205,7 @@ int zsign_p12_info(const char* p12Path, const char* password, ZSignP12Info* info
     PKCS12* p12 = d2i_PKCS12_bio(bio, NULL);
     BIO_free(bio);
     if (!p12) {
-        g_lastError = "Invalid p12 file";
+        g_lastError = GetOpenSSLErrors("Invalid p12 file");
         ERR_clear_error();
         return -1;
     }
@@ -188,7 +215,7 @@ int zsign_p12_info(const char* p12Path, const char* password, ZSignP12Info* info
     STACK_OF(X509)* ca = NULL;
     const char* pwd = password ? password : "";
     if (PKCS12_parse(p12, pwd, &pkey, &cert, &ca) != 1) {
-        g_lastError = "Wrong password or unsupported p12 format";
+        g_lastError = GetOpenSSLErrors("Wrong password or unsupported p12 format");
         PKCS12_free(p12);
         ERR_clear_error();
         return -2; // distinct: password/format error

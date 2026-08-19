@@ -21,9 +21,17 @@ struct HomeView: View {
             }
             .navigationTitle("IPA Manager")
             .sheet(isPresented: $showFileImporter) {
-                DocumentPicker(onPick: { url in
-                    handleImportedFile(url)
-                }, allowsMultiple: true)
+                DocumentPicker(
+                    onPick: { _ in },
+                    // 多选导入：逐个交给 handleImportedFile，每个文件独立出结果提示
+                    onPickMany: { urls in
+                        showFileImporter = false
+                        for url in urls {
+                            handleImportedFile(url)
+                        }
+                    },
+                    allowsMultiple: true
+                )
             }
             .alert("提示", isPresented: $showAlert) {
                 Button("确定", role: .cancel) {}
@@ -243,19 +251,6 @@ struct HomeView: View {
                 self.alertMessage = error.localizedDescription
             }
             self.showAlert = true
-        }
-    }
-
-    private func handleImport(_ result: Result<[URL], Error>) {
-        switch result {
-        case .success(let urls):
-            for url in urls {
-                handleImportedFile(url)
-            }
-        case .failure(let error):
-            alertMessage = error.localizedDescription
-            Logger.error("导入失败: \(error)")
-            showAlert = true
         }
     }
 }

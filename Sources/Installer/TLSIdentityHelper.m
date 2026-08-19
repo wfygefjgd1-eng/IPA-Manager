@@ -7,14 +7,14 @@ void IPMSetTLSIdentity(sec_protocol_options_t options, SecIdentityRef identity) 
         return;
     }
 
-    // Extract the leaf certificate from the identity
-    SecCertificateRef cert = NULL;
-    if (SecIdentityCopyCertificate(identity, &cert) != errSecSuccess || cert == NULL) {
-        return;
+    // 用 sec_identity_create 包装 SecIdentityRef（同时包含证书与私钥）。
+    // 之前用 sec_identity_create_with_certificates(cert, NULL) 传了 NULL 私钥，
+    // 导致 TLS 握手永远失败（服务器拿不出私钥）。
+    CFErrorRef error = NULL;
+    sec_identity_t secIdentity = sec_identity_create(identity, NULL, &error);
+    if (error != NULL) {
+        CFRelease(error);
     }
-
-    sec_identity_t secIdentity = sec_identity_create_with_certificates(cert, NULL);
-    CFRelease(cert);
     if (secIdentity != NULL) {
         sec_protocol_options_set_local_identity(options, secIdentity);
     }

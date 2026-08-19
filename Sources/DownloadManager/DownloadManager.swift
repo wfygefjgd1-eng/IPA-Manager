@@ -3,6 +3,9 @@ import Foundation
 final class DownloadManager: NSObject {
     static let shared = DownloadManager()
 
+    // 线程约定：`tasks` / `taskModels` 仅在主队列读写（delegateQueue 为 .main，
+    // 且 startDownload/pause/resume/cancel/snapshotTasks 均由 UI 主线程调用）；
+    // 文件系统操作（移动大文件）放到后台队列执行，完成后回到主队列更新模型。
     private var session: URLSession!
     private var tasks: [UUID: URLSessionDownloadTask] = [:]
     private var taskModels: [UUID: DownloadTask] = [:]
@@ -76,23 +79,27 @@ extension DownloadManager: URLSessionDownloadDelegate {
         didFinishDownloadingTo location: URL
     ) {
         guard let id = tasks.first(where: { $0.value == downloadTask })?.key else { return }
+        var model = taskModels[id] ?? DownloadTask()
 
-        var model = taskModels[id]
+        // 注意：系统会在 didFinishDownloadingTo 返回后清理临时文件，
+        // 因此必须在返回前把文件移动到持久位置（同卷移动 = 重命名，开销小）。
         let destination = AppFileManager.shared.directoryURL(.downloads)
-            .appendingPathComponent(model?.fileName ?? "download")
+            .appendingPathComponent(model.fileName.isEmpty ? "download" : model.fileName)
 
         do {
             try AppFileManager.shared.moveItem(from: location, to: destination)
-            model?.status = .completed
-            model?.destinationPath = destination.path
-            onDownloadComplete?(destination)
+            model.status = .completed
+            model.destinationPath = destination.path
         } catch {
-            model?.status = .failed
-            model?.error = error.localizedDescription
+            model.status = .failed
+            model.error = error.localizedDescription
         }
 
         tasks.removeValue(forKey: id)
         taskModels[id] = model
+        if model.status == .completed {
+            onDownloadComplete?(destination)
+        }
     }
 
     func urlSession(
@@ -100,6 +107,8 @@ extension DownloadManager: URLSessionDownloadDelegate {
         task: URLSessionTask,
         didCompleteWithError error: Error?
     ) {
+        // 成功完成（error == nil）时无需处理：didFinishDownloadingTo 已负责收尾。
+        // 失败（error != nil）时才在此标记为 failed。
         guard let error = error else { return }
         guard let id = tasks.first(where: { $0.value == task })?.key else { return }
         taskModels[id]?.status = .failed

@@ -256,8 +256,14 @@ struct CertificatesView: View {
             try AppFileManager.shared.copyItem(from: url, to: destination)
             var profile = try ProvisioningManager.shared.importProfile(from: destination)
             profile.path = destination.path
-            appState.addProfile(profile)
-            alertMessage = "描述文件导入成功: \(profile.name)"
+            // 按 uuid 去重：同一描述文件重复导入只保留一份
+            if !appState.profiles.contains(where: { $0.uuid == profile.uuid }) {
+                appState.addProfile(profile)
+                alertMessage = "描述文件导入成功: \(profile.name)"
+            } else {
+                Logger.info("描述文件已存在，跳过重复导入: \(profile.name)")
+                alertMessage = "描述文件已存在: \(profile.name)"
+            }
         } catch {
             alertMessage = error.localizedDescription
         }

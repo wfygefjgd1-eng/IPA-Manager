@@ -82,6 +82,16 @@ final class CertificateManager {
             kSecAttrAccount as String: identifier
         ]
         SecItemDelete(query as CFDictionary)
+
+        // 同时删除对应的密码条目
+        if let passwordID = certificate.passwordKeychainIdentifier {
+            let pwdQuery: [String: Any] = [
+                kSecClass as String: kSecClassGenericPassword,
+                kSecAttrService as String: keychainPasswordService,
+                kSecAttrAccount as String: passwordID
+            ]
+            SecItemDelete(pwdQuery as CFDictionary)
+        }
     }
 
     private func readCertificate(from url: URL, password: String) throws -> CertificateInfo {
@@ -92,6 +102,16 @@ final class CertificateManager {
             }
         }
 
+        // 优先用 OpenSSL 解析（支持 PBES2/AES 等新式 P12）；失败再回退系统 SecPKCS12Import，
+        // 保证 bundled 证书（密码 “1”）与用户自己的 P12 都能导入。
+        if let info = try? readCertificateViaOpenSSL(from: url, password: password) {
+            return info
+        }
+
+        return try readCertificateViaSecurityFramework(from: url, password: password)
+    }
+
+    private func readCertificateViaOpenSSL(from url: URL, password: String) throws -> CertificateInfo {
         var info = ZSignP12Info()
 
         let result = url.path.withCString { p12Path in
@@ -107,8 +127,12 @@ final class CertificateManager {
             certInfo.teamID = Self.cString(from: info.teamID)
             certInfo.commonName = Self.cString(from: info.commonName)
             certInfo.organization = Self.cString(from: info.organization)
-            certInfo.startDate = Date(timeIntervalSince1970: TimeInterval(info.startTime))
-            certInfo.expireDate = Date(timeIntervalSince1970: TimeInterval(info.endTime))
+            if info.startTime > 0 {
+                certInfo.startDate = Date(timeIntervalSince1970: TimeInterval(info.startTime))
+            }
+            if info.endTime > 0 {
+                certInfo.expireDate = Date(timeIntervalSince1970: TimeInterval(info.endTime))
+            }
             certInfo.isPasswordProtected = !password.isEmpty
             certInfo.keychainIdentifier = UUID().uuidString
             if !password.isEmpty {
@@ -116,11 +140,71 @@ final class CertificateManager {
             }
             return certInfo
         case -2:
-            throw AppError.certificateInvalid("密码错误或证书格式不支持")
+            throw AppError.certificateInvalid("密码错误或证书格式不支持 (OpenSSL)")
         default:
             let message = zsign_last_error().map { String(cString: $0) } ?? "证书读取失败 (错误码: \(result))"
             throw AppError.certificateInvalid(message)
         }
+    }
+
+    private func readCertificateViaSecurityFramework(from url: URL, password: String) throws -> CertificateInfo {
+        guard let data = try? Data(contentsOf: url) else {
+            throw AppError.certificateInvalid("无法读取 P12 文件")
+        }
+
+        var items: CFArray?
+        let options: [String: Any] = [
+            kSecImportExportPassphrase as String: password
+        ]
+        let status = SecPKCS12Import(data as CFData, options as CFDictionary, &items)
+
+        guard status == errSecSuccess, let array = items as? [[String: Any]], let first = array.first else {
+            if status == errSecAuthFailed {
+                throw AppError.certificateInvalid("密码错误")
+            }
+            throw AppError.certificateInvalid("证书读取失败 (错误码: \(status))")
+        }
+
+        let certChain = first[kSecImportItemCertChain as String] as? [SecCertificate] ?? []
+
+        var info = CertificateInfo()
+        info.name = first[kSecImportItemLabel as String] as? String ?? "P12 证书"
+        info.isPasswordProtected = !password.isEmpty
+        info.keychainIdentifier = UUID().uuidString
+        if !password.isEmpty {
+            info.passwordKeychainIdentifier = UUID().uuidString
+        }
+
+        if let cert = certChain.first {
+            if let summary = SecCertificateCopySubjectSummary(cert) as String? {
+                info.commonName = summary
+                if info.name == "P12 证书" {
+                    info.name = summary
+                }
+            }
+            let (start, expire) = parseValidity(for: cert)
+            info.startDate = start
+            info.expireDate = expire
+        }
+
+        if !info.teamID.isEmpty {
+            info.name = "\(info.name) (\(info.teamID))"
+        }
+
+        return info
+    }
+
+    private func parseValidity(for certificate: SecCertificate) -> (start: Date?, expire: Date?) {
+        guard let values = SecCertificateCopyValues(
+            certificate,
+            [kSecOIDX509V1ValidityNotBefore as String, kSecOIDX509V1ValidityNotAfter as String] as CFArray,
+            nil
+        ) as? [CFString: Any] else {
+            return (nil, nil)
+        }
+        let startDate = (values[kSecOIDX509V1ValidityNotBefore as CFString] as? [CFString: Any])?[kSecPropertyKeyValue as String] as? Date
+        let endDate = (values[kSecOIDX509V1ValidityNotAfter as CFString] as? [CFString: Any])?[kSecPropertyKeyValue as String] as? Date
+        return (startDate, endDate)
     }
 
     private static func cString<T>(from field: T) -> String {

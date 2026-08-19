@@ -36,7 +36,12 @@ final class Installer: Installing {
 
         LocalInstallServer.shared.cacheManifest(manifest)
 
-        let installURLStr = "itms-services://?action=download-manifest&url=\(baseURL.absoluteString)/manifest.plist"
+        // itms-services 链接中的 manifest URL 必须做百分号编码（文件名可能含空格/中文）
+        let encodedManifestURL = baseURL
+            .appendingPathComponent("manifest.plist")
+            .absoluteString
+            .addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? ""
+        let installURLStr = "itms-services://?action=download-manifest&url=\(encodedManifestURL)"
         guard let installURL = URL(string: installURLStr) else {
             LocalInstallServer.shared.stop()
             throw AppError.installFailed("安装链接生成失败")
@@ -64,19 +69,35 @@ final class Installer: Installing {
 
     private func generateManifest(ipaURL: URL, baseURL: URL) throws -> Data? {
         let ipaName = ipaURL.lastPathComponent
+        // 从已签名的 IPA 中解析真实包信息，避免硬编码 bundle-identifier/version
+        var metadata: [String: Any] = [
+            "kind": "software",
+            "title": ipaURL.deletingPathExtension().lastPathComponent
+        ]
+        if let appInfo = try? IPAParser().parseAppInfo(fileURL: ipaURL) {
+            if !appInfo.bundleID.isEmpty {
+                metadata["bundle-identifier"] = appInfo.bundleID
+            }
+            if !appInfo.version.isEmpty {
+                metadata["bundle-version"] = appInfo.version
+            }
+        }
+        // 兜底：解析失败时给占位，避免 manifest 缺键导致安装直接失败
+        if metadata["bundle-identifier"] == nil {
+            metadata["bundle-identifier"] = "com.ipamanager.installed"
+        }
+        if metadata["bundle-version"] == nil {
+            metadata["bundle-version"] = "1.0"
+        }
+
+        let softwareURL = baseURL.appendingPathComponent(ipaName).absoluteString
         let manifestDict: [String: Any] = [
             "items": [
                 [
                     "assets": [
-                        ["kind": "software-package", "url": "\(baseURL.absoluteString)/\(ipaName)"],
-                        ["kind": "display-image", "url": "\(baseURL.absoluteString)/icon.png"]
+                        ["kind": "software-package", "url": softwareURL]
                     ],
-                    "metadata": [
-                        "bundle-identifier": "com.example.installed",
-                        "bundle-version": "1.0",
-                        "kind": "software",
-                        "title": ipaURL.deletingPathExtension().lastPathComponent
-                    ]
+                    "metadata": metadata
                 ]
             ]
         ]

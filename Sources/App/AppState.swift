@@ -50,15 +50,13 @@ final class AppState: ObservableObject {
         }
 
         let destination = fileManager.directoryURL(.ipa).appendingPathComponent(url.lastPathComponent)
-        do {
-            try fileManager.copyItem(from: url, to: destination)
-        } catch {
-            completion(.failure(error))
-            return
-        }
-
         DispatchQueue.global(qos: .userInitiated).async {
             do {
+                // 目标已存在（重复导入同名文件）时先移除，再用新文件覆盖
+                if FileManager.default.fileExists(atPath: destination.path) {
+                    try FileManager.default.removeItem(at: destination)
+                }
+                try self.fileManager.copyItem(from: url, to: destination)
                 var app = try self.parser.parseAppInfo(fileURL: destination)
                 app.path = destination.path
                 DispatchQueue.main.async {
@@ -67,10 +65,15 @@ final class AppState: ObservableObject {
                     } else {
                         self.importedApps.append(app)
                     }
+                    self.saveState()
                     completion(.success(app))
                 }
             } catch {
                 DispatchQueue.main.async {
+                    // 复制成功但解析失败时，清理可能残留的半成品文件
+                    if FileManager.default.fileExists(atPath: destination.path) {
+                        try? FileManager.default.removeItem(at: destination)
+                    }
                     completion(.failure(error))
                 }
             }
@@ -173,9 +176,24 @@ final class AppState: ObservableObject {
                         profileURL: content.profileURL
                     )
                     DispatchQueue.main.async {
+                        // 描述文件
                         if let profileURL = moved.profileURL,
                            let profile = try? ProvisioningManager.shared.importProfile(from: profileURL) {
                             self.addProfile(profile)
+                        }
+                        // 证书：优先用捆绑证书的已知密码尝试导入，失败则提示用户走证书页手动导入
+                        if let p12URL = moved.p12URL {
+                            CertificateManager.shared.importCertificate(from: p12URL, password: "1") { result in
+                                DispatchQueue.main.async {
+                                    switch result {
+                                    case .success(let cert):
+                                        self.addCertificate(cert)
+                                        Logger.info("zip 证书包证书导入成功: \(cert.name)")
+                                    case .failure(let error):
+                                        Logger.warning("zip 证书包证书需手动导入: \(error.localizedDescription)")
+                                    }
+                                }
+                            }
                         }
                         Logger.info("zip 证书包导入完成")
                     }
@@ -238,6 +256,8 @@ final class AppState: ObservableObject {
         if selectedCertificate?.id == certificate.id {
             selectedCertificate = certificates.first { $0.status == .valid }
         }
+        // 同步清理 Keychain 中的私钥与密码条目，避免删除后残留
+        CertificateManager.shared.deleteCertificate(certificate)
         saveState()
     }
 
@@ -258,8 +278,16 @@ final class AppState: ObservableObject {
     }
 
     func removeSignedApp(_ app: AppInfo) {
+        // 从两条列表中都移除（未签名导入的也会出现在 importedApps）
+        importedApps.removeAll { $0.id == app.id || $0.path == app.path }
+        installedApps.removeAll { $0.path == app.path }
         let url = URL(fileURLWithPath: app.path)
         try? fileManager.deleteItem(at: url)
+        // 一并清理对应的解压目录（保留基线安全）
+        let baseName = url.deletingPathExtension().lastPathComponent
+        let extractDir = fileManager.directoryURL(.extracted).appendingPathComponent(baseName, isDirectory: true)
+        try? fileManager.deleteItem(at: extractDir)
+        saveState()
         refreshInstalledApps()
     }
 }

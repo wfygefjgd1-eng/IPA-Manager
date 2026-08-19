@@ -57,7 +57,12 @@ targets:
           - $(SRCROOT)/Vendor/zsign/src
           - $(SRCROOT)/Vendor/zsign/src/common
           - $(SRCROOT)/Vendor/zsign/src/third-party/zlib
+          - $(SRCROOT)/Vendor/zsign/ios
+          - $(SRCROOT)/Sources/Installer
           - $(SRCROOT)/Vendor/openssl/include
+        USER_HEADER_SEARCH_PATHS:
+          - $(SRCROOT)/Vendor/zsign/ios
+          - $(SRCROOT)/Sources/Installer
         CLANG_CXX_LANGUAGE_STANDARD: c++17
         CLANG_CXX_LIBRARY: libc++
         GCC_PREPROCESSOR_DEFINITIONS:

@@ -4,6 +4,8 @@ import UIKit
 
 struct DocumentPicker: UIViewControllerRepresentable {
     let onPick: (URL) -> Void
+    /// 可选：多选时一次性回调全部 URL；设置了它时优先使用，onPick 仅用于单文件场景（如 CertificatesView）
+    var onPickMany: (([URL]) -> Void)?
     var allowsMultiple = false
 
     func makeCoordinator() -> Coordinator {
@@ -27,8 +29,11 @@ struct DocumentPicker: UIViewControllerRepresentable {
         }
 
         func documentPicker(_ controller: UIDocumentPickerViewController, didPickDocumentsAt urls: [URL]) {
-            guard let url = urls.first else { return }
-            parent.onPick(url)
+            if let onPickMany = parent.onPickMany {
+                onPickMany(urls)
+            } else if let url = urls.first {
+                parent.onPick(url)
+            }
         }
 
         func documentPickerWasCancelled(_ controller: UIDocumentPickerViewController) {}

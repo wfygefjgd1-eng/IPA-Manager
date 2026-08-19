@@ -86,9 +86,13 @@ bool Zip::_CreateFolderToZip(void* hZip, const string& strFolder, const string& 
 
 bool Zip::Archive(const string& strFolder, const string& strZipFile, int nZipLevel)
 {
-	 if (nZipLevel < 0 || nZipLevel > 9) {
+	 if (nZipLevel < -1 || nZipLevel > 9) {
 		ZLog::ErrorV(">>> Zip: Invalid compression level: %d\n", nZipLevel);
         return false;
+    }
+    // -1 = Z_DEFAULT_COMPRESSION（zlib 默认级别，合法）
+    if (nZipLevel == -1) {
+        nZipLevel = Z_DEFAULT_COMPRESSION;
     }
     
     zipFile zf = zipOpen64(strZipFile.c_str(), 0);

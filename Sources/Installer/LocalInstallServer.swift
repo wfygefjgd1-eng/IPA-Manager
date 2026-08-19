@@ -71,20 +71,60 @@ final class LocalInstallServer {
         let path = requestPath(from: request)
         Logger.debug("本地服务器请求: \(path)")
 
-        let response: Data
         if path == "/manifest.plist" {
             let manifest = manifestData ?? Data()
-            response = httpResponse(status: 200, contentType: "application/xml", body: manifest)
+            let response = httpResponse(status: 200, contentType: "application/xml", body: manifest)
+            sendAndClose(response, connection: connection)
         } else if path.hasSuffix(".ipa") {
-            if let ipaURL = servingIPA, let body = try? Data(contentsOf: ipaURL) {
-                response = httpResponse(status: 200, contentType: "application/octet-stream", body: body)
-            } else {
-                response = httpResponse(status: 404, contentType: "text/plain", body: Data("IPA not found".utf8))
-            }
+            streamIPA(connection: connection)
         } else {
-            response = httpResponse(status: 404, contentType: "text/plain", body: Data("Not found".utf8))
+            let response = httpResponse(status: 404, contentType: "text/plain", body: Data("Not found".utf8))
+            sendAndClose(response, connection: connection)
+        }
+    }
+
+    /// 分块流式发送 IPA，避免把整个文件读入内存（常见 IPA 数百 MB）
+    private func streamIPA(connection: NWConnection) {
+        guard let ipaURL = servingIPA,
+              let handle = try? FileHandle(forReadingFrom: ipaURL) else {
+            let response = httpResponse(status: 404, contentType: "text/plain", body: Data("IPA not found".utf8))
+            sendAndClose(response, connection: connection)
+            return
         }
 
+        var header = "HTTP/1.1 200 OK\r\n"
+        header += "Content-Type: application/octet-stream\r\n"
+        header += "Content-Length: \(AppFileManager.shared.fileSize(at: ipaURL))\r\n"
+        header += "Connection: close\r\n"
+        header += "\r\n"
+        connection.send(content: Data(header.utf8), completion: .contentProcessed { [weak self] _ in
+            guard let self = self else {
+                connection.cancel()
+                return
+            }
+            self.sendFileChunks(from: handle, connection: connection)
+        })
+    }
+
+    private func sendFileChunks(from handle: FileHandle, connection: NWConnection) {
+        let chunkSize = 256 * 1024
+        let data = handle.readData(ofLength: chunkSize)
+        if data.isEmpty {
+            try? handle.close()
+            self.connections.removeAll { $0 === connection }
+            connection.cancel()
+            return
+        }
+        connection.send(content: data, completion: .contentProcessed { [weak self] _ in
+            guard let self = self else {
+                connection.cancel()
+                return
+            }
+            self.sendFileChunks(from: handle, connection: connection)
+        })
+    }
+
+    private func sendAndClose(_ response: Data, connection: NWConnection) {
         connection.send(content: response, completion: .contentProcessed { [weak self] _ in
             guard let self = self else { return }
             self.connections.removeAll { $0 === connection }

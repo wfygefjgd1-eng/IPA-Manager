@@ -21,6 +21,10 @@ enum Logger {
         log(message, level: .error, file: file, line: line)
     }
 
+    static func warning(_ message: String, file: String = #file, line: Int = #line) {
+        log(message, level: .default, file: file, line: line)
+    }
+
     static func debug(_ message: String, file: String = #file, line: Int = #line) {
         log(message, level: .debug, file: file, line: line)
     }

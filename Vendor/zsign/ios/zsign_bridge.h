@@ -17,6 +17,7 @@ typedef struct {
     const char* bundleId;
     const char* bundleName;
     const char* bundleVersion;
+    const char* tempFolder;
     int zipLevel;
     int force;
     int enableDocuments;

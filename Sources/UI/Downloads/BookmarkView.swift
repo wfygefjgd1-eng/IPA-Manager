@@ -5,9 +5,17 @@ struct BookmarkView: View {
     let onSelect: (URL) -> Void
 
     @State private var bookmarks: [BookmarkItem] = BookmarkStore.shared.load()
-    @State private var showAddAlert = false
     @State private var newBookmarkURL = ""
-    @State private var showError = false
+
+    /// 区分「添加书签输入」与「提示错误」两种弹窗模式（合并后的单个 alert）
+    private enum BookmarkAlertCase {
+        case add
+        case invalidURL
+    }
+
+    @State private var alertCase: BookmarkAlertCase = .add
+    @State private var showAlert = false
+    @State private var showAddedToast = false
 
     var body: some View {
         NavigationView {
@@ -40,28 +48,52 @@ struct BookmarkView: View {
                 ToolbarItem(placement: .navigationBarTrailing) {
                     Button {
                         newBookmarkURL = ""
-                        showAddAlert = true
+                        alertCase = .add
+                        showAlert = true
                     } label: {
                         Image(systemName: "plus")
                     }
                 }
             }
-            .alert("添加书签", isPresented: $showAddAlert) {
-                TextField("https://...", text: $newBookmarkURL)
-                    .keyboardType(.URL)
-                    .autocapitalization(.none)
-                Button("取消", role: .cancel) {}
-                Button("添加") {
-                    addFromTextField()
+            // 合并后的单个 alert：用 alertCase 区分「添加书签输入」与「提示错误」
+            .alert(
+                Text(alertCase == .invalidURL ? "提示" : "添加书签"),
+                isPresented: $showAlert
+            ) {
+                switch alertCase {
+                case .add:
+                    TextField("https://...", text: $newBookmarkURL)
+                        .keyboardType(.URL)
+                        .autocapitalization(.none)
+                    Button("取消", role: .cancel) {}
+                    Button("添加") {
+                        addFromTextField()
+                    }
+                case .invalidURL:
+                    Button("确定", role: .cancel) {}
                 }
             } message: {
-                Text("请输入网址")
+                switch alertCase {
+                case .add:
+                    Text("请输入网址")
+                case .invalidURL:
+                    Text("请输入有效的网址")
+                }
             }
-            .alert("提示", isPresented: $showError) {
-                Button("确定", role: .cancel) {}
-            } message: {
-                Text("请输入有效的网址")
+            // 添加成功后的轻提示
+            .overlay(alignment: .bottom) {
+                if showAddedToast {
+                    Text("已添加到我的书签")
+                        .font(.footnote)
+                        .padding(.horizontal, 16)
+                        .padding(.vertical, 8)
+                        .background(Capsule().fill(Color.black.opacity(0.75)))
+                        .foregroundColor(.white)
+                        .padding(.bottom, 16)
+                        .transition(.opacity)
+                }
             }
+            .animation(.easeInOut(duration: 0.25), value: showAddedToast)
         }
     }
 
@@ -97,7 +129,11 @@ struct BookmarkView: View {
             urlString = "https://" + urlString
         }
         guard let url = URL(string: urlString), url.scheme != nil else {
-            showError = true
+            alertCase = .invalidURL
+            // 等当前 alert 先完成 dismiss，再弹出错误提示
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
+                showAlert = true
+            }
             return
         }
 
@@ -115,6 +151,10 @@ struct BookmarkView: View {
         )
         if !bookmarks.contains(where: { $0.url == item.url }) {
             bookmarks.append(item)
+            showAddedToast = true
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
+                showAddedToast = false
+            }
         }
         BookmarkStore.shared.save(bookmarks)
         newBookmarkURL = ""

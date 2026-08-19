@@ -34,7 +34,7 @@ final class SigningEngine: SigningEngineProtocol {
         }
 
         let outputURL = fileManager.directoryURL(.signed)
-            .appendingPathComponent("\(URL(fileURLWithPath: sourcePath).deletingPathExtension().lastPathComponent)-signed.ipa")
+            .appendingPathComponent("\(URL(fileURLWithPath: sourcePath).deletingPathExtension().lastPathComponent)-signed-\(Int(Date().timeIntervalSince1970)).ipa")
 
         let certPassword = certManager.readPassword(for: certificate) ?? ""
 
@@ -43,23 +43,29 @@ final class SigningEngine: SigningEngineProtocol {
         let context = Unmanaged.passRetained(box).toOpaque()
         defer { Unmanaged<ProgressBox>.fromOpaque(context).release() }
 
+        // 临时目录必须可写：iOS 沙箱内 NSTemporaryDirectory 保证可用（不能用 /tmp）
+        let tempDir = NSTemporaryDirectory()
+
         let result: Int32 = sourcePath.withCString { inputCStr in
             outputURL.path.withCString { outputCStr in
                 p12URL.path.withCString { p12CStr in
                     profile.path.withCString { provCStr in
                         certPassword.withCString { pwdCStr in
-                            var options = ZSignOptions()
-                            options.inputIpaPath = inputCStr
-                            options.outputIpaPath = outputCStr
-                            options.pkeyPath = p12CStr
-                            options.provisionPath = provCStr
-                            options.password = pwdCStr
-                            options.zipLevel = -1
-                            options.force = 1
-                            options.enableDocuments = 1
-                            options.context = context
-                            options.progressCallback = progressCallbackFunc
-                            return zsign_sign(&options)
+                            tempDir.withCString { tempDirCStr in
+                                var options = ZSignOptions()
+                                options.inputIpaPath = inputCStr
+                                options.outputIpaPath = outputCStr
+                                options.pkeyPath = p12CStr
+                                options.provisionPath = provCStr
+                                options.password = pwdCStr
+                                options.tempFolder = tempDirCStr
+                                options.zipLevel = 6
+                                options.force = 1
+                                options.enableDocuments = 1
+                                options.context = context
+                                options.progressCallback = progressCallbackFunc
+                                return zsign_sign(&options)
+                            }
                         }
                     }
                 }
@@ -77,7 +83,8 @@ final class SigningEngine: SigningEngineProtocol {
     }
 
     private func exportP12(identifier: String) throws -> URL {
-        let tempURL = fileManager.directoryURL(.certificates)
+        // 私钥材料写到系统临时目录，避免残留在 Documents 目录
+        let tempURL = URL(fileURLWithPath: NSTemporaryDirectory())
             .appendingPathComponent("export-\(identifier).p12")
         try certManager.exportP12(identifier: identifier, to: tempURL)
         return tempURL
