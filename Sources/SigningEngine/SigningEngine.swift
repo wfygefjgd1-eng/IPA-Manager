@@ -23,6 +23,14 @@ final class SigningEngine: SigningEngineProtocol {
         progress: @escaping (Double) -> Void
     ) throws -> String {
         progress(0.0)
+
+        // 源文件可能已被删除/移动（列表记录还在但磁盘文件丢失）：
+        // 若直接进入导出流程，zsign 桥接层会报 "Input file not found" 这类不友好的英文错误。
+        // 在导出/签名任何操作之前先校验源文件是否存在，给出友好中文提示。
+        guard FileManager.default.fileExists(atPath: sourcePath) else {
+            throw AppError.signFailed("源文件已被删除或移动，请返回列表重新导入该应用后再签名")
+        }
+
         Logger.info("开始签名: \(sourcePath)")
 
         guard let keychainID = certificate.keychainIdentifier else {

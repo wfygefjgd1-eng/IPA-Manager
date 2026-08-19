@@ -125,6 +125,12 @@ struct DownloadsView: View {
                     .foregroundColor(.secondary)
             }
 
+            if task.status == .failed, let error = task.error, !error.isEmpty {
+                Text(error)
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+            }
+
             if task.status == .completed {
                 HStack(spacing: 4) {
                     Image(systemName: "checkmark.circle.fill")
@@ -143,6 +149,21 @@ struct DownloadsView: View {
             } else {
                 unrecognizedMessage = unrecognizedReason(for: task)
                 showUnrecognizedAlert = true
+            }
+        }
+        .contextMenu {
+            if task.status == .failed {
+                Button {
+                    retryDownload(task)
+                } label: {
+                    Label("重新下载", systemImage: "arrow.clockwise")
+                }
+            }
+            Button(role: .destructive) {
+                DownloadManager.shared.cancelDownload(id: task.id)
+                refreshTasks()
+            } label: {
+                Label("删除", systemImage: "trash")
             }
         }
     }
@@ -178,11 +199,31 @@ struct DownloadsView: View {
 
         switch (path as NSString).pathExtension.lowercased() {
         case "zip":
+            if isCorruptedArchive(at: path) {
+                return "文件损坏或网络异常导致下载不完整，请删除后重新下载"
+            }
             return "下载成功，但该 ZIP 未包含可解析的 .app 应用包（可能不是有效的 IPA/ZIP 结构），请确认文件完整后重试。"
         case "ipa":
             return "自动导入失败：IPA 解析未生成应用记录，文件可能损坏或不是有效的 IPA 包，可重新下载验证。"
         default:
             return "自动导入失败：无法将“\(task.fileName)”识别为可签名应用（文件已存在但解析失败）。"
+        }
+    }
+
+    /// 判断下载文件是否损坏：文件头不是 zip/ipa 魔数（PK\x03\x04）即视为损坏
+    /// （截断文件、HTML 错误页都不会以该魔数开头）。
+    private func isCorruptedArchive(at path: String) -> Bool {
+        guard let handle = FileHandle(forReadingAtPath: path) else { return true }
+        defer { try? handle.close() }
+        guard let data = try? handle.read(upToCount: 512), !data.isEmpty else { return true }
+        return !data.starts(with: [0x50, 0x4B, 0x03, 0x04])
+    }
+
+    /// 长按 failed 任务 → 重新下载：先移除原失败任务，再以同一 URL 发起新下载。
+    private func retryDownload(_ task: DownloadTask) {
+        DownloadManager.shared.cancelDownload(id: task.id)
+        DownloadManager.shared.startDownload(urlString: task.url) { _ in
+            refreshTasks()
         }
     }
 

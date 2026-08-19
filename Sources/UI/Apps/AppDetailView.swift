@@ -210,10 +210,21 @@ struct AppDetailView: View {
                 }
             case .failure(let error):
                 isSigning = false
-                alertMessage = "签名失败: \(error.localizedDescription)"
+                alertMessage = signingFailureMessage(for: error)
                 showAlert = true
             }
         })
+    }
+
+    /// 当失败原因是“源文件丢失”时，在错误信息后附加一行恢复指引，
+    /// 避免用户只看到 zsign 桥接层返回的 "Input file not found" 英文错误。
+    private func signingFailureMessage(for error: Error) -> String {
+        let base = "签名失败: \(error.localizedDescription)"
+        let description = error.localizedDescription
+        if description.contains("文件已被删除") || description.contains("Input file not found") || description.contains("源文件") {
+            return base + "\n\n该应用的源文件已丢失（可能被清理），请在首页重新导入后再签名。"
+        }
+        return base
     }
 }
 

@@ -9,7 +9,6 @@ final class AppState: ObservableObject {
     @Published var certificates: [CertificateInfo] = []
     @Published var profiles: [ProvisioningInfo] = []
     @Published var signingTasks: [SigningTask] = []
-    @Published var downloadTasks: [DownloadTask] = []
 
     @Published var selectedCertificate: CertificateInfo?
     @Published var selectedProfile: ProvisioningInfo?
@@ -115,7 +114,10 @@ final class AppState: ObservableObject {
         do {
             try ZipManager.shared.unzip(archiveURL: url, destinationURL: tempDir)
         } catch {
-            throw AppError.operationFailed("无法解压压缩包（当前仅支持 zip 格式）: \(url.lastPathComponent)")
+            // 透传 ZipManager 的 ZipError（errorDescription 已是中文，区分“非 zip / 网页错误页 / 损坏不完整”）：
+            // “该文件不是有效的 ZIP 压缩包” / “下载到的是网页而不是文件（…）” /
+            // “ZIP 文件已损坏或下载不完整，请删除后重新下载”
+            throw error
         }
 
         var hasCertificate = false
@@ -320,7 +322,8 @@ final class AppState: ObservableObject {
         certificates = store.loadCertificates()
         profiles = store.loadProfiles()
         signingTasks = store.loadSigningTasks()
-        downloadTasks = store.loadDownloadTasks()
+        // 下载任务由 DownloadManager.restoreSavedTasks() 负责恢复并持久化，
+        // 这里不再加载，避免与 DownloadManager 的内存态互相覆盖。
         importedApps = store.loadImportedApps()
 
         // 选中项不持久化，恢复后必须重新挑选，避免首页显示“未选择证书”
@@ -348,7 +351,9 @@ final class AppState: ObservableObject {
         store.saveCertificates(certificates)
         store.saveProfiles(profiles)
         store.saveSigningTasks(signingTasks)
-        store.saveDownloadTasks(downloadTasks)
+        // 下载任务以 DownloadManager 的内存态为准，避免用恒为空的
+        // downloadTasks 覆盖 DownloadManager 已持久化的任务记录。
+        store.saveDownloadTasks(DownloadManager.shared.snapshotTasks())
         store.saveImportedApps(importedApps)
     }
 
