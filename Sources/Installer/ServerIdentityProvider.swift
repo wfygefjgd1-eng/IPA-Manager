@@ -134,18 +134,31 @@ final class ServerIdentityProvider {
             throw AppError.installFailed("无法加载证书（创建失败）")
         }
 
-        let keyAttributes: [String: Any] = [
+        var keyAttributes: [String: Any] = [
             kSecAttrKeyType as String: isRSA != 0 ? kSecAttrKeyTypeRSA : kSecAttrKeyTypeECSECPrimeRandom,
-            kSecAttrKeyClass as String: kSecAttrKeyClassPrivate
+            kSecAttrKeyClass as String: kSecAttrKeyClassPrivate,
+            kSecAttrLabel as String: "IPA Manager TLS Key \(UUID().uuidString)"
         ]
+        // 关键修复：SecKeyCreateWithData 在多数 iOS 版本上要求显式给出 kSecAttrKeySizeInBits，
+        // 否则对 RSA 私钥直接返回失败（"系统拒绝该私钥格式"的常见根因之一）。
+        // 本机密钥为 RSA 2048（PKCS#8 DER 约 1218 字节，已按诊断日志验证）；EC 分支不设置该属性。
+        var keySizeInBitsApplied = "未设置"
+        if isRSA != 0 {
+            keyAttributes[kSecAttrKeySizeInBits as String] = 2048
+            keySizeInBitsApplied = "2048"
+        }
+        Logger.info("尝试 SecKeyCreateWithData 直连构造私钥 (isRSA=\(isRSA) keyLen=\(keyLen) keyFormat=\(formatDesc) keySizeInBits=\(keySizeInBitsApplied))")
         guard let key = SecKeyCreateWithData(keyData as CFData, keyAttributes as CFDictionary, nil) else {
             // 私钥直连构造失败（iOS 对非同构的 PKCS#8 或其他格式可能挑剔）：
             // 先尝试 Keychain 兜底（证书+私钥配对成 SecIdentity），兜底也失败才抛错。
-            Logger.error("SecKeyCreateWithData 失败 (isRSA=\(isRSA) keyLen=\(keyLen) keyFormat=\(formatDesc))，尝试 Keychain 导入兜底")
+            Logger.error("SecKeyCreateWithData 失败 (isRSA=\(isRSA) keyLen=\(keyLen) keyFormat=\(formatDesc) keySizeInBits=\(keySizeInBitsApplied))，尝试 Keychain 导入兜底")
             if loadIdentityViaKeychain(cert: cert, keyData: keyData, isRSA: isRSA != 0) {
                 return true
             }
-            throw AppError.installFailed("无法加载证书私钥（系统拒绝该私钥格式）")
+            // Keychain 兜底每一步的 status 与阶段已在上方 Logger 记录；最终抛出的文案面向用户，
+            // 完整诊断以诊断报告中的日志为准。
+            Logger.error("SecKeyCreateWithData 与 Keychain 兜底均失败：无法加载私钥（详见上面各阶段 status 日志）")
+            throw AppError.installFailed("无法加载证书私钥（系统拒绝该私钥格式，Keychain 兜底亦失败，详见诊断日志）")
         }
 
         currentCertKey = (cert: cert, key: key)
@@ -153,7 +166,7 @@ final class ServerIdentityProvider {
     }
 
     /// Keychain 兜底：SecKeyCreateWithData 拒绝私钥 DER 时，把证书与私钥写入 Keychain 配对成 SecIdentity。
-    /// 成功返回 true 并设置 currentIdentity；任何失败路径只记日志并清理本次条目，不抛错。
+    /// 成功返回 true 并设置 currentIdentity；任何失败路径只记日志（每步带 status 与阶段）并清理本次条目，不抛错。
     private func loadIdentityViaKeychain(cert: SecCertificate, keyData: Data, isRSA: Bool) -> Bool {
         // 先清理上一次兜底产生的 Keychain 条目（避免多次安装累积）
         if let oldLabel = ServerIdentityProvider.lastFallbackLabel {
@@ -163,20 +176,23 @@ final class ServerIdentityProvider {
 
         let label = "IPA Manager Server Identity \(UUID().uuidString)"
 
-        // 1. 证书
+        // 1. 证书（带唯一 label，供后续与私钥同标签配对）
         let certQuery: [String: Any] = [
             kSecClass as String: kSecClassCertificate,
             kSecValueRef as String: cert,
             kSecAttrLabel as String: label
         ]
         let certStatus = SecItemAdd(certQuery as CFDictionary, nil)
+        Logger.info("Keychain 兜底：证书添加 (status=\(certStatus))")
         guard certStatus == errSecSuccess else {
-            Logger.error("Keychain 兜底失败：证书添加失败 (status=\(certStatus))")
+            Logger.error("Keychain 证书添加失败 (status=\(certStatus))")
             return false
         }
 
-        // 2. 私钥（kSecValueData 要求 PKCS#8 DER；若实际为 PKCS#1/SEC1 系统可能拒绝，直接记日志并走失败路径）
-        let keyQuery: [String: Any] = [
+        // 2. 私钥：与证书使用完全相同的 label；RSA 分支与直连构造一致补 kSecAttrKeySizeInBits。
+        //    注意：个别 iOS 版本不允许把 kSecAttrAccessible 放到 key 条目上（-50 errSecParam），
+        //    失败时去掉 kSecAttrAccessible 重试一次，仍失败才记日志。
+        var keyQuery: [String: Any] = [
             kSecClass as String: kSecClassKey,
             kSecAttrKeyType as String: isRSA ? kSecAttrKeyTypeRSA : kSecAttrKeyTypeECSECPrimeRandom,
             kSecAttrKeyClass as String: kSecAttrKeyClassPrivate,
@@ -184,32 +200,85 @@ final class ServerIdentityProvider {
             kSecValueData as String: keyData,
             kSecAttrAccessible as String: kSecAttrAccessibleWhenUnlockedThisDeviceOnly
         ]
-        let keyStatus = SecItemAdd(keyQuery as CFDictionary, nil)
-        guard keyStatus == errSecSuccess else {
-            Logger.error("Keychain 兜底失败：私钥添加失败 (status=\(keyStatus), isRSA=\(isRSA), keyLen=\(keyData.count))")
+        if isRSA {
+            keyQuery[kSecAttrKeySizeInBits as String] = 2048
+        }
+        var keyStatus = SecItemAdd(keyQuery as CFDictionary, nil)
+        Logger.info("Keychain 兜底：私钥添加 (status=\(keyStatus), isRSA=\(isRSA), keyLen=\(keyData.count), keySizeInBits=\(isRSA ? "2048" : "未设置"))")
+        if keyStatus != errSecSuccess {
+            Logger.warning("Keychain 私钥添加失败 (status=\(keyStatus))，去掉 kSecAttrAccessible 重试一次")
+            keyQuery.removeValue(forKey: kSecAttrAccessible as String)
+            keyStatus = SecItemAdd(keyQuery as CFDictionary, nil)
+            Logger.info("Keychain 兜底：私钥添加重试（无 kSecAttrAccessible）(status=\(keyStatus))")
+            guard keyStatus == errSecSuccess else {
+                Logger.error("Keychain 私钥添加失败 (status=\(keyStatus), isRSA=\(isRSA), keyLen=\(keyData.count))")
+                removeKeychainIdentity(label: label)
+                return false
+            }
+        }
+
+        // 3. 两段式 SecIdentity 配对：先按 label 精确查；查不到（-25300）再列出全部
+        //    identities 按证书 DER 匹配（见 findKeychainIdentity）。
+        let (identity, matchStatus) = findKeychainIdentity(label: label, cert: cert)
+        guard let identity = identity else {
+            Logger.error("SecIdentity 配对未找到 (status=\(matchStatus))，Keychain 兜底失败，已清理本次条目")
             removeKeychainIdentity(label: label)
             return false
         }
 
-        // 3. 按 label 取系统配对后的 SecIdentity（走原 tlsOptions 快路径）
-        var identityRef: CFTypeRef?
-        let matchQuery: [String: Any] = [
-            kSecClass as String: kSecClassIdentity,
-            kSecAttrLabel as String: label,
-            kSecReturnRef as String: true
-        ]
-        let matchStatus = SecItemCopyMatching(matchQuery as CFDictionary, &identityRef)
-        guard matchStatus == errSecSuccess, let ref = identityRef, CFGetTypeID(ref) == SecIdentityGetTypeID() else {
-            Logger.error("Keychain 兜底失败：SecIdentity 配对失败 (status=\(matchStatus))")
-            removeKeychainIdentity(label: label)
-            return false
-        }
-
-        currentIdentity = (ref as! SecIdentity)
+        currentIdentity = identity
         currentCertKey = nil
         ServerIdentityProvider.lastFallbackLabel = label
         Logger.info("Keychain 兜底成功：已通过 SecIdentity 设置 TLS 身份")
         return true
+    }
+
+    /// 两段式 SecIdentity 配对查询：
+    /// 阶段 A：按 label 精确查询（cert 与 key 同 label 时系统通常已完成配对）；
+    /// 阶段 B：阶段 A 失败（常见 -25300 errSecItemNotFound，个别 iOS 版本上 SecIdentity 的
+    ///         label 与写入条目不一致）时，用 kSecMatchLimitAll 列出全部 identities，再按证书
+    ///         DER 与本次 cert 逐条匹配，挑出属于本次安装的 identity。
+    /// 返回 (identity, status)：status 为查询阶段的最后状态码，供日志/诊断使用。
+    private func findKeychainIdentity(label: String, cert: SecCertificate) -> (identity: SecIdentity?, status: OSStatus) {
+        // 阶段 A：按 label 精确查询
+        var identityRef: CFTypeRef?
+        let labelQuery: [String: Any] = [
+            kSecClass as String: kSecClassIdentity,
+            kSecAttrLabel as String: label,
+            kSecReturnRef as String: true
+        ]
+        let labelStatus = SecItemCopyMatching(labelQuery as CFDictionary, &identityRef)
+        Logger.info("Keychain 兜底：按 label 查询 SecIdentity (status=\(labelStatus))")
+        if labelStatus == errSecSuccess, let ref = identityRef as? SecIdentity {
+            return (ref, labelStatus)
+        }
+
+        // 阶段 B：列出全部 identities，按证书 DER 匹配本次证书
+        var allRefs: CFTypeRef?
+        let listQuery: [String: Any] = [
+            kSecClass as String: kSecClassIdentity,
+            kSecReturnRef as String: true,
+            kSecMatchLimit as String: kSecMatchLimitAll
+        ]
+        let listStatus = SecItemCopyMatching(listQuery as CFDictionary, &allRefs)
+        Logger.info("Keychain 兜底：列出全部 identities (status=\(listStatus))")
+        guard listStatus == errSecSuccess, let identities = allRefs as? [SecIdentity] else {
+            Logger.error("Keychain 兜底：列出全部 identities 失败 (status=\(listStatus))")
+            return (nil, listStatus)
+        }
+
+        let ourCertData = SecCertificateCopyData(cert) as Data
+        for identity in identities {
+            var candidateCert: SecCertificate?
+            guard SecIdentityCopyCertificate(identity, &candidateCert) == errSecSuccess,
+                  let candidate = candidateCert else { continue }
+            if SecCertificateCopyData(candidate) as Data == ourCertData {
+                Logger.info("Keychain 兜底：在全部 identities 中找到匹配本次证书的 SecIdentity")
+                return (identity, errSecSuccess)
+            }
+        }
+        Logger.error("Keychain 兜底：全部 identities 中未找到匹配本次证书的条目 (count=\(identities.count))")
+        return (nil, labelStatus)
     }
 
     /// 按 label 删除兜底写入的证书/私钥/身份条目（幂等，条目不存在视为成功）。
