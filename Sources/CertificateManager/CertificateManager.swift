@@ -195,16 +195,109 @@ final class CertificateManager {
     }
 
     private func parseValidity(for certificate: SecCertificate) -> (start: Date?, expire: Date?) {
-        guard let values = SecCertificateCopyValues(
-            certificate,
-            [kSecOIDX509V1ValidityNotBefore as String, kSecOIDX509V1ValidityNotAfter as String] as CFArray,
-            nil
-        ) as? [CFString: Any] else {
+        // iOS 无 SecCertificateCopyValues（macOS only），改为从证书 DER 中解析有效期
+        let data = SecCertificateCopyData(certificate) as Data
+        return Self.parseValidity(fromDER: data)
+    }
+
+    /// 最小 DER 解析：从 X.509 证书中提取 notBefore / notAfter（UTCTime / GeneralizedTime）
+    private static func parseValidity(fromDER data: Data) -> (start: Date?, expire: Date?) {
+        // 顶层必须是 SEQUENCE
+        var offset = 0
+        guard let top = readDERElement(data, at: &offset),
+              top.tag == 0x30 else {
             return (nil, nil)
         }
-        let startDate = (values[kSecOIDX509V1ValidityNotBefore as CFString] as? [CFString: Any])?[kSecPropertyKeyValue as String] as? Date
-        let endDate = (values[kSecOIDX509V1ValidityNotAfter as CFString] as? [CFString: Any])?[kSecPropertyKeyValue as String] as? Date
-        return (startDate, endDate)
+        let topContent = top.content
+
+        var inner = 0
+        // [0] version（可选）
+        if inner < topContent.count, topContent[topContent.startIndex + inner] == 0xA0 {
+            _ = readDERElement(topContent, at: &inner)
+        }
+        // INTEGER serial
+        guard readDERElement(topContent, at: &inner) != nil else { return (nil, nil) }
+        // SEQUENCE signature algorithm
+        guard readDERElement(topContent, at: &inner) != nil else { return (nil, nil) }
+        // SEQUENCE issuer
+        guard readDERElement(topContent, at: &inner) != nil else { return (nil, nil) }
+        // SEQUENCE validity
+        guard let validity = readDERElement(topContent, at: &inner) else { return (nil, nil) }
+
+        var v = 0
+        guard let notBefore = readDERElement(validity.content, at: &v),
+              let notAfter = readDERElement(validity.content, at: &v) else {
+            return (nil, nil)
+        }
+        return (Self.parseASN1Time(notBefore.content, tag: notBefore.tag),
+                Self.parseASN1Time(notAfter.content, tag: notAfter.tag))
+    }
+
+    /// 读取一个 DER TLV 元素，offset 前进到下一个元素
+    private static func readDERElement(_ data: Data, at offset: inout Int) -> (tag: UInt8, content: Data)? {
+        guard offset < data.count else { return nil }
+        let tag = data[data.startIndex + offset]
+        offset += 1
+        guard offset < data.count else { return nil }
+
+        var length = Int(data[data.startIndex + offset])
+        offset += 1
+        if length & 0x80 != 0 {
+            let count = length & 0x7F
+            guard count > 0, count <= 4, offset + count <= data.count else { return nil }
+            var value = 0
+            for _ in 0..<count {
+                value = (value << 8) | Int(data[data.startIndex + offset])
+                offset += 1
+            }
+            length = value
+        }
+        guard offset + length <= data.count else { return nil }
+        let content = data.subdata(in: (data.startIndex + offset)..<(data.startIndex + offset + length))
+        offset += length
+        return (tag, content)
+    }
+
+    /// 解析 ASN.1 时间：UTCTime(0x17) "YYMMDDHHMMSSZ" / GeneralizedTime(0x18) "YYYYMMDDHHMMSSZ"
+    private static func parseASN1Time(_ bytes: Data, tag: UInt8) -> Date? {
+        guard tag == 0x17 || tag == 0x18 else { return nil }
+        guard let text = String(data: bytes, encoding: .ascii) else { return nil }
+        let s = text.trimmingCharacters(in: .whitespaces)
+        guard s.last == "Z" else { return nil }
+        let digits = s.dropLast()
+
+        let year: Int
+        let rest: Substring
+        if tag == 0x17, digits.count == 12 { // UTCTime
+            let yy = Int(digits.prefix(2)) ?? 0
+            year = yy >= 50 ? 1900 + yy : 2000 + yy
+            rest = digits.dropFirst(2)
+        } else if tag == 0x18, digits.count == 14 { // GeneralizedTime
+            year = Int(digits.prefix(4)) ?? 0
+            rest = digits.dropFirst(4)
+        } else {
+            return nil
+        }
+
+        // rest 是 10 位数字 MMDDHHMMSS，必须两位一组解析（逐字符会导致 month=0 等错误）
+        var values = [Int]()
+        var idx = rest.startIndex
+        while idx < rest.endIndex {
+            let next = rest.index(idx, offsetBy: 2)
+            guard next <= rest.endIndex, let v = Int(rest[idx..<next]) else { return nil }
+            values.append(v)
+            idx = next
+        }
+        guard values.count == 5 else { return nil }
+        var components = DateComponents()
+        components.year = year
+        components.month = values[0]
+        components.day = values[1]
+        components.hour = values[2]
+        components.minute = values[3]
+        components.second = values[4]
+        components.timeZone = TimeZone(secondsFromGMT: 0)
+        return Calendar(identifier: .gregorian).date(from: components)
     }
 
     private static func cString<T>(from field: T) -> String {
