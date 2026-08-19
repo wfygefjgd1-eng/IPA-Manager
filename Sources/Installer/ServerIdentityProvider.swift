@@ -268,9 +268,12 @@ final class ServerIdentityProvider {
             Logger.error("Keychain 兜底：列出全部 identities 失败 (status=\(listStatus))")
             return (nil, listStatus)
         }
-        // CFArray 桥接成的 [Any]：逐条转成 SecIdentity 再匹配
+        // CFArray 桥接成的 [Any]：逐条按类型 ID 校验后强转成 SecIdentity 再匹配。
+        // 注意：对 CoreFoundation 类型不能用 as? 条件转换（编译器报
+        // "conditional downcast ... will always succeed"），必须 CFGetTypeID + unsafeBitCast。
         let identities: [SecIdentity] = (allRefs as? [Any])?.compactMap { ref in
-            ref as? SecIdentity
+            guard CFGetTypeID(unsafeBitCast(ref, to: CFTypeRef.self)) == SecIdentityGetTypeID() else { return nil }
+            return unsafeBitCast(ref, to: SecIdentity.self)
         } ?? []
 
         let ourCertData = SecCertificateCopyData(cert) as Data
