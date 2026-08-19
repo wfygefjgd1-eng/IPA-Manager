@@ -207,7 +207,25 @@ struct DownloadsView: View {
             // 3) 与 app.path 的 lastPathComponent（原始 + 去扩展名）比较
             let appPathLast = (app.path as NSString).lastPathComponent
             let appPathBase = (appPathLast as NSString).deletingPathExtension
-            return appPathLast == fileName || appPathBase == baseName
+            if appPathLast == fileName || appPathBase == baseName {
+                return true
+            }
+            // 4) 包含关系兜底：任务名（去扩展名）与导入应用名 / 文件名互相包含，
+            //    提高 zip 文件名（如 "EPICKLE-VR.6.19-IOS"）与 Info.plist 显示名
+            //    （如 "ePickle"）不一致时的命中率。名称过短容易误匹配，低于 3 字符不启用。
+            let baseLower = baseName.lowercased()
+            guard baseLower.count >= 3 else { return false }
+            if !app.name.isEmpty {
+                let appNameLower = app.name.lowercased()
+                if appNameLower.contains(baseLower) || baseLower.contains(appNameLower) {
+                    return true
+                }
+            }
+            if !appPathBase.isEmpty {
+                let appPathBaseLower = appPathBase.lowercased()
+                return appPathBaseLower.contains(baseLower) || baseLower.contains(appPathBaseLower)
+            }
+            return false
         }
     }
 
@@ -254,12 +272,21 @@ struct DownloadsView: View {
                 Logger.error("无法识别下载文件: \(task.fileName) - \(reason)")
                 return reason
             }
-            // 文件头（PK 魔数）正常但自动导入仍失败：这里实际解析一次，
-            // 用真实的解析错误（IPAParser 已把“压缩包内包含：…”等内容细节写进错误信息）代替笼统文案。
+            // 文件头（PK 魔数）正常但自动导入仍失败：这里实际解析一次。
+            // 解析成功说明 zip 内包含 .app 或 .ipa（IPAParser 已支持 zip 内嵌 .ipa）；
+            // 若仍未匹配到已导入应用，说明自动导入没跑成，主动补一次导入兜底。
             do {
                 _ = try IPAParser().parse(fileURL: URL(fileURLWithPath: path))
-                let reason = "该 ZIP 可解析为应用，请回到“我的应用”查看；若未出现请重试导入。"
-                Logger.info("下载文件可解析（但未匹配到任务）: \(task.fileName) - \(reason)")
+                // matchedApp 读取 @Published importedApps，需在主线程判断；
+                // handleDownloadedFile 内部会再切到后台执行分类与导入，调用安全。
+                DispatchQueue.main.async {
+                    if self.matchedApp(for: task) == nil {
+                        Logger.info("zip 可解析但未匹配到已导入应用，主动补导入: \(task.fileName)")
+                        self.appState.handleDownloadedFile(at: URL(fileURLWithPath: path))
+                    }
+                }
+                let reason = "压缩包内包含应用（.app 或 .ipa），自动导入应已将其加入「我的应用」；若未出现，请删除任务后重新下载导入。"
+                Logger.info("下载文件可解析（自动导入未匹配，已补导入）: \(task.fileName) - \(reason)")
                 return reason
             } catch {
                 return zipParseFailureReason(task: task, detail: error.localizedDescription)

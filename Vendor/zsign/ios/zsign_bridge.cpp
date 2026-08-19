@@ -1,5 +1,6 @@
 #include "zsign_bridge.h"
 
+#include <cstdlib>
 #include <cstring>
 #include <string>
 #include <vector>
@@ -305,6 +306,167 @@ int zsign_p12_info(const char* p12Path, const char* password, ZSignP12Info* info
     if (ca) sk_X509_pop_free(ca, X509_free);
     X509_free(cert);
 
+    g_lastError.clear();
+    return 0;
+}
+
+int zsign_p12_export_identity(const char* p12Path, const char* password,
+                              unsigned char** outCertDER, int* outCertLen,
+                              unsigned char** outKeyDER,  int* outKeyLen,
+                              int* outIsRSA) {
+    if (!p12Path || !outCertDER || !outCertLen || !outKeyDER || !outKeyLen || !outIsRSA) {
+        g_lastError = "无效的 p12 导出参数";
+        return -1;
+    }
+
+    *outCertDER = NULL;
+    *outCertLen = 0;
+    *outKeyDER = NULL;
+    *outKeyLen = 0;
+    *outIsRSA = 0;
+
+    BIO* bio = BIO_new_file(p12Path, "rb");
+    if (!bio) {
+        g_lastError = "无法打开 p12 文件";
+        return -1;
+    }
+
+    // 与 zsign_p12_info 一致：加载 legacy + default provider，
+    // 兼容新版 PBES2/AES 与旧版加密算法的 p12。
+    OSSL_PROVIDER_load(NULL, "legacy");
+    OSSL_PROVIDER_load(NULL, "default");
+
+    PKCS12* p12 = d2i_PKCS12_bio(bio, NULL);
+    BIO_free(bio);
+    if (!p12) {
+        g_lastError = GetOpenSSLErrors("无效的 p12 文件");
+        ERR_clear_error();
+        return -1;
+    }
+
+    EVP_PKEY* pkey = NULL;
+    X509* cert = NULL;
+    STACK_OF(X509)* ca = NULL;
+    const char* pwd = password ? password : "";
+    if (PKCS12_parse(p12, pwd, &pkey, &cert, &ca) != 1) {
+        g_lastError = GetOpenSSLErrors("密码错误或 p12 格式不受支持");
+        PKCS12_free(p12);
+        ERR_clear_error();
+        return -2; // distinct: password/format error
+    }
+    PKCS12_free(p12);
+
+    if (cert == NULL || pkey == NULL) {
+        g_lastError = (cert == NULL) ? "p12 中未找到证书" : "p12 中未找到私钥";
+        if (pkey) EVP_PKEY_free(pkey);
+        if (cert) X509_free(cert);
+        if (ca) sk_X509_pop_free(ca, X509_free);
+        ERR_clear_error();
+        return -1;
+    }
+
+    int isRSA = (EVP_PKEY_base_id(pkey) == EVP_PKEY_RSA) ? 1 : 0;
+
+    // 证书 DER（i2d_X509：先取长度，再写入并推进指针）
+    int nCertLen = i2d_X509(cert, NULL);
+    if (nCertLen <= 0) {
+        g_lastError = "证书 DER 编码失败";
+        EVP_PKEY_free(pkey);
+        X509_free(cert);
+        if (ca) sk_X509_pop_free(ca, X509_free);
+        ERR_clear_error();
+        return -1;
+    }
+    unsigned char* certDER = (unsigned char*)malloc((size_t)nCertLen);
+    if (!certDER) {
+        g_lastError = "内存分配失败";
+        EVP_PKEY_free(pkey);
+        X509_free(cert);
+        if (ca) sk_X509_pop_free(ca, X509_free);
+        return -1;
+    }
+    {
+        unsigned char* pCert = certDER;
+        if (i2d_X509(cert, &pCert) <= 0) {
+            free(certDER);
+            g_lastError = "证书 DER 编码失败";
+            EVP_PKEY_free(pkey);
+            X509_free(cert);
+            if (ca) sk_X509_pop_free(ca, X509_free);
+            ERR_clear_error();
+            return -1;
+        }
+    }
+
+    // 私钥 DER：优先 PKCS#8（SecKeyCreateWithData 最稳）；不可用或失败时回退 i2d_PrivateKey（RSA 输出 PKCS#1，EC 输出 SEC1）
+    unsigned char* keyDER = NULL;
+    int nKeyLen = 0;
+#if !defined(OPENSSL_NO_DEPRECATED) && !defined(OPENSSL_NO_DEPRECATED_3_0)
+    {
+        PKCS8_PRIV_KEY_INFO* p8info = EVP_PKEY2PKCS8(pkey);
+        if (p8info != NULL) {
+            int nP8Len = i2d_PKCS8_PRIV_KEY_INFO(p8info, NULL);
+            if (nP8Len > 0) {
+                unsigned char* buf = (unsigned char*)malloc((size_t)nP8Len);
+                if (buf != NULL) {
+                    unsigned char* pKey = buf;
+                    if (i2d_PKCS8_PRIV_KEY_INFO(p8info, &pKey) > 0) {
+                        keyDER = buf;
+                        nKeyLen = nP8Len;
+                    } else {
+                        free(buf);
+                    }
+                }
+            }
+            PKCS8_PRIV_KEY_INFO_free(p8info);
+        }
+    }
+#endif
+    if (keyDER == NULL) {
+        int nP1Len = i2d_PrivateKey(pkey, NULL);
+        if (nP1Len <= 0) {
+            free(certDER);
+            g_lastError = "私钥 DER 编码失败";
+            EVP_PKEY_free(pkey);
+            X509_free(cert);
+            if (ca) sk_X509_pop_free(ca, X509_free);
+            ERR_clear_error();
+            return -1;
+        }
+        unsigned char* buf = (unsigned char*)malloc((size_t)nP1Len);
+        if (!buf) {
+            free(certDER);
+            g_lastError = "内存分配失败";
+            EVP_PKEY_free(pkey);
+            X509_free(cert);
+            if (ca) sk_X509_pop_free(ca, X509_free);
+            return -1;
+        }
+        unsigned char* pKey = buf;
+        if (i2d_PrivateKey(pkey, &pKey) <= 0) {
+            free(buf);
+            free(certDER);
+            g_lastError = "私钥 DER 编码失败";
+            EVP_PKEY_free(pkey);
+            X509_free(cert);
+            if (ca) sk_X509_pop_free(ca, X509_free);
+            ERR_clear_error();
+            return -1;
+        }
+        keyDER = buf;
+        nKeyLen = nP1Len;
+    }
+
+    *outCertDER = certDER;
+    *outCertLen = nCertLen;
+    *outKeyDER = keyDER;
+    *outKeyLen = nKeyLen;
+    *outIsRSA = isRSA;
+
+    EVP_PKEY_free(pkey);
+    X509_free(cert);
+    if (ca) sk_X509_pop_free(ca, X509_free);
+    ERR_clear_error();
     g_lastError.clear();
     return 0;
 }

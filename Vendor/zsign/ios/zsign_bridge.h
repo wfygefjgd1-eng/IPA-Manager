@@ -36,6 +36,15 @@ typedef struct {
 
 int zsign_sign(const ZSignOptions* options);
 int zsign_p12_info(const char* p12Path, const char* password, ZSignP12Info* info);
+
+// 从 p12 导出证书与私钥的 DER（不加密，证书用 i2d_X509、私钥优先 PKCS#8、失败回退 PKCS#1/SEC1），
+// 供 iOS Security framework 在 SecPKCS12Import 无法解析 OpenSSL 3 新式 p12 时构造 TLS 身份。
+// 返回 0 成功；-1 文件/解析失败；-2 密码错误。成功时通过 out 输出 DER 字节（调用方负责 free()）。
+int zsign_p12_export_identity(const char* p12Path, const char* password,
+                              unsigned char** outCertDER, int* outCertLen,
+                              unsigned char** outKeyDER,  int* outKeyLen,
+                              int* outIsRSA); // 1=RSA, 0=EC
+
 const char* zsign_last_error(void);
 
 #ifdef __cplusplus

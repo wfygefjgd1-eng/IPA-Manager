@@ -37,17 +37,82 @@ final class IPAParser {
             throw AppError.operationFailed("解压失败：\(error.localizedDescription)")
         }
 
-        guard let appURL = findAppBundle(in: extractDir) else {
-            // 解压成功但找不到 .app：列出压缩包顶层实际内容，
-            // 让用户/我们一眼看出这是源码包、证书包、空包还是结构异常的 ZIP。
-            throw AppError.operationFailed(noAppBundleMessage(for: extractDir))
+        // 优先级不变：zip 里同时存在 .app 时仍按标准应用包解析
+        if let appURL = findAppBundle(in: extractDir) {
+            return try makePackage(appURL: appURL, extractDir: extractDir)
         }
 
+        // zip 内嵌 .ipa（GitHub release 常见格式：zip 包着 ipa + 校验 txt）：
+        // 没有 .app 时在解压目录里找独立的 .ipa，把其中的 .app 提取到当前解压目录再解析。
+        if ext == "zip", let ipaURL = findEmbeddedIPA(in: extractDir),
+           let appURL = try extractAppFromEmbeddedIPA(ipaURL, into: extractDir) {
+            return try makePackage(appURL: appURL, extractDir: extractDir)
+        }
+
+        // 解压成功但既找不到 .app 也找不到 .ipa：列出压缩包顶层实际内容，
+        // 让用户/我们一眼看出这是源码包、证书包、空包还是结构异常的 ZIP。
+        throw AppError.operationFailed(noAppBundleMessage(for: extractDir))
+    }
+
+    /// 从 zip 内嵌的 .ipa 中提取 .app，移入当前解压目录：
+    /// - 内嵌 .ipa 解压到独立命名（UUID）的临时目录，避免与当前 extractDir 重名冲突
+    ///   （典型场景是 zip 与内嵌 ipa 同名：如 "EPICKLE-VR.6.19-IOS.zip" 内含
+    ///   "EPICKLE-VR.6.19-IOS.ipa"，若复用同名目录会互相覆盖）；
+    /// - 找到 .app 后移动到 extractDir：返回的 ParsedPackage 必须指向持久位置，
+    ///   与普通解析的生命周期一致（调用方在 parse 返回后仍会立即读取 appURL）；
+    /// - defer 清理临时目录，只保留移出的 .app。
+    /// 返回 nil 表示内嵌 .ipa 不是有效的 IPA 结构（解压后无 .app），由调用方回落错误处理。
+    private func extractAppFromEmbeddedIPA(_ ipaURL: URL, into extractDir: URL) throws -> URL? {
+        let tempDir = AppFileManager.shared.directoryURL(.extracted)
+            .appendingPathComponent("IPA-Embedded-\(UUID().uuidString)", isDirectory: true)
+        defer { try? fileManager.removeItem(at: tempDir) }
+
+        do {
+            try zipManager.unzip(archiveURL: ipaURL, destinationURL: tempDir)
+        } catch {
+            // 外层 zip 正常，但内嵌的 .ipa 本身损坏/截断（如 release 未上传完整）：
+            // 单独给出“内嵌 .ipa”提示，避免误报为外层 zip 损坏。
+            throw AppError.operationFailed(
+                "压缩包内嵌的 .ipa 无法解压（\(ipaURL.lastPathComponent)）：\(error.localizedDescription)"
+            )
+        }
+
+        guard let innerApp = findAppBundle(in: tempDir) else { return nil }
+
+        let movedAppURL = extractDir.appendingPathComponent(innerApp.lastPathComponent)
+        if fileManager.fileExists(atPath: movedAppURL.path) {
+            try? fileManager.removeItem(at: movedAppURL)
+        }
+        try fileManager.moveItem(at: innerApp, to: movedAppURL)
+        return movedAppURL
+    }
+
+    /// 在解压目录中查找独立的 .ipa 文件（顶层或任意子目录，排除 .app 内部的），
+    /// 用于 zip 内嵌 .ipa 的解析。zip 中不可能有多个有效的内嵌 ipa，取第一个即可。
+    private func findEmbeddedIPA(in rootURL: URL) -> URL? {
+        guard let enumerator = fileManager.enumerator(at: rootURL, includingPropertiesForKeys: nil) else {
+            return nil
+        }
+        while let element = enumerator.nextObject() as? URL {
+            guard element.pathExtension.lowercased() == "ipa",
+                  !isInsideAppBundle(element) else { continue }
+            let isDirectory = (try? element.resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory ?? false
+            guard !isDirectory else { continue }
+            return element
+        }
+        return nil
+    }
+
+    private func isInsideAppBundle(_ url: URL) -> Bool {
+        url.pathComponents.contains { $0.hasSuffix(".app") }
+    }
+
+    /// 校验 .app 内 Info.plist 存在并构造 ParsedPackage（普通 .app 与内嵌 .ipa 解析共用统一出口）。
+    private func makePackage(appURL: URL, extractDir: URL) throws -> ParsedPackage {
         let infoPlistURL = appURL.appendingPathComponent("Info.plist")
         guard fileManager.fileExists(atPath: infoPlistURL.path) else {
             throw AppError.operationFailed("未找到 Info.plist: \(appURL.lastPathComponent)")
         }
-
         return ParsedPackage(appURL: appURL, infoPlistURL: infoPlistURL, rootURL: extractDir)
     }
 

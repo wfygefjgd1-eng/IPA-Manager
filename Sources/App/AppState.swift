@@ -38,7 +38,7 @@ final class AppState: ObservableObject {
         case unknown(String)
     }
 
-    private func handleDownloadedFile(
+    func handleDownloadedFile(
         at url: URL,
         completion: ((Result<AppInfo, Error>) -> Void)? = nil
     ) {
@@ -325,7 +325,13 @@ final class AppState: ObservableObject {
         Logger.info("外部打开文件: \(url.lastPathComponent)")
 
         switch ext {
-        case "zip", "p12", "pfx", "mobileprovision":
+        case "zip":
+            // zip 统一走下载完成的分类导入（证书包 / 应用包 / zip 内嵌 ipa / 未知），
+            // 修复“文件 App 打开 zip 包着 ipa”时一律被当证书包导入、内嵌 .ipa 无法识别的问题。
+            // 分类为 .certificateBundle 时其内部仍会调 importCertificateBundleOrFile，证书包不受影响。
+            handleDownloadedFile(at: url)
+        case "p12", "pfx", "mobileprovision":
+            // 单个证书相关文件保持原逻辑（zip 才是证书包载体）
             importCertificateBundleOrFile(url)
         default:
             importFile(from: url) { _ in }
