@@ -13,10 +13,8 @@ struct HomeView: View {
         NavigationView {
             ScrollView {
                 VStack(spacing: 16) {
-                    statusCard
                     importBar
                     appsSection
-                    recentSignings
                 }
                 .padding()
             }
@@ -65,14 +63,6 @@ struct HomeView: View {
                         appRow(app)
                     }
                 }
-                if !appState.installedApps.isEmpty {
-                    Text("已签名 (\(appState.installedApps.count))")
-                        .font(.subheadline)
-                        .foregroundColor(.green)
-                    ForEach(appState.installedApps) { app in
-                        appRow(app)
-                    }
-                }
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
@@ -110,51 +100,6 @@ struct HomeView: View {
         }
     }
 
-    private var statusCard: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            Text("证书状态")
-                .font(.headline)
-
-            if let cert = appState.selectedCertificate {
-                Label {
-                    Text("\(cert.name) · \(cert.statusDescription)")
-                } icon: {
-                    Image(systemName: cert.status == .valid ? "checkmark.circle.fill" : "xmark.circle.fill")
-                        .foregroundColor(cert.status == .valid ? .green : .red)
-                }
-            } else {
-                Label {
-                    Text("未选择证书")
-                } icon: {
-                    Image(systemName: "exclamationmark.triangle")
-                        .foregroundColor(.orange)
-                }
-            }
-
-            Divider()
-
-            if let profile = appState.selectedProfile {
-                Label {
-                    Text("\(profile.name) · \(profile.statusDescription)")
-                } icon: {
-                    Image(systemName: "doc.badge.gearshape")
-                        .foregroundColor(profile.status == .valid ? .green : .red)
-                }
-            } else {
-                Label {
-                    Text("未选择描述文件")
-                } icon: {
-                    Image(systemName: "exclamationmark.triangle")
-                        .foregroundColor(.orange)
-                }
-            }
-        }
-        .padding()
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .background(Color(.secondarySystemBackground))
-        .cornerRadius(12)
-    }
-
     // 首页功能入口：仅保留可用的「导入文件」，显示为整条可点的长条卡片
     private var importBar: some View {
         Button {
@@ -184,49 +129,6 @@ struct HomeView: View {
             .frame(maxWidth: .infinity, alignment: .leading)
             .background(Color(.secondarySystemBackground))
             .cornerRadius(12)
-        }
-    }
-
-    private var recentSignings: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            Text("最近签名任务")
-                .font(.headline)
-
-            if appState.signingTasks.isEmpty {
-                Text("暂无签名任务")
-                    .font(.subheadline)
-                    .foregroundColor(.secondary)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-            } else {
-                ForEach(appState.signingTasks.prefix(5)) { task in
-                    HStack {
-                        VStack(alignment: .leading) {
-                            Text(task.sourceAppName.isEmpty ? "未命名" : task.sourceAppName)
-                                .font(.subheadline)
-                            Text(task.createdAt, style: .date)
-                                .font(.caption)
-                                .foregroundColor(.secondary)
-                        }
-                        Spacer()
-                        Text(task.statusDescription)
-                            .font(.caption)
-                            .padding(.horizontal, 8)
-                            .padding(.vertical, 4)
-                            .background(statusColor(task.status))
-                            .cornerRadius(6)
-                    }
-                }
-            }
-        }
-        .frame(maxWidth: .infinity, alignment: .leading)
-    }
-
-    private func statusColor(_ status: SigningTask.Status) -> Color {
-        switch status {
-        case .success: return .green.opacity(0.2)
-        case .failed: return .red.opacity(0.2)
-        case .processing: return .blue.opacity(0.2)
-        case .queued: return .gray.opacity(0.2)
         }
     }
 

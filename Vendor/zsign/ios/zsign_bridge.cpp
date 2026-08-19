@@ -313,8 +313,8 @@ int zsign_p12_info(const char* p12Path, const char* password, ZSignP12Info* info
 int zsign_p12_export_identity(const char* p12Path, const char* password,
                               unsigned char** outCertDER, int* outCertLen,
                               unsigned char** outKeyDER,  int* outKeyLen,
-                              int* outIsRSA) {
-    if (!p12Path || !outCertDER || !outCertLen || !outKeyDER || !outKeyLen || !outIsRSA) {
+                              int* outIsRSA, int* outKeyFormat) {
+    if (!p12Path || !outCertDER || !outCertLen || !outKeyDER || !outKeyLen || !outIsRSA || !outKeyFormat) {
         g_lastError = "无效的 p12 导出参数";
         return -1;
     }
@@ -324,6 +324,7 @@ int zsign_p12_export_identity(const char* p12Path, const char* password,
     *outKeyDER = NULL;
     *outKeyLen = 0;
     *outIsRSA = 0;
+    *outKeyFormat = 0;
 
     BIO* bio = BIO_new_file(p12Path, "rb");
     if (!bio) {
@@ -398,9 +399,12 @@ int zsign_p12_export_identity(const char* p12Path, const char* password,
         }
     }
 
-    // 私钥 DER：优先 PKCS#8（SecKeyCreateWithData 最稳）；不可用或失败时回退 i2d_PrivateKey（RSA 输出 PKCS#1，EC 输出 SEC1）
+    // 私钥 DER：优先 PKCS#8（SecKeyCreateWithData 最稳）；不可用或失败时回退 i2d_PrivateKey（RSA 输出 PKCS#1，EC 输出 SEC1）。
+    // 注意：PKCS#8 路径受 OPENSSL_NO_DEPRECATED 系列宏保护（本工程构建未启用 no-deprecated，条件成立 → 走 PKCS#8）；
+    // 为保证只读诊断也能区分实际导出格式，nKeyFormat 会随成功结果输出（1=PKCS#8, 2=PKCS#1/SEC1）。
     unsigned char* keyDER = NULL;
     int nKeyLen = 0;
+    int nKeyFormat = 0;
 #if !defined(OPENSSL_NO_DEPRECATED) && !defined(OPENSSL_NO_DEPRECATED_3_0)
     {
         PKCS8_PRIV_KEY_INFO* p8info = EVP_PKEY2PKCS8(pkey);
@@ -413,6 +417,7 @@ int zsign_p12_export_identity(const char* p12Path, const char* password,
                     if (i2d_PKCS8_PRIV_KEY_INFO(p8info, &pKey) > 0) {
                         keyDER = buf;
                         nKeyLen = nP8Len;
+                        nKeyFormat = 1; // PKCS#8
                     } else {
                         free(buf);
                     }
@@ -455,6 +460,7 @@ int zsign_p12_export_identity(const char* p12Path, const char* password,
         }
         keyDER = buf;
         nKeyLen = nP1Len;
+        nKeyFormat = 2; // PKCS#1/SEC1 回退
     }
 
     *outCertDER = certDER;
@@ -462,6 +468,7 @@ int zsign_p12_export_identity(const char* p12Path, const char* password,
     *outKeyDER = keyDER;
     *outKeyLen = nKeyLen;
     *outIsRSA = isRSA;
+    *outKeyFormat = nKeyFormat;
 
     EVP_PKEY_free(pkey);
     X509_free(cert);

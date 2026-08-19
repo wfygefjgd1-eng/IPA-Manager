@@ -229,9 +229,24 @@ struct DownloadsView: View {
         }
     }
 
-    /// 已 completed 但未匹配到已导入应用：先做轻量快速判断（文件缺失 / ZIP 魔数损坏），
-    /// 需要真实解压解析时放到后台执行，避免大文件解压阻塞主线程。
+    /// unrecognizedReason 的 zip 分支“解析成功且已触发补导入”时返回此标记，
+    /// 调用方据此跳过 alert（后续结果由补导入 completion 驱动），避免弹出“未出现”误导文案。
+    private static let zipRecognizedMarker = "__zip_recognized_trigger__"
+
+    /// 已 completed 但未匹配到已导入应用：先做主线程快速判断（文件缺失 / ZIP 魔数损坏），
+    /// 以及“自动导入其实已经成功”的复查；需要真实解压解析或补导入时放到后台执行，
+    /// 避免大文件解压阻塞主线程。
     private func recognizeUnmatchedTask(_ task: DownloadTask) {
+        // 主线程优先复查 @Published importedApps：自动导入可能在下载完成时就已入库成功
+        // （如 zip 内嵌 ipa，诊断日志里的“自动解析成功: xxx.ipa”），此时 matchedApp 直接命中。
+        // 零延迟直接打开签名详情页——与列表点击已匹配任务行为一致，绝不再重复解析/导入，
+        // 也绝不给用户弹任何 alert。
+        if let app = matchedApp(for: task) {
+            Logger.info("下载文件已识别（自动导入已完成），零延迟打开签名页: \(app.name)")
+            selectedApp = app
+            return
+        }
+
         let path = task.destinationPath
         let exists = !path.isEmpty && FileManager.default.fileExists(atPath: path)
         let isZip = (path as NSString).pathExtension.lowercased() == "zip"
@@ -243,14 +258,24 @@ struct DownloadsView: View {
             return
         }
 
-        // 魔数正常但仍解析失败：后台实际解析一次拿到真实原因，保持界面流畅
+        // 魔数正常但仍未匹配：后台实际解析 / 补导入一次拿到真实结果，保持界面流畅。
+        // unrecognizedReason 返回 zipRecognizedMarker 表示“已识别并触发补导入”，
+        // 此时不走 alert，后续结果由补导入 completion 驱动（成功打开签名页 / 失败弹原因）。
         DispatchQueue.global(qos: .userInitiated).async {
             let reason = self.unrecognizedReason(for: task)
             DispatchQueue.main.async {
+                guard reason != Self.zipRecognizedMarker else { return }
                 self.unrecognizedMessage = reason
                 self.showUnrecognizedAlert = true
             }
         }
+    }
+
+    /// 识别/导入成功后的统一出口：零延迟直接打开签名详情页（AppDetailView 经
+    /// .sheet(item: $selectedApp) 弹出，用户可立即一键签名），与列表点击“已匹配任务”
+    /// 的行为完全一致；不弹 alert、不做二次解析、不插入任何中间提示。
+    private func openSigning(for app: AppInfo) {
+        selectedApp = app
     }
 
     /// 已 completed 但未匹配到已导入应用时，给出具体导入失败原因而非笼统的“无法识别”。
@@ -272,22 +297,58 @@ struct DownloadsView: View {
                 Logger.error("无法识别下载文件: \(task.fileName) - \(reason)")
                 return reason
             }
-            // 文件头（PK 魔数）正常但自动导入仍失败：这里实际解析一次。
-            // 解析成功说明 zip 内包含 .app 或 .ipa（IPAParser 已支持 zip 内嵌 .ipa）；
-            // 若仍未匹配到已导入应用，说明自动导入没跑成，主动补一次导入兜底。
+            // 文件头（PK 魔数）正常但自动导入仍失败/未完成：后台实际解析一次
+            // （调用方已确保本函数在后台队列执行，解析含解压，不阻塞主线程）。
+            // 解析成功说明 zip 内含 .app 或内嵌 .ipa（IPAParser 已支持 zip 内嵌 .ipa）。
+            // 此时绝不把“若未出现请删除任务后重新下载”的误导文案丢给用户，而是让用户能立刻去签名：
+            //   1) 回主线程先查 importedApps——自动导入可能其实已经成功，matchedApp 直接命中，
+            //      零延迟直接打开签名详情页，不弹任何 alert；
+            //   2) 未命中则主动补一次完整导入（handleDownloadedFile，幂等：内嵌 ipa 复制到
+            //      Documents/IPA 后走 importFile，importFile 按 bundleID 去重替换），
+            //      导入结果经 completion 回到主线程：成功→零延迟打开签名详情页（无 alert），
+            //      失败→弹 zipParseFailureReason 给出的具体中文原因。
+            // 兜底：handleDownloadedFile 对“证书包 zip”不会回调 completion（证书导入无 completion），
+            // 该分支几秒内无结果时再查一次 importedApps，仍未命中才弹通用提示，避免用户无任何反馈。
             do {
                 _ = try IPAParser().parse(fileURL: URL(fileURLWithPath: path))
-                // matchedApp 读取 @Published importedApps，需在主线程判断；
-                // handleDownloadedFile 内部会再切到后台执行分类与导入，调用安全。
                 DispatchQueue.main.async {
-                    if self.matchedApp(for: task) == nil {
-                        Logger.info("zip 可解析但未匹配到已导入应用，主动补导入: \(task.fileName)")
-                        self.appState.handleDownloadedFile(at: URL(fileURLWithPath: path))
+                    if let app = self.matchedApp(for: task) {
+                        Logger.info("zip 已自动导入成功，零延迟打开签名页: \(app.name)")
+                        self.openSigning(for: app)
+                        return
+                    }
+                    Logger.info("zip 可解析但未匹配到已导入应用，主动补导入: \(task.fileName)")
+                    var finished = false
+                    let url = URL(fileURLWithPath: path)
+                    self.appState.handleDownloadedFile(at: url) { result in
+                        DispatchQueue.main.async {
+                            guard !finished else { return }
+                            finished = true
+                            switch result {
+                            case .success(let app):
+                                Logger.info("zip 补导入成功，零延迟打开签名页: \(app.name)")
+                                self.openSigning(for: app)
+                            case .failure(let error):
+                                let reason = self.zipParseFailureReason(task: task, detail: error.localizedDescription)
+                                self.unrecognizedMessage = reason
+                                self.showUnrecognizedAlert = true
+                            }
+                        }
+                    }
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 4.0) {
+                        guard !finished else { return }
+                        finished = true
+                        if let app = self.matchedApp(for: task) {
+                            self.openSigning(for: app)
+                        } else {
+                            let reason = "压缩包内包含应用（.app 或 .ipa），已重新尝试导入。若仍失败，请查看下方具体原因。"
+                            Logger.error("无法识别下载文件: \(task.fileName) - \(reason)")
+                            self.unrecognizedMessage = reason
+                            self.showUnrecognizedAlert = true
+                        }
                     }
                 }
-                let reason = "压缩包内包含应用（.app 或 .ipa），自动导入应已将其加入「我的应用」；若未出现，请删除任务后重新下载导入。"
-                Logger.info("下载文件可解析（自动导入未匹配，已补导入）: \(task.fileName) - \(reason)")
-                return reason
+                return Self.zipRecognizedMarker
             } catch {
                 return zipParseFailureReason(task: task, detail: error.localizedDescription)
             }

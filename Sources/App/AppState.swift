@@ -18,6 +18,11 @@ final class AppState: ObservableObject {
     private let store = UserDefaultsStore()
     private let parser = IPAParser()
 
+    /// 已签名应用刷新串行队列：parseAppInfo 会解压整个 IPA（较慢），且
+    /// refreshInstalledApps 可能在主线程被多次触发（签名完成 / 删除应用 / 启动），
+    /// 用串行队列保证多次解析互不重叠、不阻塞主线程；@Published 赋值仍回主线程。
+    private let installedAppsRefreshQueue = DispatchQueue(label: "com.ipamanager.installed-apps-refresh")
+
     init() {
         loadPersistedState()
         refreshInstalledApps()
@@ -291,10 +296,13 @@ final class AppState: ObservableObject {
                         self.signingTasks[index].status = .success
                         self.signingTasks[index].progress = 1.0
                         self.signingTasks[index].outputPath = signedPath
-                        self.refreshInstalledApps()
                     }
                     self.saveState()
-                    completion?(.success(signedPath))
+                    // 已签名列表在后台串行队列解析后回主线程赋值，完成后才回调，
+                    // 保证 AppDetailView.liveApp 在 completion 后能立刻按 path 匹配到签名产物。
+                    self.refreshInstalledApps {
+                        completion?(.success(signedPath))
+                    }
                 }
             } catch {
                 DispatchQueue.main.async {
@@ -460,15 +468,75 @@ final class AppState: ObservableObject {
         }
     }
 
-    func refreshInstalledApps() {
-        let signedURLs = fileManager.contents(of: .signed)
-        installedApps = signedURLs.map { url in
-            var app = AppInfo()
-            app.name = url.deletingPathExtension().lastPathComponent
-            app.path = url.path
-            app.size = fileManager.fileSize(at: url)
-            app.isSigned = true
-            return app
+    /// 重新扫描 Documents/Signed 下的签名产物并刷新已签名应用列表。
+    /// 对每个签名 IPA 完整解析，拿到 bundleID / version / iconPath（修复“未知 Bundle ID”、
+    /// 图标不显示）；解析失败时回退为旧逻辑（文件名 + isSigned）。
+    /// 解析在串行后台队列执行（解压较慢，不可上主线程），最终 @Published 赋值回到主线程。
+    func refreshInstalledApps(completion: (() -> Void)? = nil) {
+        installedAppsRefreshQueue.async {
+            let signedURLs = self.fileManager.contents(of: .signed)
+            let apps = signedURLs.map { self.makeInstalledAppInfo(from: $0) }
+            DispatchQueue.main.async {
+                self.installedApps = apps
+                completion?()
+            }
+        }
+    }
+
+    /// 解析单个签名产物为完整 AppInfo；失败时回退旧逻辑（文件名 + isSigned）。
+    private func makeInstalledAppInfo(from url: URL) -> AppInfo {
+        // parseAppInfo 会解压 IPA 并读取 Info.plist / 提取图标
+        if var parsed = try? parser.parseAppInfo(fileURL: url) {
+            // 覆盖回签名产物自身：parseAppInfo 返回的 path 是 .app 内部路径、
+            // size 是 IPA 大小。其它调用方（AppDetailView 按 path 匹配已签名列表、
+            // 详情/首页按 signedPath/path 取签名文件时间）依赖这些字段指向签名 IPA。
+            parsed.path = url.path
+            parsed.size = fileManager.fileSize(at: url)
+            parsed.isSigned = true
+            parsed.signedPath = url.path
+            // extractIcon 返回的是 .app 内部路径，而解压目录（Extracted/<baseName>/）
+            // 会在下一轮解析时被整体清空重建，因此把图标复制到稳定位置再回填 iconPath，
+            // 保证刷新后 iconPath 指向存在的文件。
+            if let iconPath = parsed.iconPath,
+               FileManager.default.fileExists(atPath: iconPath),
+               let stablePath = persistInstalledAppIcon(
+                   from: iconPath,
+                   baseName: url.deletingPathExtension().lastPathComponent,
+                   app: parsed
+               ) {
+                parsed.iconPath = stablePath
+            }
+            return parsed
+        }
+
+        var fallback = AppInfo()
+        fallback.name = url.deletingPathExtension().lastPathComponent
+        fallback.path = url.path
+        fallback.size = fileManager.fileSize(at: url)
+        fallback.isSigned = true
+        return fallback
+    }
+
+    /// 把签名 IPA 解压出的图标复制到稳定位置 Extracted/<baseName>/<标识>-icon.<ext>，
+    /// 避免后续解析清理解压目录后图标路径失效。复制失败返回 nil（调用方保留原路径兜底）。
+    private func persistInstalledAppIcon(from iconPath: String, baseName: String, app: AppInfo) -> String? {
+        let source = URL(fileURLWithPath: iconPath)
+        var label = app.bundleID.isEmpty ? app.name : app.bundleID
+        // 文件名安全化：bundleID 一般只含字母数字点横线；显示名可能含 / : 等非法字符
+        label = label.replacingOccurrences(of: "/", with: "-")
+            .replacingOccurrences(of: ":", with: "-")
+        if label.isEmpty { label = baseName }
+        let fileName = "\(label)-icon.\(source.pathExtension.lowercased())"
+        let target = fileManager.directoryURL(.extracted)
+            .appendingPathComponent(baseName, isDirectory: true)
+            .appendingPathComponent(fileName)
+        do {
+            // AppFileManager.copyItem 会先移除已存在的同名目标，重复刷新安全
+            try fileManager.copyItem(from: source, to: target)
+            return target.path
+        } catch {
+            Logger.warning("已签名应用图标持久化失败: \(fileName) - \(error.localizedDescription)")
+            return nil
         }
     }
 
