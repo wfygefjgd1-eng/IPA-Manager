@@ -38,8 +38,8 @@ jobs:
           export SIM_CROSS_TOP="$XCODE_DEV/Contents/Developer/Platforms/iPhoneSimulator.platform"
 
           # Build for device (arm64)
-          CROSS_TOP="$IOS_CROSS_TOP" CROSS_SDK=iPhoneOS.sdk CC="xcrun --sdk iphoneos clang" \
-            ./Configure ios64-cross \
+          export CROSS_TOP="$IOS_CROSS_TOP" CROSS_SDK=iPhoneOS.sdk
+          CC="xcrun --sdk iphoneos clang" ./Configure ios64-cross \
             --prefix=/tmp/openssl-out/device \
             --openssldir=/tmp/openssl-out/device \
             -D__IPHONE_OS_VERSION_MIN_REQUIRED=160000 \
@@ -49,8 +49,8 @@ jobs:
 
           # Build for simulator (arm64)
           make distclean 2>/dev/null || true
-          CROSS_TOP="$SIM_CROSS_TOP" CROSS_SDK=iPhoneSimulator.sdk CC="xcrun --sdk iphonesimulator clang" \
-            ./Configure ios-sim-cross-arm64 \
+          export CROSS_TOP="$SIM_CROSS_TOP" CROSS_SDK=iPhoneSimulator.sdk
+          CC="xcrun --sdk iphonesimulator clang" ./Configure ios-sim-cross-arm64 \
             --prefix=/tmp/openssl-out/sim-arm64 \
             --openssldir=/tmp/openssl-out/sim-arm64 \
             -D__IPHONE_OS_VERSION_MIN_REQUIRED=160000 \
@@ -60,8 +60,8 @@ jobs:
 
           # Build for simulator (x86_64)
           make distclean 2>/dev/null || true
-          CROSS_TOP="$SIM_CROSS_TOP" CROSS_SDK=iPhoneSimulator.sdk CC="xcrun --sdk iphonesimulator clang" \
-            ./Configure ios-sim-cross-x86_64 \
+          export CROSS_TOP="$SIM_CROSS_TOP" CROSS_SDK=iPhoneSimulator.sdk
+          CC="xcrun --sdk iphonesimulator clang" ./Configure ios-sim-cross-x86_64 \
             --prefix=/tmp/openssl-out/sim-x86_64 \
             --openssldir=/tmp/openssl-out/sim-x86_64 \
             -D__IPHONE_OS_VERSION_MIN_REQUIRED=160000 \
