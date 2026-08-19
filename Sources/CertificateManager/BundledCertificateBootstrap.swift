@@ -10,12 +10,17 @@ final class BundledCertificateBootstrap {
         guard let p12URL = Bundle.main.url(forResource: "bundled", withExtension: "p12") else { return }
         guard let provURL = Bundle.main.url(forResource: "bundled", withExtension: "mobileprovision") else { return }
 
-        // 仅在“已导入过 且 证书/描述文件都在”时跳过；
-        // 任一数据丢失（为空）都要重新导入，不受已设标记影响。
+        // 仅在“已导入过 且 证书已导入 且所有已存描述文件记录的文件都真实存在”时跳过；
+        // 任一描述文件记录的 path 失效（文件不存在，如旧版本只存了 Bundle 内路径，而
+        // Bundle 的 UUID 会随 app 更新/重装变化）都不能跳过，必须重新走导入流程，
+        // 把 Bundle 内描述文件复制到 Documents/Profiles 并回填稳定路径，
+        // 否则签名时 zsign 将读不到描述文件。
         let alreadyImported = UserDefaults.standard.bool(forKey: key)
         let hasCert = !appState.certificates.isEmpty
-        let hasProfile = !appState.profiles.isEmpty
-        if alreadyImported && hasCert && hasProfile { return }
+        let profilesUsable = !appState.profiles.isEmpty && appState.profiles.allSatisfy { profile in
+            !profile.path.isEmpty && FileManager.default.fileExists(atPath: profile.path)
+        }
+        if alreadyImported && hasCert && profilesUsable { return }
 
         Logger.info("检测到捆绑证书，开始自动导入")
 
@@ -26,10 +31,28 @@ final class BundledCertificateBootstrap {
             // 并返回 Documents 下的稳定路径；不要再用 provURL.path（Bundle 内路径）
             // 覆盖它——Bundle 的 UUID 会随 app 更新/重装变化，导致持久化路径失效。
             let profile = try ProvisioningManager.shared.importProfile(from: provURL)
-            if !appState.profiles.contains(where: { $0.uuid == profile.uuid }) {
+            // 按 uuid upsert：已存在同 uuid 记录时，原地把 path 更新为新的稳定路径
+            // （修复旧版本的 Bundle 内失效路径），保持记录 id 不变，避免破坏
+            // selectedProfile / 签名任务对旧 id 的引用；不存在则新增。
+            if let index = appState.profiles.firstIndex(where: { $0.uuid == profile.uuid }) {
+                appState.profiles[index].path = profile.path
+                // selectedProfile 持有的是 struct 副本，同步修复其 path，
+                // 避免后续“默认选中”签名流程仍读到失效路径
+                if appState.selectedProfile?.uuid == profile.uuid {
+                    appState.selectedProfile?.path = profile.path
+                }
+                appState.saveState()
+            } else {
                 appState.addProfile(profile)
             }
-            profileOK = true
+            // 重新确认文件真实存在后再视为成功（决定是否记录“已导入”标记，
+            // 避免标记提前打上导致下次启动跳过修复）
+            profileOK = FileManager.default.fileExists(atPath: profile.path)
+            if profileOK {
+                Logger.info("捆绑描述文件已就绪: \(profile.path)")
+            } else {
+                Logger.error("捆绑描述文件导入后文件仍不存在: \(profile.path)")
+            }
             Logger.info("捆绑描述文件导入成功: \(profile.name)")
         } catch {
             Logger.error("捆绑描述文件导入失败: \(error.localizedDescription)")

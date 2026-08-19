@@ -31,6 +31,9 @@ final class AppState: ObservableObject {
     private enum DownloadedArchiveKind {
         case certificateBundle
         case appPackage
+        /// zip 内嵌 .ipa（GitHub release 常见格式：zip 包着 ipa + 校验 txt）；
+        /// 携带已复制到 Documents/IPA 持久位置的 .ipa 文件 URL（不会是临时目录内的路径）
+        case embeddedIPA(URL)
         /// 压缩包能正常解压但既非应用包也非证书包；携带顶层内容摘要，便于定位真实结构
         case unknown(String)
     }
@@ -78,9 +81,23 @@ final class AppState: ObservableObject {
                             completion?(result)
                         }
                     }
+                case .embeddedIPA(let ipaURL):
+                    // zip 内嵌 .ipa → 直接导入“我的应用”：
+                    // 文件已复制到 .ipa 目录（url.path == destination.path），importFile 会跳过复制直接 parse
+                    self.importFile(from: ipaURL) { result in
+                        DispatchQueue.main.async {
+                            switch result {
+                            case .success:
+                                Logger.info("自动解析成功（zip 内嵌 ipa）: \(ipaURL.lastPathComponent)")
+                            case .failure(let error):
+                                Logger.error("自动解析失败: \(error.localizedDescription)")
+                            }
+                            completion?(result)
+                        }
+                    }
                 case .unknown(let summary):
                     // 保留原始分类信息，并附上“压缩包内包含：…”内容摘要，方便定位真实结构
-                    let message = "该 ZIP 不是应用包（无 Payload/*.app 结构）也不是证书包（无 .p12/.mobileprovision）。\(summary)"
+                    let message = "该 ZIP 不是应用包（未发现 .app 应用包或 .ipa 文件）也不是证书包（无 .p12/.mobileprovision）。\(summary)"
                     DispatchQueue.main.async {
                         Logger.error("自动解析失败: \(url.lastPathComponent) - \(message)")
                         completion?(.failure(AppError.operationFailed(message)))
@@ -125,6 +142,8 @@ final class AppState: ObservableObject {
 
         var hasCertificate = false
         var hasAppBundle = false
+        // zip 内嵌的独立 .ipa 文件在 Documents/IPA 下的持久副本；nil 表示尚未发现或复制失败
+        var embeddedIPAURL: URL? = nil
 
         guard let enumerator = FileManager.default.enumerator(at: tempDir, includingPropertiesForKeys: nil) else {
             throw AppError.operationFailed("无法读取压缩包内容: \(url.lastPathComponent)")
@@ -140,11 +159,26 @@ final class AppState: ObservableObject {
             } else if elementExt == "mobileprovision" && !isInsideAppBundle(element) {
                 // 排除 .app 内部的 embedded.mobileprovision，避免应用包被误判为证书包
                 hasCertificate = true
+            } else if elementExt == "ipa" && !isInsideAppBundle(element) {
+                // zip 内嵌 .ipa（GitHub release 常见格式：zip 包着 ipa + 校验 txt）。
+                // 临时目录会被本函数末尾的 defer 删除，因此必须立即复制到 Documents/IPA 持久位置，
+                // 否则返回的 URL 会在 defer 后失效。只记录第一个成功复制的副本。
+                guard embeddedIPAURL == nil else { continue }
+                let destURL = self.fileManager.directoryURL(.ipa)
+                    .appendingPathComponent(element.lastPathComponent)
+                // copyItem 不返回 URL，复制成功后用目标路径构造并校验文件已存在
+                if (try? self.fileManager.copyItem(from: element, to: destURL)) != nil,
+                   FileManager.default.fileExists(atPath: destURL.path) {
+                    embeddedIPAURL = destURL
+                    Logger.info("压缩包内检测到内嵌 .ipa，已复制到: \(destURL.lastPathComponent)")
+                }
+                // 复制失败：绝不返回临时目录路径，跳过，最终落 .unknown
             }
         }
 
         if hasCertificate { return .certificateBundle }
         if hasAppBundle { return .appPackage }
+        if let embeddedURL = embeddedIPAURL { return .embeddedIPA(embeddedURL) }
         // 压缩包能正常解压但内部既无 .app 也无证书结构 → 未知类型（下游会报“不是应用包也不是证书包”）
         // 附上顶层内容摘要，说明“压缩包里到底有什么”（源码包 / 空包 / 其它结构）。
         let summary = topLevelSummary(of: tempDir)

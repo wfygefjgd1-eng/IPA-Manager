@@ -212,7 +212,15 @@ struct CertificatesView: View {
                             // importProfile 内部归档到 Documents/Profiles（目标本就在该目录时直接复用），
                             // 返回的 path 稳定，无需再覆盖
                             let profile = try ProvisioningManager.shared.importProfile(from: profileURL)
-                            if !appState.profiles.contains(where: { $0.uuid == profile.uuid }) {
+                            // 按 uuid 去重/更新：同名记录已存在时不重复添加，原地把 path
+                            // 更新为最新稳定路径（修复旧 Bundle 内失效路径），保持记录 id 不变
+                            if let index = appState.profiles.firstIndex(where: { $0.uuid == profile.uuid }) {
+                                appState.profiles[index].path = profile.path
+                                if appState.selectedProfile?.uuid == profile.uuid {
+                                    appState.selectedProfile?.path = profile.path
+                                }
+                                appState.saveState()
+                            } else {
                                 appState.addProfile(profile)
                             }
                             summary += "描述文件 ✓\n"
@@ -257,13 +265,19 @@ struct CertificatesView: View {
             try AppFileManager.shared.copyItem(from: url, to: destination)
             // importProfile 检测到源已在 Documents/Profiles 内，会直接复用该路径，无需再覆盖
             let profile = try ProvisioningManager.shared.importProfile(from: destination)
-            // 按 uuid 去重：同一描述文件重复导入只保留一份
-            if !appState.profiles.contains(where: { $0.uuid == profile.uuid }) {
+            // 按 uuid 去重/更新：同一描述文件重复导入不重复添加，原地把 path 更新为最新稳定路径
+            // （修复旧 Bundle 内失效路径）；保持记录 id 不变，避免破坏 selectedProfile 等引用
+            if let index = appState.profiles.firstIndex(where: { $0.uuid == profile.uuid }) {
+                appState.profiles[index].path = profile.path
+                if appState.selectedProfile?.uuid == profile.uuid {
+                    appState.selectedProfile?.path = profile.path
+                }
+                appState.saveState()
+                Logger.info("描述文件已存在，更新路径: \(profile.path)")
+                alertMessage = "描述文件已存在: \(profile.name)"
+            } else {
                 appState.addProfile(profile)
                 alertMessage = "描述文件导入成功: \(profile.name)"
-            } else {
-                Logger.info("描述文件已存在，跳过重复导入: \(profile.name)")
-                alertMessage = "描述文件已存在: \(profile.name)"
             }
         } catch {
             alertMessage = error.localizedDescription
