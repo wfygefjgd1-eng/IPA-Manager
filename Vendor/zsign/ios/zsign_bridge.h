@@ -4,7 +4,7 @@
 extern "C" {
 #endif
 
-typedef void (*ZSignProgressCallback)(int percent, const char* message);
+typedef void (*ZSignProgressCallback)(void* context, int percent, const char* message);
 
 typedef struct {
     const char* inputIpaPath;
@@ -21,6 +21,7 @@ typedef struct {
     int force;
     int enableDocuments;
     ZSignProgressCallback progressCallback;
+    void* context;
 } ZSignOptions;
 
 int zsign_sign(const ZSignOptions* options);

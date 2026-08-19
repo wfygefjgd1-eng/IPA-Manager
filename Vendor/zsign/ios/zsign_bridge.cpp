@@ -70,7 +70,7 @@ int zsign_sign(const ZSignOptions* options) {
         ZFile::GetTempFolder().c_str(), ZUtil::GetMicroSecond());
 
     if (options->progressCallback) {
-        options->progressCallback(5, "正在解压 IPA...");
+        options->progressCallback(options->context, , "正在解压 IPA...");
     }
 
     if (!Zip::Extract(strInputPath.c_str(), strTempFolder.c_str())) {
@@ -81,7 +81,7 @@ int zsign_sign(const ZSignOptions* options) {
 
     // 3. Sign the app bundle folder
     if (options->progressCallback) {
-        options->progressCallback(20, "正在签名主程序...");
+        options->progressCallback(options->context, , "正在签名主程序...");
     }
 
     ZBundle bundle;
@@ -100,7 +100,7 @@ int zsign_sign(const ZSignOptions* options) {
 
     // 4. Repackage to IPA
     if (options->progressCallback) {
-        options->progressCallback(85, "正在重新打包...");
+        options->progressCallback(options->context, , "正在重新打包...");
     }
 
     size_t pos = bundle.m_strAppFolder.rfind("Payload");
@@ -121,7 +121,7 @@ int zsign_sign(const ZSignOptions* options) {
     ZFile::RemoveFolder(strTempFolder.c_str());
 
     if (options->progressCallback) {
-        options->progressCallback(100, "签名完成");
+        options->progressCallback(options->context, , "签名完成");
     }
 
     return 0;

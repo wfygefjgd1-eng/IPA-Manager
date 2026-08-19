@@ -38,6 +38,11 @@ final class SigningEngine: SigningEngineProtocol {
 
         let certPassword = certManager.readPassword(for: certificate) ?? ""
 
+        // Bridge progress callback: pass a non-capturing C closure + context
+        let box = ProgressBox(handler: progress)
+        let context = Unmanaged.passRetained(box).toOpaque()
+        defer { Unmanaged<ProgressBox>.fromOpaque(context).release() }
+
         let result: Int32 = sourcePath.withCString { inputCStr in
             outputURL.path.withCString { outputCStr in
                 p12URL.path.withCString { p12CStr in
@@ -52,15 +57,8 @@ final class SigningEngine: SigningEngineProtocol {
                             options.zipLevel = -1
                             options.force = 1
                             options.enableDocuments = 1
-                            options.progressCallback = { percent, message in
-                                DispatchQueue.main.async {
-                                    progress(Double(percent) / 100.0)
-                                }
-                                if let message = message {
-                                    let text = String(cString: message)
-                                    Logger.debug("zsign: \(text)")
-                                }
-                            }
+                            options.context = context
+                            options.progressCallback = progressCallbackFunc
                             return zsign_sign(&options)
                         }
                     }
@@ -83,5 +81,25 @@ final class SigningEngine: SigningEngineProtocol {
             .appendingPathComponent("export-\(identifier).p12")
         try certManager.exportP12(identifier: identifier, to: tempURL)
         return tempURL
+    }
+}
+
+private final class ProgressBox {
+    let handler: (Double) -> Void
+
+    init(handler: @escaping (Double) -> Void) {
+        self.handler = handler
+    }
+}
+
+private let progressCallbackFunc: ZSignProgressCallback = { (context, percent, message) in
+    guard let context = context else { return }
+    let box = Unmanaged<ProgressBox>.fromOpaque(context).takeUnretainedValue()
+    DispatchQueue.main.async {
+        box.handler(Double(percent) / 100.0)
+    }
+    if let message = message {
+        let text = String(cString: message)
+        Logger.debug("zsign: \(text)")
     }
 }
