@@ -42,7 +42,7 @@ struct HomeView: View {
                 .font(.headline)
 
             if appState.importedApps.isEmpty && appState.installedApps.isEmpty {
-                Text("还没有导入任何应用，点"导入文件"导入 IPA / ZIP")
+                Text("还没有导入任何应用，点「导入文件」导入 IPA / ZIP")
                     .font(.subheadline)
                     .foregroundColor(.secondary)
                     .frame(maxWidth: .infinity, alignment: .leading)
