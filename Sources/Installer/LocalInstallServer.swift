@@ -45,11 +45,7 @@ final class LocalInstallServer {
     }
 
     private static func tlsOptions() -> NWProtocolTLS.Options {
-        let options = NWProtocolTLS.Options()
-        if let identity = ServerIdentityProvider.shared.currentIdentity {
-            sec_protocol_options_set_local_identity(options.securityProtocolOptions, identity)
-        }
-        return options
+        ServerIdentityProvider.shared.tlsOptions()
     }
 
     private func handleConnection(_ connection: NWConnection) {

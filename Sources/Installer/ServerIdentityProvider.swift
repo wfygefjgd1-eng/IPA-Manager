@@ -5,7 +5,7 @@ import Network
 final class ServerIdentityProvider {
     static let shared = ServerIdentityProvider()
 
-    private(set) var currentIdentity: sec_identity_t?
+    private(set) var currentIdentity: SecIdentity?
 
     func setIdentity(from p12URL: URL, password: String) throws {
         guard let data = try? Data(contentsOf: p12URL) else {
@@ -22,24 +22,27 @@ final class ServerIdentityProvider {
             throw AppError.certificateInvalid("证书导入身份失败 (错误码: \(status))")
         }
 
-        guard let identity = first[kSecImportItemIdentity as String] else {
+        guard let rawIdentity = first[kSecImportItemIdentity as String],
+              let identity = rawIdentity as? SecIdentity else {
             throw AppError.certificateInvalid("证书中未找到身份")
         }
 
-        let secIdentity = identity as! SecIdentity
-        let result = sec_identity_create_with_identity(secIdentity)
-        guard let result else {
-            throw AppError.certificateInvalid("创建 TLS 身份失败")
-        }
-        currentIdentity = result
-
-        // 将证书持久化到系统 Keychain，确保后续启动可直接使用
-        self.exportToKeychain(identity: secIdentity)
+        currentIdentity = identity
+        exportToKeychain(identity: identity)
         Logger.info("已设置本地服务器 TLS 身份")
     }
 
     func clear() {
         currentIdentity = nil
+    }
+
+    func tlsOptions() -> NWProtocolTLS.Options {
+        let options = NWProtocolTLS.Options()
+        guard let identity = currentIdentity else { return options }
+
+        let secOptions = options.securityProtocolOptions
+        IPMSetTLSIdentity(secOptions, identity)
+        return options
     }
 
     private func exportToKeychain(identity: SecIdentity) {
