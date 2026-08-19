@@ -249,8 +249,10 @@ final class ServerIdentityProvider {
         ]
         let labelStatus = SecItemCopyMatching(labelQuery as CFDictionary, &identityRef)
         Logger.info("Keychain 兜底：按 label 查询 SecIdentity (status=\(labelStatus))")
-        if labelStatus == errSecSuccess, let ref = identityRef as? SecIdentity {
-            return (ref, labelStatus)
+        // SecIdentity 是 CoreFoundation 类型，成功后应直接强转（as? 条件转换会被编译器
+        // 以 "conditional downcast to CoreFoundation type will always succeed" 拒绝）
+        if labelStatus == errSecSuccess, let ref = identityRef {
+            return (ref as! SecIdentity, labelStatus)
         }
 
         // 阶段 B：列出全部 identities，按证书 DER 匹配本次证书
@@ -262,10 +264,14 @@ final class ServerIdentityProvider {
         ]
         let listStatus = SecItemCopyMatching(listQuery as CFDictionary, &allRefs)
         Logger.info("Keychain 兜底：列出全部 identities (status=\(listStatus))")
-        guard listStatus == errSecSuccess, let identities = allRefs as? [SecIdentity] else {
+        guard listStatus == errSecSuccess else {
             Logger.error("Keychain 兜底：列出全部 identities 失败 (status=\(listStatus))")
             return (nil, listStatus)
         }
+        // CFArray 桥接成的 [Any]：逐条转成 SecIdentity 再匹配
+        let identities: [SecIdentity] = (allRefs as? [Any])?.compactMap { ref in
+            ref as? SecIdentity
+        } ?? []
 
         let ourCertData = SecCertificateCopyData(cert) as Data
         for identity in identities {
