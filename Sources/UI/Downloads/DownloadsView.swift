@@ -1,9 +1,12 @@
 import SwiftUI
 
 struct DownloadsView: View {
+    @EnvironmentObject private var appState: AppState
     @State private var showBrowser = false
     @State private var tasks: [DownloadTask] = []
     @State private var timer: Timer?
+    @State private var selectedApp: AppInfo?
+    @State private var showUnrecognizedAlert = false
 
     var body: some View {
         NavigationView {
@@ -30,6 +33,15 @@ struct DownloadsView: View {
             }
             .sheet(isPresented: $showBrowser) {
                 BrowserView()
+            }
+            .sheet(item: $selectedApp) { app in
+                AppDetailView(app: app)
+                    .environmentObject(appState)
+            }
+            .alert("无法识别", isPresented: $showUnrecognizedAlert) {
+                Button("好", role: .cancel) {}
+            } message: {
+                Text("文件已下载，但未能识别为可签名应用")
             }
             .onAppear {
                 refreshTasks()
@@ -88,8 +100,37 @@ struct DownloadsView: View {
                     .font(.caption)
                     .foregroundColor(.secondary)
             }
+
+            if task.status == .completed {
+                HStack(spacing: 4) {
+                    Image(systemName: "checkmark.circle.fill")
+                    Text("已完成·点击签名")
+                }
+                .font(.caption)
+                .foregroundColor(.green)
+            }
         }
         .padding(.vertical, 4)
+        .contentShape(Rectangle())
+        .onTapGesture {
+            guard task.status == .completed else { return }
+            if let app = matchedApp(for: task) {
+                selectedApp = app
+            } else {
+                showUnrecognizedAlert = true
+            }
+        }
+    }
+
+    private func matchedApp(for task: DownloadTask) -> AppInfo? {
+        let fileName = task.fileName
+        return appState.importedApps.first { app in
+            if !task.destinationPath.isEmpty, app.path == task.destinationPath {
+                return true
+            }
+            let appPathName = (app.path as NSString).lastPathComponent
+            return app.name == fileName || appPathName == fileName
+        }
     }
 
     private func statusColor(_ status: DownloadTask.Status) -> Color {

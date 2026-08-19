@@ -57,6 +57,9 @@ jobs:
 
       - name: Build unsigned device IPA
         run: |
+          MARKETING_VERSION="1.0.${{ github.run_number }}"
+          BUILD_NUMBER="${{ github.run_number }}"
+          echo "Building v${MARKETING_VERSION} (${BUILD_NUMBER})"
           xcodebuild -project "IPA Manager.xcodeproj" \
             -scheme "IPA Manager" \
             -sdk iphoneos \
@@ -64,9 +67,11 @@ jobs:
             -configuration Release \
             -derivedDataPath build/device \
             CODE_SIGNING_ALLOWED=NO \
+            MARKETING_VERSION="${MARKETING_VERSION}" \
+            CURRENT_PROJECT_VERSION="${BUILD_NUMBER}" \
             build
           mkdir -p build/artifacts
-          ditto -c -k --keepParent "build/device/Build/Products/Release-iphoneos/IPA Manager.app" "build/artifacts/IPA-Manager-unsigned.ipa"
+          ditto -c -k --keepParent "build/device/Build/Products/Release-iphoneos/IPA Manager.app" "build/artifacts/IPA-Manager-v${MARKETING_VERSION}-unsigned.ipa"
 
       - name: Upload Build Artifacts
         uses: actions/upload-artifact@v4

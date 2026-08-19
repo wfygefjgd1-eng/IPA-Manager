@@ -84,6 +84,7 @@ extension DownloadManager: URLSessionDownloadDelegate {
         do {
             try AppFileManager.shared.moveItem(from: location, to: destination)
             model?.status = .completed
+            model?.destinationPath = destination.path
             onDownloadComplete?(destination)
         } catch {
             model?.status = .failed

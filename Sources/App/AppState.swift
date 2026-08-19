@@ -13,6 +13,7 @@ final class AppState: ObservableObject {
 
     @Published var selectedCertificate: CertificateInfo?
     @Published var selectedProfile: ProvisioningInfo?
+    @Published var selectedTab: Int = 0
 
     private let fileManager = AppFileManager.shared
     private let store = UserDefaultsStore()
@@ -193,6 +194,15 @@ final class AppState: ObservableObject {
         profiles = store.loadProfiles()
         signingTasks = store.loadSigningTasks()
         downloadTasks = store.loadDownloadTasks()
+        importedApps = store.loadImportedApps()
+
+        // 选中项不持久化，恢复后必须重新挑选，避免首页显示“未选择证书”
+        if selectedCertificate == nil {
+            selectedCertificate = certificates.first { $0.status == .valid } ?? certificates.first
+        }
+        if selectedProfile == nil {
+            selectedProfile = profiles.first { $0.status == .valid } ?? profiles.first
+        }
     }
 
     func refreshInstalledApps() {
@@ -212,6 +222,7 @@ final class AppState: ObservableObject {
         store.saveProfiles(profiles)
         store.saveSigningTasks(signingTasks)
         store.saveDownloadTasks(downloadTasks)
+        store.saveImportedApps(importedApps)
     }
 
     func addCertificate(_ certificate: CertificateInfo) {

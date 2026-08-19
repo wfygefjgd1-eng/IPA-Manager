@@ -24,7 +24,17 @@ typedef struct {
     void* context;
 } ZSignOptions;
 
+typedef struct {
+    char name[256];
+    char teamID[64];
+    char commonName[256];
+    char organization[256];
+    long startTime;      // epoch seconds
+    long endTime;        // epoch seconds
+} ZSignP12Info;
+
 int zsign_sign(const ZSignOptions* options);
+int zsign_p12_info(const char* p12Path, const char* password, ZSignP12Info* info);
 const char* zsign_last_error(void);
 
 #ifdef __cplusplus

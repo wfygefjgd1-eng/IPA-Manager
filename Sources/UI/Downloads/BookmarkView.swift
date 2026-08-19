@@ -5,6 +5,9 @@ struct BookmarkView: View {
     let onSelect: (URL) -> Void
 
     @State private var bookmarks: [BookmarkItem] = BookmarkStore.shared.load()
+    @State private var showAddAlert = false
+    @State private var newBookmarkURL = ""
+    @State private var showError = false
 
     var body: some View {
         NavigationView {
@@ -36,11 +39,28 @@ struct BookmarkView: View {
                 }
                 ToolbarItem(placement: .navigationBarTrailing) {
                     Button {
-                        addBookmark()
+                        newBookmarkURL = ""
+                        showAddAlert = true
                     } label: {
                         Image(systemName: "plus")
                     }
                 }
+            }
+            .alert("添加书签", isPresented: $showAddAlert) {
+                TextField("https://...", text: $newBookmarkURL)
+                    .keyboardType(.URL)
+                    .autocapitalization(.none)
+                Button("取消", role: .cancel) {}
+                Button("添加") {
+                    addFromTextField()
+                }
+            } message: {
+                Text("请输入网址")
+            }
+            .alert("提示", isPresented: $showError) {
+                Button("确定", role: .cancel) {}
+            } message: {
+                Text("请输入有效的网址")
             }
         }
     }
@@ -70,29 +90,34 @@ struct BookmarkView: View {
         }
     }
 
-    private func addBookmark() {
-        let alert = UIAlertController(title: "添加书签", message: "输入网址", preferredStyle: .alert)
-        alert.addTextField { textField in
-            textField.placeholder = "https://..."
-            textField.keyboardType = .URL
+    private func addFromTextField() {
+        let trimmed = newBookmarkURL.trimmingCharacters(in: .whitespacesAndNewlines)
+        var urlString = trimmed
+        if !urlString.hasPrefix("http://") && !urlString.hasPrefix("https://") {
+            urlString = "https://" + urlString
         }
-        alert.addAction(UIAlertAction(title: "取消", style: .cancel))
-        alert.addAction(UIAlertAction(title: "添加", style: .default) { _ in
-            guard let text = alert.textFields?.first?.text,
-                  let url = URL(string: text),
-                  url.scheme != nil else { return }
+        guard let url = URL(string: urlString), url.scheme != nil else {
+            showError = true
+            return
+        }
 
-            let title = url.host ?? url.absoluteString
-            let item = BookmarkItem(title: title, url: url.absoluteString, icon: "bookmark.fill", isPreset: false)
+        var title = url.host ?? url.absoluteString
+        let path = url.path
+        if !path.isEmpty && path != "/" {
+            title = URL(fileURLWithPath: path).lastPathComponent
+        }
+
+        let item = BookmarkItem(
+            title: title,
+            url: url.absoluteString,
+            icon: "bookmark.fill",
+            isPreset: false
+        )
+        if !bookmarks.contains(where: { $0.url == item.url }) {
             bookmarks.append(item)
-            BookmarkStore.shared.save(bookmarks)
-        })
-
-        if let scene = UIApplication.shared.connectedScenes
-            .compactMap({ $0 as? UIWindowScene })
-            .first?.windows.first {
-            scene.rootViewController?.present(alert, animated: true)
         }
+        BookmarkStore.shared.save(bookmarks)
+        newBookmarkURL = ""
     }
 
     private func deleteBookmarks(_ indexSet: IndexSet) {
@@ -139,21 +164,19 @@ final class BookmarkStore {
         UserDefaults.standard.set(data, forKey: key)
     }
 
-    func addCurrentPage(_ urlString: String) {
-        guard let url = URL(string: urlString), url.scheme != nil else { return }
+    func addCurrentPage(_ urlString: String) -> Bool {
+        guard let url = URL(string: urlString), url.scheme != nil else { return false }
         let all = load()
-        if all.contains(where: { $0.url == urlString }) { return }
+        if all.contains(where: { $0.url == urlString }) { return true }
 
-        var title = url.absoluteString
+        var title = url.host ?? url.absoluteString
         let path = url.path
         if !path.isEmpty && path != "/" {
             title = URL(fileURLWithPath: path).lastPathComponent
-        } else if let host = url.host {
-            title = host
         }
 
         let item = BookmarkItem(
-            title: title.isEmpty ? "书签" : title,
+            title: title,
             url: urlString,
             icon: "bookmark.fill",
             isPreset: false
@@ -161,5 +184,6 @@ final class BookmarkStore {
         var user = all.filter { !$0.isPreset }
         user.append(item)
         save(user)
+        return true
     }
 }

@@ -3,6 +3,7 @@ import WebKit
 
 struct BrowserView: View {
     @Environment(\.dismiss) private var dismiss
+    @EnvironmentObject private var appState: AppState
     @State private var urlString = "https://github.com"
     @State private var isLoading = false
     @State private var canGoBack = false
@@ -64,18 +65,6 @@ struct BrowserView: View {
             } message: {
                 Text(pendingDownloadURL?.absoluteString ?? "")
             }
-            .overlay(alignment: .bottom) {
-                if showToast {
-                    Text(toastMessage)
-                        .font(.subheadline)
-                        .padding(.horizontal, 16)
-                        .padding(.vertical, 10)
-                        .background(Color.black.opacity(0.75))
-                        .foregroundColor(.white)
-                        .cornerRadius(8)
-                        .padding(.bottom, 60)
-                }
-            }
         }
     }
 
@@ -129,25 +118,15 @@ struct BrowserView: View {
         Logger.info("开始下载: \(url.absoluteString)")
         DownloadManager.shared.startDownload(urlString: url.absoluteString) { _ in
             Logger.info("下载任务已创建")
-            toastMessage = "已加入下载"
-            showToast = true
-            DispatchQueue.main.asyncAfter(deadline: .now() + 2) {
-                showToast = false
-            }
         }
+        // 下载已加入队列：关闭浏览器并切到下载页
+        appState.selectedTab = 2
+        dismiss()
     }
 
     private func addCurrentPageToBookmarks() {
-        guard !urlString.isEmpty, let _ = URL(string: urlString) else {
-            toastMessage = "当前页面无法收藏"
-            showToast = true
-            DispatchQueue.main.asyncAfter(deadline: .now() + 2) {
-                showToast = false
-            }
-            return
-        }
-        BookmarkStore.shared.addCurrentPage(urlString)
-        toastMessage = "已收藏当前页面"
+        let ok = BookmarkStore.shared.addCurrentPage(urlString)
+        toastMessage = ok ? "已收藏当前页面" : "当前页面无法收藏"
         showToast = true
         DispatchQueue.main.asyncAfter(deadline: .now() + 2) {
             showToast = false

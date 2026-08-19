@@ -8,6 +8,22 @@ final class ServerIdentityProvider {
     private(set) var currentIdentity: SecIdentity?
 
     func setIdentity(from p12URL: URL, password: String) throws {
+        var info = ZSignP12Info()
+        let result = p12URL.path.withCString { p12Path in
+            password.withCString { pwd in
+                zsign_p12_info(p12Path, pwd, &info)
+            }
+        }
+
+        switch result {
+        case 0:
+            break
+        case -2:
+            throw AppError.certificateInvalid("密码错误")
+        default:
+            throw AppError.certificateInvalid("证书解析失败")
+        }
+
         guard let data = try? Data(contentsOf: p12URL) else {
             throw AppError.certificateInvalid("无法读取证书数据")
         }
@@ -19,7 +35,7 @@ final class ServerIdentityProvider {
         var items: CFArray?
         let status = SecPKCS12Import(data as CFData, options as CFDictionary, &items)
         guard status == errSecSuccess, let array = items as? [[String: Any]], let first = array.first else {
-            throw AppError.certificateInvalid("证书导入身份失败 (错误码: \(status))")
+            throw AppError.installFailed("此证书的加密格式(PBES2)无法用于本地安装，请更换 P12")
         }
 
         guard let rawIdentity = first[kSecImportItemIdentity as String],

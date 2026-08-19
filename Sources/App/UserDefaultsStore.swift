@@ -8,10 +8,19 @@ final class UserDefaultsStore {
         static let profiles = "stored_profiles"
         static let signingTasks = "stored_signing_tasks"
         static let downloadTasks = "stored_download_tasks"
+        static let importedApps = "stored_imported_apps"
     }
 
     private let encoder = JSONEncoder()
     private let decoder = JSONDecoder()
+
+    func loadImportedApps() -> [AppInfo] {
+        load([AppInfo].self, key: Keys.importedApps) ?? []
+    }
+
+    func saveImportedApps(_ items: [AppInfo]) {
+        save(items, key: Keys.importedApps)
+    }
 
     func loadCertificates() -> [CertificateInfo] {
         load([CertificateInfo].self, key: Keys.certificates) ?? []
