@@ -13,6 +13,12 @@ final class CertificateManager {
         completion: @escaping (Result<CertificateInfo, Error>) -> Void
     ) {
         DispatchQueue.global(qos: .userInitiated).async {
+            let accessed = url.startAccessingSecurityScopedResource()
+            defer {
+                if accessed {
+                    url.stopAccessingSecurityScopedResource()
+                }
+            }
             do {
                 let certificate = try self.readCertificate(from: url, password: password)
                 self.storePrivateKey(from: url, password: password, identifier: certificate.keychainIdentifier, passwordIdentifier: certificate.passwordKeychainIdentifier)
@@ -79,6 +85,13 @@ final class CertificateManager {
     }
 
     private func readCertificate(from url: URL, password: String) throws -> CertificateInfo {
+        let accessed = url.startAccessingSecurityScopedResource()
+        defer {
+            if accessed {
+                url.stopAccessingSecurityScopedResource()
+            }
+        }
+
         guard let data = try? Data(contentsOf: url) else {
             throw AppError.certificateInvalid("无法读取 P12 文件")
         }

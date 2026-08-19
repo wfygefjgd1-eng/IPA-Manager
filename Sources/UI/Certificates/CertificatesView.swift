@@ -4,16 +4,11 @@ import UniformTypeIdentifiers
 struct CertificatesView: View {
     @EnvironmentObject private var appState: AppState
     @State private var showImporter = false
-    @State private var importType: ImportType = .certificate
     @State private var pendingImportURL: URL?
     @State private var showPasswordSheet = false
     @State private var showAlert = false
     @State private var alertMessage = ""
-
-    enum ImportType {
-        case certificate
-        case profile
-    }
+    @State private var isImporting = false
 
     var body: some View {
         NavigationView {
@@ -25,14 +20,12 @@ struct CertificatesView: View {
             .toolbar {
                 ToolbarItemGroup(placement: .navigationBarTrailing) {
                     Button {
-                        importType = .profile
                         showImporter = true
                     } label: {
-                        Image(systemName: "doc.badge.plus")
+                        Text("一键导入")
                     }
 
                     Button {
-                        importType = .certificate
                         showImporter = true
                     } label: {
                         Image(systemName: "plus")
@@ -41,10 +34,10 @@ struct CertificatesView: View {
             }
             .fileImporter(
                 isPresented: $showImporter,
-                allowedContentTypes: importType == .certificate ? [.p12Type] : [.mobileprovisionType],
+                allowedContentTypes: [.data, .zip],
                 allowsMultipleSelection: false
             ) { result in
-                handleImport(result, type: importType)
+                handleImport(result)
             }
             .sheet(isPresented: $showPasswordSheet) {
                 PasswordPromptView(importURL: pendingImportURL) { cert in
@@ -56,13 +49,21 @@ struct CertificatesView: View {
             } message: {
                 Text(alertMessage)
             }
+            .overlay {
+                if isImporting {
+                    ProgressView("正在导入...")
+                        .padding()
+                        .background(Color(.secondarySystemBackground))
+                        .cornerRadius(12)
+                }
+            }
         }
     }
 
     private var certificatesSection: some View {
         Section("企业证书") {
             if appState.certificates.isEmpty {
-                Text("暂无证书，点击右上角 + 导入 P12")
+                Text("暂无证书，点击右上角 + 导入 P12 或 zip 一键导入")
                     .font(.subheadline)
                     .foregroundColor(.secondary)
             } else {
@@ -81,7 +82,7 @@ struct CertificatesView: View {
     private var profilesSection: some View {
         Section("描述文件") {
             if appState.profiles.isEmpty {
-                Text("暂无描述文件，点击右上角导入 mobileprovision")
+                Text("暂无描述文件，导入 zip 或单独导入 mobileprovision")
                     .font(.subheadline)
                     .foregroundColor(.secondary)
             } else {
@@ -159,20 +160,79 @@ struct CertificatesView: View {
         }
     }
 
-    private func handleImport(_ result: Result<[URL], Error>, type: ImportType) {
+    private func handleImport(_ result: Result<[URL], Error>) {
         switch result {
         case .success(let urls):
             guard let url = urls.first else { return }
-            switch type {
-            case .certificate:
+            let ext = url.pathExtension.lowercased()
+            switch ext {
+            case "zip":
+                importBundle(url)
+            case "p12", "pfx":
                 pendingImportURL = url
                 showPasswordSheet = true
-            case .profile:
+            case "mobileprovision":
                 importProfile(url)
+            default:
+                alertMessage = "不支持的文件类型: \(ext)"
+                showAlert = true
             }
         case .failure(let error):
             alertMessage = error.localizedDescription
             showAlert = true
+        }
+    }
+
+    // 一键导入 zip（自动识别 p12 + mobileprovision）
+    private func importBundle(_ url: URL) {
+        isImporting = true
+        DispatchQueue.global(qos: .userInitiated).async {
+            do {
+                let content = try CertificateBundleImporter.shared.extract(from: url)
+                let moved = try CertificateBundleImporter.shared.moveToManagedLocation(
+                    p12URL: content.p12URL,
+                    profileURL: content.profileURL
+                )
+
+                DispatchQueue.main.async {
+                    isImporting = false
+                    var summary = ""
+
+                    // 导入描述文件
+                    if let profileURL = moved.profileURL {
+                        do {
+                            var profile = try ProvisioningManager.shared.importProfile(from: profileURL)
+                            profile.path = profileURL.path
+                            if !appState.profiles.contains(where: { $0.uuid == profile.uuid }) {
+                                appState.addProfile(profile)
+                            }
+                            summary += "描述文件 ✓\n"
+                        } catch {
+                            summary += "描述文件失败: \(error.localizedDescription)\n"
+                        }
+                    } else {
+                        summary += "未找到描述文件\n"
+                    }
+
+                    // 导入证书（需要密码）
+                    if let p12URL = moved.p12URL {
+                        pendingImportURL = p12URL
+                        showPasswordSheet = true
+                        summary += "证书: 请输入密码\n"
+                    } else {
+                        summary += "未找到证书\n"
+                    }
+
+                    alertMessage = summary
+                    showAlert = true
+                }
+            } catch {
+                DispatchQueue.main.async {
+                    isImporting = false
+                    alertMessage = "导入失败: \(error.localizedDescription)"
+                    showAlert = true
+                }
+            }
         }
     }
 
