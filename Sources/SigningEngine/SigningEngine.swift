@@ -129,7 +129,7 @@ final class SigningEngine: SigningEngineProtocol {
         var pemBlock = "-----BEGIN PRIVATE KEY-----\n"
         var isEC = false
         var isRSA = false
-        if let attrs = SecKeyCopyAttributes(key) as? [CFString: Any],
+        if let attrs = SecKeyCopyAttributes(key) as? [String: Any],
            let keyType = attrs[kSecAttrKeyType as String] as? String {
             if keyType == (kSecAttrKeyTypeEC as String) || keyType == (kSecAttrKeyTypeECSECPrimeRandom as String) {
                 isEC = true
