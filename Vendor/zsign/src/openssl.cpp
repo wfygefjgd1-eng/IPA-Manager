@@ -884,6 +884,9 @@ bool ZSignAsset::Init(
 			evpPKey = d2i_PrivateKey_bio(bioPKey, NULL);
 			if (NULL == evpPKey) {
 				BIO_reset(bioPKey);
+				// PBES2/AES p12 需要 default provider；旧式 3DES/RC2 需要 legacy provider。
+				// 静态链接构建中 provider 对象若未被链接器拉入，这里会返回 NULL，但不影响后续尝试。
+				OSSL_PROVIDER_load(NULL, "default");
 				OSSL_PROVIDER_load(NULL, "legacy");
 				PKCS12* p12 = d2i_PKCS12_bio(bioPKey, NULL);
 				if (NULL != p12) {

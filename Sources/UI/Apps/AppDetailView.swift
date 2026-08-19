@@ -322,6 +322,21 @@ struct SignOptionsView: View {
             }
             .navigationTitle("签名选项")
             .navigationBarTitleDisplayMode(.inline)
+            // 打开弹窗时，若尚未手动选择，则默认勾选 AppState 中自动选中的默认证书/描述文件（存在且有效时）
+            .onAppear {
+                if selectedCert == nil,
+                   let cert = appState.selectedCertificate,
+                   cert.status == .valid,
+                   appState.certificates.contains(where: { $0.id == cert.id }) {
+                    selectedCert = cert
+                }
+                if selectedProfile == nil,
+                   let profile = appState.selectedProfile,
+                   profile.status == .valid,
+                   appState.profiles.contains(where: { $0.id == profile.id }) {
+                    selectedProfile = profile
+                }
+            }
             .toolbar {
                 ToolbarItem(placement: .navigationBarLeading) {
                     Button("取消") {

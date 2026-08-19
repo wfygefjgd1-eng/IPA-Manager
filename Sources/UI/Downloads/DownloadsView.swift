@@ -8,6 +8,7 @@ struct DownloadsView: View {
     @State private var selectedApp: AppInfo?
     @State private var showUnrecognizedAlert = false
     @State private var unrecognizedMessage = ""
+    @State private var showClearAllAlert = false
 
     var body: some View {
         NavigationView {
@@ -19,11 +20,21 @@ struct DownloadsView: View {
                         ForEach(tasks) { task in
                             downloadRow(task)
                         }
+                        .onDelete { offsets in
+                            deleteTasks(at: offsets)
+                        }
                     }
                 }
             }
             .navigationTitle("下载")
             .toolbar {
+                ToolbarItem(placement: .navigationBarLeading) {
+                    if !tasks.isEmpty {
+                        Button("全部清除", role: .destructive) {
+                            showClearAllAlert = true
+                        }
+                    }
+                }
                 ToolbarItem(placement: .navigationBarTrailing) {
                     Button {
                         showBrowser = true
@@ -43,6 +54,14 @@ struct DownloadsView: View {
                 Button("好", role: .cancel) {}
             } message: {
                 Text(unrecognizedMessage)
+            }
+            .alert("全部清除下载任务？", isPresented: $showClearAllAlert) {
+                Button("全部清除", role: .destructive) {
+                    clearAllTasks()
+                }
+                Button("取消", role: .cancel) {}
+            } message: {
+                Text("将取消并移除全部 \(tasks.count) 个下载任务，此操作不可撤销。")
             }
             .onAppear {
                 refreshTasks()
@@ -159,7 +178,7 @@ struct DownloadsView: View {
 
         switch (path as NSString).pathExtension.lowercased() {
         case "zip":
-            return "自动导入失败：该文件为 ZIP，需按证书包（.p12 / .mobileprovision）处理，目前未识别为可签名应用。"
+            return "下载成功，但该 ZIP 未包含可解析的 .app 应用包（可能不是有效的 IPA/ZIP 结构），请确认文件完整后重试。"
         case "ipa":
             return "自动导入失败：IPA 解析未生成应用记录，文件可能损坏或不是有效的 IPA 包，可重新下载验证。"
         default:
@@ -182,6 +201,24 @@ struct DownloadsView: View {
         } else {
             DownloadManager.shared.pauseDownload(id: task.id)
         }
+    }
+
+    /// 滑动删除：取消并移除指定索引的下载任务。
+    private func deleteTasks(at offsets: IndexSet) {
+        let ids = offsets.map { tasks[$0].id }
+        for id in ids {
+            DownloadManager.shared.cancelDownload(id: id)
+        }
+        refreshTasks()
+    }
+
+    /// 全部清除：取消并移除所有下载任务。
+    private func clearAllTasks() {
+        let all = DownloadManager.shared.snapshotTasks()
+        for task in all {
+            DownloadManager.shared.cancelDownload(id: task.id)
+        }
+        refreshTasks()
     }
 
     private func refreshTasks() {

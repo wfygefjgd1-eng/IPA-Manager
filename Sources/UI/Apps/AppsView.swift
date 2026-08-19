@@ -3,6 +3,7 @@ import SwiftUI
 struct AppsView: View {
     @EnvironmentObject private var appState: AppState
     @State private var selectedApp: AppInfo?
+    @State private var showClearAllAlert = false
 
     var body: some View {
         NavigationView {
@@ -10,18 +11,40 @@ struct AppsView: View {
                 if appState.installedApps.isEmpty {
                     emptyView
                 } else {
-                    List(appState.installedApps) { app in
-                        Button {
-                            selectedApp = app
-                        } label: {
-                            appRow(app)
+                    List {
+                        ForEach(appState.installedApps) { app in
+                            Button {
+                                selectedApp = app
+                            } label: {
+                                appRow(app)
+                            }
+                        }
+                        .onDelete { offsets in
+                            deleteApps(at: offsets)
                         }
                     }
                 }
             }
             .navigationTitle("已签应用")
+            .toolbar {
+                ToolbarItem(placement: .navigationBarLeading) {
+                    if !appState.installedApps.isEmpty {
+                        Button("全部清除", role: .destructive) {
+                            showClearAllAlert = true
+                        }
+                    }
+                }
+            }
             .sheet(item: $selectedApp) { app in
                 AppDetailView(app: app)
+            }
+            .alert("全部清除已签应用？", isPresented: $showClearAllAlert) {
+                Button("全部清除", role: .destructive) {
+                    clearAllSignedApps()
+                }
+                Button("取消", role: .cancel) {}
+            } message: {
+                Text("将删除全部 \(appState.installedApps.count) 个已签应用及对应文件，此操作不可撤销。")
             }
         }
     }
@@ -58,5 +81,21 @@ struct AppsView: View {
                 .foregroundColor(.secondary)
         }
         .padding(.vertical, 4)
+    }
+
+    /// 滑动删除：移除指定索引的已签应用。
+    private func deleteApps(at offsets: IndexSet) {
+        let appsToRemove = offsets.map { appState.installedApps[$0] }
+        for app in appsToRemove {
+            appState.removeSignedApp(app)
+        }
+    }
+
+    /// 全部清除：移除所有已签应用及其文件。
+    private func clearAllSignedApps() {
+        let all = appState.installedApps
+        for app in all {
+            appState.removeSignedApp(app)
+        }
     }
 }

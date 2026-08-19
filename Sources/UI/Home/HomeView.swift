@@ -1,5 +1,6 @@
 import SwiftUI
 import UniformTypeIdentifiers
+import Foundation
 
 struct HomeView: View {
     @EnvironmentObject private var appState: AppState
@@ -13,7 +14,7 @@ struct HomeView: View {
             ScrollView {
                 VStack(spacing: 16) {
                     statusCard
-                    functionGrid
+                    importBar
                     appsSection
                     recentSignings
                 }
@@ -91,6 +92,15 @@ struct HomeView: View {
                     Text(app.bundleID.isEmpty ? "未知 Bundle ID" : app.bundleID)
                         .font(.caption)
                         .foregroundColor(.secondary)
+                        .lineLimit(1)
+                    HStack(spacing: 6) {
+                        Text(versionText(for: app))
+                            .font(.caption2)
+                            .foregroundColor(.secondary)
+                        Text(timeText(for: app))
+                            .font(.caption2)
+                            .foregroundColor(.secondary)
+                    }
                 }
                 Spacer()
                 Image(systemName: app.isSigned ? "checkmark.seal.fill" : "exclamationmark.circle")
@@ -145,55 +155,33 @@ struct HomeView: View {
         .cornerRadius(12)
     }
 
-    private var functionGrid: some View {
-        LazyVGrid(columns: [GridItem(.flexible()), GridItem(.flexible())], spacing: 12) {
-            functionCard(
-                title: "下载应用",
-                icon: "arrow.down.circle.fill",
-                color: .blue
-            ) {
-                // TODO: 跳转到内置浏览器
+    // 首页功能入口：仅保留可用的「导入文件」，显示为整条可点的长条卡片
+    private var importBar: some View {
+        Button {
+            showFileImporter = true
+        } label: {
+            HStack(spacing: 12) {
+                Image(systemName: "square.and.arrow.down.fill")
+                    .font(.system(size: 24))
+                    .foregroundColor(.green)
+                    .frame(width: 44, height: 44)
+                    .background(Color.green.opacity(0.15))
+                    .cornerRadius(10)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("导入文件")
+                        .font(.headline)
+                        .foregroundColor(.primary)
+                    Text("导入 IPA / ZIP，支持多选")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                }
+                Spacer()
+                Image(systemName: "chevron.right")
+                    .font(.system(size: 14, weight: .semibold))
+                    .foregroundColor(.secondary)
             }
-
-            functionCard(
-                title: "导入文件",
-                icon: "square.and.arrow.down.fill",
-                color: .green
-            ) {
-                showFileImporter = true
-            }
-
-            functionCard(
-                title: "证书管理",
-                icon: "lock.shield.fill",
-                color: .orange
-            ) {
-                // TODO: 跳转到证书管理
-            }
-
-            functionCard(
-                title: "已签应用",
-                icon: "apps.iphone",
-                color: .purple
-            ) {
-                // TODO: 跳转到已签应用
-            }
-        }
-    }
-
-    private func functionCard(title: String, icon: String, color: Color, action: @escaping () -> Void) -> some View {
-        Button(action: action) {
-            VStack(spacing: 8) {
-                Image(systemName: icon)
-                    .font(.system(size: 28))
-                    .foregroundColor(color)
-                Text(title)
-                    .font(.subheadline)
-                    .fontWeight(.medium)
-                    .foregroundColor(.primary)
-            }
-            .frame(maxWidth: .infinity)
-            .padding(.vertical, 20)
+            .padding()
+            .frame(maxWidth: .infinity, alignment: .leading)
             .background(Color(.secondarySystemBackground))
             .cornerRadius(12)
         }
@@ -240,6 +228,29 @@ struct HomeView: View {
         case .processing: return .blue.opacity(0.2)
         case .queued: return .gray.opacity(0.2)
         }
+    }
+
+    // 版本号展示：为空时显示"未知"
+    private func versionText(for app: AppInfo) -> String {
+        app.version.isEmpty ? "版本 未知" : "版本 v\(app.version)"
+    }
+
+    private static let fileDateFormatter: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.dateFormat = "yyyy-MM-dd HH:mm"
+        return formatter
+    }()
+
+    // 时间信息：已签名应用显示"签名于"（优先取签名产物文件时间），未签名显示"导入于"；文件不存在则显示"时间未知"
+    private func timeText(for app: AppInfo) -> String {
+        let path = app.isSigned ? (app.signedPath ?? app.path) : app.path
+        guard !path.isEmpty,
+              let attributes = try? FileManager.default.attributesOfItem(atPath: path),
+              let date = (attributes[.modificationDate] as? Date) ?? (attributes[.creationDate] as? Date) else {
+            return "时间未知"
+        }
+        let prefix = app.isSigned ? "签名于" : "导入于"
+        return "\(prefix) \(Self.fileDateFormatter.string(from: date))"
     }
 
     private func handleImportedFile(_ url: URL) {

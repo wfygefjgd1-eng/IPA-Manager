@@ -53,17 +53,25 @@ final class IPAParser {
         let ext = fileURL.pathExtension.lowercased()
         if ext == "ipa" { return fileURL }
 
+        // 解压源压缩包并定位 .app（找不到会抛出“未找到 .app 应用包”）
         let package = try parse(fileURL: fileURL)
-        let payloadDir = package.rootURL.appendingPathComponent("Payload", isDirectory: true)
 
-        if !fileManager.fileExists(atPath: payloadDir.path) {
-            try fileManager.createDirectory(at: payloadDir, withIntermediateDirectories: true)
-            try fileManager.moveItem(at: package.appURL, to: payloadDir.appendingPathComponent(package.appURL.lastPathComponent))
-        }
+        // 构造干净的临时目录，只包含 Payload/<应用名>.app，
+        // 保证打包出的 .ipa 无论源结构（Payload/、Archive/ 或裸 .app）都合法
+        let stagingRoot = AppFileManager.shared.directoryURL(.extracted)
+            .appendingPathComponent("IPA-Build-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: stagingRoot) }
+        let payloadDir = stagingRoot.appendingPathComponent("Payload", isDirectory: true)
+        try fileManager.createDirectory(at: payloadDir, withIntermediateDirectories: true)
+        try fileManager.moveItem(
+            at: package.appURL,
+            to: payloadDir.appendingPathComponent(package.appURL.lastPathComponent)
+        )
 
+        // 输出到 .ipa 目录；同名文件已存在时 ZipManager.zip 会先移除再覆盖
         let outputURL = AppFileManager.shared.directoryURL(.ipa)
             .appendingPathComponent(fileURL.deletingPathExtension().lastPathComponent + ".ipa")
-        try zipManager.zip(folderURL: package.rootURL, outputURL: outputURL)
+        try zipManager.zip(folderURL: stagingRoot, outputURL: outputURL)
         return outputURL
     }
 

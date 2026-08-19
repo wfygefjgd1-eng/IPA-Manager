@@ -29,16 +29,122 @@ final class AppState: ObservableObject {
         Logger.info("AppState 初始化完成")
     }
 
-    private func handleDownloadedFile(at url: URL) {
+    private enum DownloadedArchiveKind {
+        case certificateBundle
+        case appPackage
+        case unknown
+    }
+
+    private func handleDownloadedFile(
+        at url: URL,
+        completion: ((Result<AppInfo, Error>) -> Void)? = nil
+    ) {
         Logger.info("下载完成，自动解析: \(url.lastPathComponent)")
-        importFile(from: url) { result in
+        let ext = url.pathExtension.lowercased()
+        let isArchive = ext == "zip" || ext == "tgz" || ext == "tar"
+            || (ext == "gz" && url.lastPathComponent.lowercased().hasSuffix(".tar.gz"))
+
+        guard isArchive else {
+            // .ipa 及其它格式：直接走原有导入逻辑
+            importFile(from: url) { result in
+                self.logImportResult(result, fileName: url.lastPathComponent)
+                completion?(result)
+            }
+            return
+        }
+
+        // 压缩包：后台先判断内容（证书包 / 应用包 / 未知），避免阻塞 UI
+        DispatchQueue.global(qos: .userInitiated).async {
+            do {
+                let kind = try self.classifyArchivedContent(at: url)
+                switch kind {
+                case .certificateBundle:
+                    // 内含 .p12/.mobileprovision → 证书包，走现有证书导入
+                    DispatchQueue.main.async {
+                        Logger.info("检测到证书包，走证书导入: \(url.lastPathComponent)")
+                    }
+                    self.importCertificateBundleOrFile(url)
+                case .appPackage:
+                    // 内含 .app → 应用包：解压并重新打包成 .ipa 后导入“我的应用”
+                    let ipaURL = try self.parser.convertToIPAIfNeeded(fileURL: url)
+                    self.importFile(from: ipaURL) { result in
+                        DispatchQueue.main.async {
+                            switch result {
+                            case .success:
+                                Logger.info("自动解析成功（zip→ipa）: \(ipaURL.lastPathComponent)")
+                            case .failure(let error):
+                                Logger.error("自动解析失败: \(error.localizedDescription)")
+                            }
+                            completion?(result)
+                        }
+                    }
+                case .unknown:
+                    let message = "该 ZIP 不是应用包（无 Payload/*.app 结构）也不是证书包（无 .p12/.mobileprovision）"
+                    DispatchQueue.main.async {
+                        Logger.error("自动解析失败: \(message)")
+                        completion?(.failure(AppError.operationFailed(message)))
+                    }
+                }
+            } catch {
+                DispatchQueue.main.async {
+                    Logger.error("自动解析失败: \(error.localizedDescription)")
+                    completion?(.failure(error))
+                }
+            }
+        }
+    }
+
+    private func logImportResult(_ result: Result<AppInfo, Error>, fileName: String) {
+        DispatchQueue.main.async {
             switch result {
             case .success:
-                Logger.info("自动解析成功: \(url.lastPathComponent)")
+                Logger.info("自动解析成功: \(fileName)")
             case .failure(let error):
                 Logger.error("自动解析失败: \(error.localizedDescription)")
             }
         }
+    }
+
+    /// 把压缩包解压到临时目录后扫描内容，判断它属于证书包还是应用包。
+    /// 不做列表 API 依赖：ZipManager 只有 unzip/zip，因此采用“解压后扫目录”方案。
+    private func classifyArchivedContent(at url: URL) throws -> DownloadedArchiveKind {
+        let tempDir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("DLScan-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: tempDir) }
+
+        do {
+            try ZipManager.shared.unzip(archiveURL: url, destinationURL: tempDir)
+        } catch {
+            throw AppError.operationFailed("无法解压压缩包（当前仅支持 zip 格式）: \(url.lastPathComponent)")
+        }
+
+        var hasCertificate = false
+        var hasAppBundle = false
+
+        guard let enumerator = FileManager.default.enumerator(at: tempDir, includingPropertiesForKeys: nil) else {
+            throw AppError.operationFailed("无法读取压缩包内容: \(url.lastPathComponent)")
+        }
+
+        while let element = enumerator.nextObject() as? URL {
+            let elementExt = element.pathExtension.lowercased()
+            if elementExt == "app" {
+                // 找到 .app 即视为应用包（无论位于 Payload/、Archive/ 还是根目录）
+                hasAppBundle = true
+            } else if elementExt == "p12" || elementExt == "pfx" {
+                hasCertificate = true
+            } else if elementExt == "mobileprovision" && !isInsideAppBundle(element) {
+                // 排除 .app 内部的 embedded.mobileprovision，避免应用包被误判为证书包
+                hasCertificate = true
+            }
+        }
+
+        if hasCertificate { return .certificateBundle }
+        if hasAppBundle { return .appPackage }
+        return .unknown
+    }
+
+    private func isInsideAppBundle(_ url: URL) -> Bool {
+        url.pathComponents.contains { $0.hasSuffix(".app") }
     }
 
     func importFile(from url: URL, completion: @escaping (Result<AppInfo, Error>) -> Void) {
@@ -52,11 +158,14 @@ final class AppState: ObservableObject {
         let destination = fileManager.directoryURL(.ipa).appendingPathComponent(url.lastPathComponent)
         DispatchQueue.global(qos: .userInitiated).async {
             do {
-                // 目标已存在（重复导入同名文件）时先移除，再用新文件覆盖
-                if FileManager.default.fileExists(atPath: destination.path) {
-                    try FileManager.default.removeItem(at: destination)
+                // 转换得到的 .ipa 已直接输出到 .ipa 目录（url 即 destination），跳过复制，避免删掉源文件
+                if url.path != destination.path {
+                    // 目标已存在（重复导入同名文件）时先移除，再用新文件覆盖
+                    if FileManager.default.fileExists(atPath: destination.path) {
+                        try FileManager.default.removeItem(at: destination)
+                    }
+                    try self.fileManager.copyItem(from: url, to: destination)
                 }
-                try self.fileManager.copyItem(from: url, to: destination)
                 var app = try self.parser.parseAppInfo(fileURL: destination)
                 app.path = destination.path
                 DispatchQueue.main.async {

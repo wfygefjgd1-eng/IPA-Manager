@@ -9,8 +9,6 @@ struct BrowserView: View {
     @State private var canGoBack = false
     @State private var canGoForward = false
     @State private var showBookmarks = false
-    @State private var showDownloadAlert = false
-    @State private var pendingDownloadURL: URL?
     @State private var showToast = false
     @State private var toastMessage = ""
 
@@ -23,8 +21,8 @@ struct BrowserView: View {
                     canGoBack: $canGoBack,
                     canGoForward: $canGoForward,
                     onDownloadDetected: { url in
-                        pendingDownloadURL = url
-                        showDownloadAlert = true
+                        // 命中下载链接：不再弹确认框，直接开始下载并切到“下载”标签页
+                        startDownload(url)
                     }
                 )
                 .ignoresSafeArea(edges: .bottom)
@@ -54,16 +52,6 @@ struct BrowserView: View {
                     urlString = url.absoluteString
                     showBookmarks = false
                 }
-            }
-            .alert("开始下载", isPresented: $showDownloadAlert) {
-                Button("取消", role: .cancel) {}
-                Button("下载") {
-                    if let url = pendingDownloadURL {
-                        startDownload(url)
-                    }
-                }
-            } message: {
-                Text(pendingDownloadURL?.absoluteString ?? "")
             }
             // 轻提示：收藏当前页面等操作结果
             .overlay(alignment: .bottom) {
@@ -136,7 +124,13 @@ struct BrowserView: View {
         DownloadManager.shared.startDownload(urlString: url.absoluteString) { _ in
             Logger.info("下载任务已创建")
         }
-        // 下载已加入队列：关闭浏览器并切到下载页
+        // 轻提示（可选）：直接开始下载，不再弹任何确认框
+        toastMessage = "开始下载：\(url.lastPathComponent)"
+        showToast = true
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2) {
+            showToast = false
+        }
+        // 下载已加入队列：关闭浏览器并切到“下载”标签页
         appState.selectedTab = 2
         dismiss()
     }
