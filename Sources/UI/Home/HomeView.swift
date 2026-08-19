@@ -18,12 +18,10 @@ struct HomeView: View {
                 .padding()
             }
             .navigationTitle("IPA Manager")
-            .fileImporter(
-                isPresented: $showFileImporter,
-                allowedContentTypes: [.ipaType, .zip, .pkcs12],
-                allowsMultipleSelection: true
-            ) { result in
-                handleImport(result)
+            .sheet(isPresented: $showFileImporter) {
+                DocumentPicker(onPick: { url in
+                    handleImportedFile(url)
+                }, allowsMultiple: true)
             }
             .alert("提示", isPresented: $showAlert) {
                 Button("确定", role: .cancel) {}
@@ -175,19 +173,23 @@ struct HomeView: View {
         }
     }
 
+    private func handleImportedFile(_ url: URL) {
+        appState.importFile(from: url) { importResult in
+            switch importResult {
+            case .success(let app):
+                self.alertMessage = "已导入: \(app.name) (\(app.version))"
+            case .failure(let error):
+                self.alertMessage = error.localizedDescription
+            }
+            self.showAlert = true
+        }
+    }
+
     private func handleImport(_ result: Result<[URL], Error>) {
         switch result {
         case .success(let urls):
             for url in urls {
-                appState.importFile(from: url) { importResult in
-                    switch importResult {
-                    case .success(let app):
-                        self.alertMessage = "已导入: \(app.name) (\(app.version))"
-                    case .failure(let error):
-                        self.alertMessage = error.localizedDescription
-                    }
-                    self.showAlert = true
-                }
+                handleImportedFile(url)
             }
         case .failure(let error):
             alertMessage = error.localizedDescription

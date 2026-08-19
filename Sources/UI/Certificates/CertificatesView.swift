@@ -32,12 +32,10 @@ struct CertificatesView: View {
                     }
                 }
             }
-            .fileImporter(
-                isPresented: $showImporter,
-                allowedContentTypes: [.data, .zip],
-                allowsMultipleSelection: false
-            ) { result in
-                handleImport(result)
+            .sheet(isPresented: $showImporter) {
+                DocumentPicker { url in
+                    handleImportedFile(url)
+                }
             }
             .sheet(isPresented: $showPasswordSheet) {
                 PasswordPromptView(importURL: pendingImportURL) { cert in
@@ -160,23 +158,33 @@ struct CertificatesView: View {
         }
     }
 
+    private func handleImportedFile(_ url: URL) {
+        let accessed = url.startAccessingSecurityScopedResource()
+        defer {
+            if accessed {
+                url.stopAccessingSecurityScopedResource()
+            }
+        }
+        let ext = url.pathExtension.lowercased()
+        switch ext {
+        case "zip":
+            importBundle(url)
+        case "p12", "pfx":
+            pendingImportURL = url
+            showPasswordSheet = true
+        case "mobileprovision":
+            importProfile(url)
+        default:
+            alertMessage = "不支持的文件类型: \(ext)"
+            showAlert = true
+        }
+    }
+
     private func handleImport(_ result: Result<[URL], Error>) {
         switch result {
         case .success(let urls):
             guard let url = urls.first else { return }
-            let ext = url.pathExtension.lowercased()
-            switch ext {
-            case "zip":
-                importBundle(url)
-            case "p12", "pfx":
-                pendingImportURL = url
-                showPasswordSheet = true
-            case "mobileprovision":
-                importProfile(url)
-            default:
-                alertMessage = "不支持的文件类型: \(ext)"
-                showAlert = true
-            }
+            handleImportedFile(url)
         case .failure(let error):
             alertMessage = error.localizedDescription
             showAlert = true

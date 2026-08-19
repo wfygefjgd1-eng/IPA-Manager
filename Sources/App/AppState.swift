@@ -2,6 +2,8 @@ import SwiftUI
 import Foundation
 
 final class AppState: ObservableObject {
+    static let shared = AppState()
+
     @Published var installedApps: [AppInfo] = []
     @Published var importedApps: [AppInfo] = []
     @Published var certificates: [CertificateInfo] = []
@@ -22,6 +24,7 @@ final class AppState: ObservableObject {
         DownloadManager.shared.onDownloadComplete = { [weak self] url in
             self?.handleDownloadedFile(at: url)
         }
+        BundledCertificateBootstrap.shared.importIfNeeded(into: self)
         Logger.info("AppState 初始化完成")
     }
 
@@ -136,6 +139,46 @@ final class AppState: ObservableObject {
             throw AppError.installFailed("应用尚未签名")
         }
         try Installer.shared.install(ipaPath: app.path, certificate: certificate)
+    }
+
+    func handleFileOpenedFromOutside(_ url: URL) {
+        let ext = url.pathExtension.lowercased()
+        Logger.info("外部打开文件: \(url.lastPathComponent)")
+
+        switch ext {
+        case "zip", "p12", "pfx", "mobileprovision":
+            importCertificateBundleOrFile(url)
+        default:
+            importFile(from: url) { _ in }
+        }
+    }
+
+    private func importCertificateBundleOrFile(_ url: URL) {
+        switch url.pathExtension.lowercased() {
+        case "zip":
+            let importer = CertificateBundleImporter.shared
+            DispatchQueue.global(qos: .userInitiated).async {
+                do {
+                    let content = try importer.extract(from: url)
+                    let moved = try importer.moveToManagedLocation(
+                        p12URL: content.p12URL,
+                        profileURL: content.profileURL
+                    )
+                    DispatchQueue.main.async {
+                        if let profileURL = moved.profileURL,
+                           let profile = try? ProvisioningManager.shared.importProfile(from: profileURL) {
+                            self.addProfile(profile)
+                        }
+                        Logger.info("zip 证书包导入完成")
+                    }
+                } catch {
+                    Logger.error("zip 证书包导入失败: \(error)")
+                }
+            }
+        default:
+            // p12/mobileprovision need UI flow; route to certificates tab later
+            Logger.info("单个证书文件需通过证书页导入: \(url.lastPathComponent)")
+        }
     }
 
     func loadPersistedState() {

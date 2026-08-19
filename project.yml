@@ -68,6 +68,7 @@ targets:
           - -lz
         SWIFT_OBJC_BRIDGING_HEADER: $(SRCROOT)/Sources/Bridging-Header.h
         ENABLE_MODULES: YES
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
     info:
       path: Sources/Info.plist
       properties:
@@ -84,6 +85,12 @@ targets:
           - UIInterfaceOrientationPortrait
         UILaunchScreen:
           UIColorName: ""
+        CFBundleDocumentTypes:
+          - CFBundleTypeName: IPA File
+            LSHandlerRank: Owner
+            LSItemContentTypes:
+              - public.data
+            CFBundleTypeRole: Viewer
 schemes:
   IPA Manager:
     build:
