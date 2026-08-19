@@ -34,42 +34,40 @@ jobs:
           XCODE_DEV=$(xcode-select -p | sed 's|/Contents/Developer||')
           echo "Xcode developer path: $XCODE_DEV"
 
+          export IOS_CROSS_TOP="$XCODE_DEV/Contents/Developer/Platforms/iPhoneOS.platform"
+          export SIM_CROSS_TOP="$XCODE_DEV/Contents/Developer/Platforms/iPhoneSimulator.platform"
+
           # Build for device (arm64)
-          ./Configure ios64-cross \
+          CROSS_TOP="$IOS_CROSS_TOP" CROSS_SDK=iPhoneOS.sdk CC="xcrun --sdk iphoneos clang" \
+            ./Configure ios64-cross \
             --prefix=/tmp/openssl-out/device \
             --openssldir=/tmp/openssl-out/device \
             -D__IPHONE_OS_VERSION_MIN_REQUIRED=160000 \
-            CC="xcrun --sdk iphoneos clang" \
-            CROSS_TOP="$XCODE_DEV/Contents/Developer/Platforms/iPhoneOS.platform" \
-            CROSS_SDK=iPhoneOS.sdk \
             no-shared no-tests no-unit-test
-          make -j4 || make
-          make install_sw
+          make -j4 build_libs || make build_libs
+          make install_dev
 
-          # Build for simulator (arm64 + x86_64)
+          # Build for simulator (arm64)
           make distclean 2>/dev/null || true
-          ./Configure ios-sim-cross-arm64 \
+          CROSS_TOP="$SIM_CROSS_TOP" CROSS_SDK=iPhoneSimulator.sdk CC="xcrun --sdk iphonesimulator clang" \
+            ./Configure ios-sim-cross-arm64 \
             --prefix=/tmp/openssl-out/sim-arm64 \
             --openssldir=/tmp/openssl-out/sim-arm64 \
             -D__IPHONE_OS_VERSION_MIN_REQUIRED=160000 \
-            CC="xcrun --sdk iphonesimulator clang" \
-            CROSS_TOP="$XCODE_DEV/Contents/Developer/Platforms/iPhoneSimulator.platform" \
-            CROSS_SDK=iPhoneSimulator.sdk \
             no-shared no-tests no-unit-test
-          make -j4 || make
-          make install_sw
+          make -j4 build_libs || make build_libs
+          make install_dev
 
+          # Build for simulator (x86_64)
           make distclean 2>/dev/null || true
-          ./Configure ios-sim-cross-x86_64 \
+          CROSS_TOP="$SIM_CROSS_TOP" CROSS_SDK=iPhoneSimulator.sdk CC="xcrun --sdk iphonesimulator clang" \
+            ./Configure ios-sim-cross-x86_64 \
             --prefix=/tmp/openssl-out/sim-x86_64 \
             --openssldir=/tmp/openssl-out/sim-x86_64 \
             -D__IPHONE_OS_VERSION_MIN_REQUIRED=160000 \
-            CC="xcrun --sdk iphonesimulator clang" \
-            CROSS_TOP="$XCODE_DEV/Contents/Developer/Platforms/iPhoneSimulator.platform" \
-            CROSS_SDK=iPhoneSimulator.sdk \
             no-shared no-tests no-unit-test
-          make -j4 || make
-          make install_sw
+          make -j4 build_libs || make build_libs
+          make install_dev
 
           # Combine into xcframework
           mkdir -p "$GITHUB_WORKSPACE/Vendor/openssl/include"
