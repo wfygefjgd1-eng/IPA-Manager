@@ -53,28 +53,15 @@ jobs:
           make -j4 build_libs || make build_libs
           make install_dev
 
-          # Build for simulator (x86_64)
-          make distclean 2>/dev/null || true
-          ./Configure iossimulator-x86_64-xcrun \
-            --prefix=/tmp/openssl-out/sim-x86_64 \
-            --openssldir=/tmp/openssl-out/sim-x86_64 \
-            -D__IPHONE_OS_VERSION_MIN_REQUIRED=160000 \
-            no-shared no-tests no-unit-test no-apps
-          make -j4 build_libs || make build_libs
-          make install_dev
-
-          # Combine into xcframework
+          # Combine into xcframework (device arm64 + simulator arm64)
           mkdir -p "$GITHUB_WORKSPACE/Vendor/openssl/include"
           cp -R /tmp/openssl-out/device/include/openssl "$GITHUB_WORKSPACE/Vendor/openssl/include/openssl"
 
-          libtool -static -o /tmp/openssl-out/libcrypto-device.a /tmp/openssl-out/device/lib/libcrypto.a /tmp/openssl-out/device/lib/libssl.a
-          libtool -static -o /tmp/openssl-out/libcrypto-sim-arm64.a /tmp/openssl-out/sim-arm64/lib/libcrypto.a /tmp/openssl-out/sim-arm64/lib/libssl.a
-          libtool -static -o /tmp/openssl-out/libcrypto-sim-x86_64.a /tmp/openssl-out/sim-x86_64/lib/libcrypto.a /tmp/openssl-out/sim-x86_64/lib/libssl.a
-          libtool -static -o /tmp/openssl-out/libcrypto-sim.a /tmp/openssl-out/libcrypto-sim-arm64.a /tmp/openssl-out/libcrypto-sim-x86_64.a
-
           xcodebuild -create-xcframework \
-            -library /tmp/openssl-out/libcrypto-device.a -headers "$GITHUB_WORKSPACE/Vendor/openssl/include" \
-            -library /tmp/openssl-out/libcrypto-sim.a -headers "$GITHUB_WORKSPACE/Vendor/openssl/include" \
+            -library /tmp/openssl-out/device/lib/libcrypto.a -headers "$GITHUB_WORKSPACE/Vendor/openssl/include" \
+            -library /tmp/openssl-out/device/lib/libssl.a \
+            -library /tmp/openssl-out/sim-arm64/lib/libcrypto.a -headers "$GITHUB_WORKSPACE/Vendor/openssl/include" \
+            -library /tmp/openssl-out/sim-arm64/lib/libssl.a \
             -output "$GITHUB_WORKSPACE/Vendor/openssl/openssl.xcframework"
 
       - name: Generate Xcode Project
