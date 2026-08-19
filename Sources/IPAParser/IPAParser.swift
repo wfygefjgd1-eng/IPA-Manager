@@ -44,7 +44,7 @@ final class IPAParser {
         let package = try parse(fileURL: fileURL)
         var info = try infoParser.parse(at: package.infoPlistURL)
         info.path = package.appURL.path
-        info.size = fileManager.fileSize(at: fileURL)
+        info.size = AppFileManager.shared.fileSize(at: fileURL)
         info.iconPath = try? infoParser.extractIcon(from: package.infoPlistURL, appURL: package.appURL)
         return info
     }

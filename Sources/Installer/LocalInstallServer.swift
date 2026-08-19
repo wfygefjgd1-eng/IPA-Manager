@@ -52,7 +52,7 @@ final class LocalInstallServer {
         return options
     }
 
-    private func handleConnection(_ connection: NWConnection, manifest: Data) {
+    private func handleConnection(_ connection: NWConnection) {
         connections.append(connection)
         connection.start(queue: ServerQueue.shared.queue)
 
