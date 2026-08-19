@@ -1,0 +1,96 @@
+name: IPA Manager
+options:
+  bundleIdPrefix: com.ipamanager
+  deploymentTarget:
+    iOS: "16.0"
+  createIntermediateGroups: true
+packages:
+  ZIPFoundation:
+    url: https://github.com/weichsel/ZIPFoundation.git
+    from: "0.9.19"
+settings:
+  base:
+    SWIFT_VERSION: "5.9"
+    DEVELOPMENT_TEAM: ""
+    CODE_SIGN_STYLE: Automatic
+    MARKETING_VERSION: "1.0"
+    CURRENT_PROJECT_VERSION: "1"
+    TARGETED_DEVICE_FAMILY: "1"
+    ENABLE_BITCODE: NO
+    GENERATE_INFOPLIST_FILE: NO
+targets:
+  IPA Manager:
+    type: application
+    platform: iOS
+    sources:
+      - path: Sources
+      - path: Vendor/zsign/src
+        excludes:
+          - zsign.cpp
+          - third-party/zlib/adler32.c
+          - third-party/zlib/compress.c
+          - third-party/zlib/crc32.c
+          - third-party/zlib/deflate.c
+          - third-party/zlib/gzclose.c
+          - third-party/zlib/gzlib.c
+          - third-party/zlib/gzread.c
+          - third-party/zlib/gzwrite.c
+          - third-party/zlib/infback.c
+          - third-party/zlib/inffast.c
+          - third-party/zlib/inflate.c
+          - third-party/zlib/inftrees.c
+          - third-party/zlib/trees.c
+          - third-party/zlib/uncompr.c
+          - third-party/zlib/zutil.c
+          - third-party/minizip/iowin32.c
+          - third-party/minizip/iowin32.h
+          - third-party/minizip/mztools.c
+          - third-party/minizip/mztools.h
+      - path: Vendor/zsign/ios
+      - path: Vendor/openssl/openssl.xcframework
+        type: framework
+    dependencies:
+      - package: ZIPFoundation
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.ipamanager.app
+        INFOPLIST_FILE: Sources/Info.plist
+        HEADER_SEARCH_PATHS:
+          - $(SRCROOT)/Vendor/zsign/src
+          - $(SRCROOT)/Vendor/zsign/src/common
+          - $(SRCROOT)/Vendor/zsign/src/third-party/zlib
+          - $(SRCROOT)/Vendor/openssl/include
+        CLANG_CXX_LANGUAGE_STANDARD: c++17
+        CLANG_CXX_LIBRARY: libc++
+        GCC_PREPROCESSOR_DEFINITIONS:
+          - MINIZIP_FOPEN_NO_64=1
+        OTHER_LDFLAGS:
+          - -lcrypto
+          - -lz
+        SWIFT_OBJC_BRIDGING_HEADER: $(SRCROOT)/Sources/Bridging-Header.h
+        ENABLE_MODULES: YES
+    info:
+      path: Sources/Info.plist
+      properties:
+        CFBundleDisplayName: IPA Manager
+        CFBundleShortVersionString: "1.0"
+        CFBundleVersion: "1"
+        UIFileSharingEnabled: true
+        LSSupportsOpeningDocumentsInPlace: true
+        UISupportsDocumentBrowser: true
+        NSAppTransportSecurity:
+          NSAllowsArbitraryLoads: true
+        ITSAppUsesNonExemptEncryption: false
+        UISupportedInterfaceOrientations:
+          - UIInterfaceOrientationPortrait
+        UILaunchScreen:
+          UIColorName: ""
+schemes:
+  IPA Manager:
+    build:
+      targets:
+        IPA Manager: all
+    run:
+      config: Debug
+    archive:
+      config: Release

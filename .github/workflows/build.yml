@@ -1,0 +1,96 @@
+name: iOS Build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-14
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Select Xcode
+        run: |
+          sudo xcode-select --switch /Applications/Xcode_15.2.app || sudo xcode-select --switch /Applications/Xcode_15.1.app || echo "Using default Xcode"
+
+      - name: Verify Xcode
+        run: xcodebuild -version
+
+      - name: Install XcodeGen
+        run: brew install xcodegen
+
+      - name: Build OpenSSL for iOS
+        run: |
+          curl -L -o /tmp/openssl.tar.gz https://github.com/openssl/openssl/releases/download/openssl-3.3.2/openssl-3.3.2.tar.gz
+          cd /tmp
+          tar -xzf openssl.tar.gz
+          cd openssl-3.3.2
+
+          # Build for device (arm64)
+          ./Configure ios64-cross --prefix=/tmp/openssl-out/device --openssldir=/tmp/openssl-out/device no-shared no-tests
+          make -j4
+          make install_sw
+
+          # Build for simulator (arm64 + x86_64)
+          make distclean 2>/dev/null || true
+          ./Configure ios-sim-cross-arm64 --prefix=/tmp/openssl-out/sim-arm64 --openssldir=/tmp/openssl-out/sim-arm64 no-shared no-tests
+          make -j4
+          make install_sw
+
+          make distclean 2>/dev/null || true
+          ./Configure ios-sim-cross-x86_64 --prefix=/tmp/openssl-out/sim-x86_64 --openssldir=/tmp/openssl-out/sim-x86_64 no-shared no-tests
+          make -j4
+          make install_sw
+
+          # Combine into xcframework
+          mkdir -p "$GITHUB_WORKSPACE/Vendor/openssl/include"
+          cp -R /tmp/openssl-out/device/include/openssl "$GITHUB_WORKSPACE/Vendor/openssl/include/openssl"
+
+          libtool -static -o /tmp/openssl-out/libcrypto-device.a /tmp/openssl-out/device/lib/libcrypto.a /tmp/openssl-out/device/lib/libssl.a
+          libtool -static -o /tmp/openssl-out/libcrypto-sim-arm64.a /tmp/openssl-out/sim-arm64/lib/libcrypto.a /tmp/openssl-out/sim-arm64/lib/libssl.a
+          libtool -static -o /tmp/openssl-out/libcrypto-sim-x86_64.a /tmp/openssl-out/sim-x86_64/lib/libcrypto.a /tmp/openssl-out/sim-x86_64/lib/libssl.a
+          libtool -static -o /tmp/openssl-out/libcrypto-sim.a /tmp/openssl-out/libcrypto-sim-arm64.a /tmp/openssl-out/libcrypto-sim-x86_64.a
+
+          xcodebuild -create-xcframework \
+            -library /tmp/openssl-out/libcrypto-device.a -headers "$GITHUB_WORKSPACE/Vendor/openssl/include" \
+            -library /tmp/openssl-out/libcrypto-sim.a -headers "$GITHUB_WORKSPACE/Vendor/openssl/include" \
+            -output "$GITHUB_WORKSPACE/Vendor/openssl/openssl.xcframework"
+
+      - name: Generate Xcode Project
+        run: xcodegen generate
+
+      - name: Build (unsigned simulator build for verification)
+        run: |
+          xcodebuild -project "IPA Manager.xcodeproj" \
+            -scheme "IPA Manager" \
+            -sdk iphonesimulator \
+            -destination 'generic/platform=iOS Simulator' \
+            -configuration Debug \
+            CODE_SIGNING_ALLOWED=NO \
+            build
+
+      - name: Build unsigned device IPA
+        run: |
+          xcodebuild -project "IPA Manager.xcodeproj" \
+            -scheme "IPA Manager" \
+            -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
+            -configuration Release \
+            -derivedDataPath build/device \
+            CODE_SIGNING_ALLOWED=NO \
+            build
+          mkdir -p build/artifacts
+          ditto -c -k --keepParent "build/device/Build/Products/Release-iphoneos/IPA Manager.app" "build/artifacts/IPA-Manager-unsigned.ipa"
+
+      - name: Upload Build Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: IPA-Manager-Build
+          path: |
+            build/artifacts
+          if-no-files-found: warn
