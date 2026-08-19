@@ -10,6 +10,8 @@ struct BrowserView: View {
     @State private var showBookmarks = false
     @State private var showDownloadAlert = false
     @State private var pendingDownloadURL: URL?
+    @State private var showToast = false
+    @State private var toastMessage = ""
 
     var body: some View {
         NavigationView {
@@ -40,9 +42,9 @@ struct BrowserView: View {
                 }
                 ToolbarItem(placement: .navigationBarTrailing) {
                     Button {
-                        showBookmarks = true
+                        addCurrentPageToBookmarks()
                     } label: {
-                        Image(systemName: "bookmark")
+                        Image(systemName: "bookmark.badge.plus")
                     }
                 }
             }
@@ -61,6 +63,18 @@ struct BrowserView: View {
                 }
             } message: {
                 Text(pendingDownloadURL?.absoluteString ?? "")
+            }
+            .overlay(alignment: .bottom) {
+                if showToast {
+                    Text(toastMessage)
+                        .font(.subheadline)
+                        .padding(.horizontal, 16)
+                        .padding(.vertical, 10)
+                        .background(Color.black.opacity(0.75))
+                        .foregroundColor(.white)
+                        .cornerRadius(8)
+                        .padding(.bottom, 60)
+                }
             }
         }
     }
@@ -96,6 +110,12 @@ struct BrowserView: View {
             }
 
             Button {
+                showBookmarks = true
+            } label: {
+                Image(systemName: "bookmark")
+            }
+
+            Button {
                 dismiss()
             } label: {
                 Image(systemName: "xmark")
@@ -108,8 +128,29 @@ struct BrowserView: View {
     private func startDownload(_ url: URL) {
         Logger.info("开始下载: \(url.absoluteString)")
         DownloadManager.shared.startDownload(urlString: url.absoluteString) { _ in
-            // 下载完成后交由 AppState 处理
             Logger.info("下载任务已创建")
+            toastMessage = "已加入下载"
+            showToast = true
+            DispatchQueue.main.asyncAfter(deadline: .now() + 2) {
+                showToast = false
+            }
+        }
+    }
+
+    private func addCurrentPageToBookmarks() {
+        guard !urlString.isEmpty, let _ = URL(string: urlString) else {
+            toastMessage = "当前页面无法收藏"
+            showToast = true
+            DispatchQueue.main.asyncAfter(deadline: .now() + 2) {
+                showToast = false
+            }
+            return
+        }
+        BookmarkStore.shared.addCurrentPage(urlString)
+        toastMessage = "已收藏当前页面"
+        showToast = true
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2) {
+            showToast = false
         }
     }
 }
@@ -144,7 +185,12 @@ private struct WebView: UIViewRepresentable {
         return webView
     }
 
-    func updateUIView(_ uiView: WKWebView, context: Context) {}
+    func updateUIView(_ uiView: WKWebView, context: Context) {
+        guard let target = URL(string: url),
+              target.absoluteString != context.coordinator.currentURL?.absoluteString else { return }
+        uiView.load(URLRequest(url: target))
+        context.coordinator.currentURL = target
+    }
 
     func makeCoordinator() -> Coordinator {
         Coordinator(parent: self)
@@ -174,6 +220,7 @@ private struct WebView: UIViewRepresentable {
     class Coordinator: NSObject, WKNavigationDelegate, WKUIDelegate {
         var parent: WebView
         weak var webView: WKWebView?
+        var currentURL: URL?
 
         init(parent: WebView) {
             self.parent = parent
@@ -200,6 +247,7 @@ private struct WebView: UIViewRepresentable {
         }
 
         func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
+            currentURL = webView.url
             DispatchQueue.main.async {
                 self.parent.isLoading = false
                 self.parent.canGoBack = webView.canGoBack
@@ -215,6 +263,7 @@ private struct WebView: UIViewRepresentable {
             Logger.error("网页加载失败: \(error)")
         }
 
+        // 拦截下载：匹配扩展名或 GitHub release/download 链接
         func webView(
             _ webView: WKWebView,
             decidePolicyFor navigationAction: WKNavigationAction,
@@ -225,14 +274,59 @@ private struct WebView: UIViewRepresentable {
                 return
             }
 
+            let urlStr = url.absoluteString.lowercased()
             let ext = url.pathExtension.lowercased()
-            if ext == "ipa" || ext == "zip" || ext == "tar.gz" {
+            let isDownloadExt = ext == "ipa" || ext == "zip" || ext == "tar" || ext == "tar.gz" || ext == "apk"
+            let isReleaseDownload = urlStr.contains("releases/download")
+            let isNewWindow = navigationAction.targetFrame == nil
+
+            if isDownloadExt || isReleaseDownload || isNewWindow && isReleaseDownload {
                 parent.onDownloadDetected(url)
                 decisionHandler(.cancel)
                 return
             }
 
             decisionHandler(.allow)
+        }
+
+        // 兜底：服务器响应的 MIME/文件名指示文件下载时也拦截
+        func webView(
+            _ webView: WKWebView,
+            decidePolicyFor navigationResponse: WKNavigationResponse,
+            decisionHandler: @escaping (WKNavigationResponsePolicy) -> Void
+        ) {
+            let mime = navigationResponse.response.mimeType?.lowercased() ?? ""
+            let mimeIsDownload = mime.contains("zip") || mime.contains("octet-stream") || mime.contains("application/x-tar")
+
+            if !navigationResponse.canShowMIMEType || mimeIsDownload {
+                if let url = navigationResponse.response.url {
+                    parent.onDownloadDetected(url)
+                }
+                decisionHandler(.cancel)
+                return
+            }
+            decisionHandler(.allow)
+        }
+
+        // 新窗口打开（target=_blank）统一在当前浏览器打开
+        func webView(
+            _ webView: WKWebView,
+            createWebViewWith configuration: WKWebViewConfiguration,
+            for navigationAction: WKNavigationAction,
+            windowFeatures: WKWindowFeatures
+        ) -> WKWebView? {
+            if let url = navigationAction.request.url {
+                let urlStr = url.absoluteString.lowercased()
+                let ext = url.pathExtension.lowercased()
+                let isDownload = ext == "ipa" || ext == "zip" || ext == "tar" || ext == "tar.gz" || urlStr.contains("releases/download")
+                if isDownload {
+                    parent.onDownloadDetected(url)
+                    return nil
+                }
+                webView.load(navigationAction.request)
+                return nil
+            }
+            return nil
         }
     }
 }

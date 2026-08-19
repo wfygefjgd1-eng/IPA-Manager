@@ -6,6 +6,7 @@ struct HomeView: View {
     @State private var showFileImporter = false
     @State private var showAlert = false
     @State private var alertMessage = ""
+    @State private var selectedApp: AppInfo?
 
     var body: some View {
         NavigationView {
@@ -13,6 +14,7 @@ struct HomeView: View {
                 VStack(spacing: 16) {
                     statusCard
                     functionGrid
+                    appsSection
                     recentSignings
                 }
                 .padding()
@@ -28,6 +30,65 @@ struct HomeView: View {
             } message: {
                 Text(alertMessage)
             }
+            .sheet(item: $selectedApp) { app in
+                AppDetailView(app: app)
+            }
+        }
+    }
+
+    private var appsSection: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text("我的应用")
+                .font(.headline)
+
+            if appState.importedApps.isEmpty && appState.installedApps.isEmpty {
+                Text("还没有导入任何应用，点"导入文件"导入 IPA / ZIP")
+                    .font(.subheadline)
+                    .foregroundColor(.secondary)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            } else {
+                let unsigned = appState.importedApps.filter { !$0.isSigned }
+                if !unsigned.isEmpty {
+                    Text("待签名 (\(unsigned.count))")
+                        .font(.subheadline)
+                        .foregroundColor(.orange)
+                    ForEach(unsigned) { app in
+                        appRow(app)
+                    }
+                }
+                if !appState.installedApps.isEmpty {
+                    Text("已签名 (\(appState.installedApps.count))")
+                        .font(.subheadline)
+                        .foregroundColor(.green)
+                    ForEach(appState.installedApps) { app in
+                        appRow(app)
+                    }
+                }
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    private func appRow(_ app: AppInfo) -> some View {
+        Button {
+            selectedApp = app
+        } label: {
+            HStack(spacing: 12) {
+                AppIconView(iconPath: app.iconPath)
+                    .frame(width: 40, height: 40)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(app.name.isEmpty ? "未命名" : app.name)
+                        .font(.subheadline)
+                        .foregroundColor(.primary)
+                    Text(app.bundleID.isEmpty ? "未知 Bundle ID" : app.bundleID)
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                }
+                Spacer()
+                Image(systemName: app.isSigned ? "checkmark.seal.fill" : "exclamationmark.circle")
+                    .foregroundColor(app.isSigned ? .green : .orange)
+            }
+            .padding(.vertical, 6)
         }
     }
 

@@ -80,7 +80,8 @@ final class AppState: ObservableObject {
         _ app: AppInfo,
         certificate: CertificateInfo,
         profile: ProvisioningInfo,
-        progress: @escaping (Double) -> Void
+        progress: @escaping (Double) -> Void,
+        completion: ((Result<String, Error>) -> Void)? = nil
     ) {
         var task = SigningTask()
         task.sourceFile = app.path
@@ -121,6 +122,7 @@ final class AppState: ObservableObject {
                         self.refreshInstalledApps()
                     }
                     self.saveState()
+                    completion?(.success(signedPath))
                 }
             } catch {
                 DispatchQueue.main.async {
@@ -129,6 +131,7 @@ final class AppState: ObservableObject {
                         self.signingTasks[index].error = error.localizedDescription
                     }
                     self.saveState()
+                    completion?(.failure(error))
                 }
             }
         }
@@ -139,6 +142,10 @@ final class AppState: ObservableObject {
             throw AppError.installFailed("应用尚未签名")
         }
         try Installer.shared.install(ipaPath: app.path, certificate: certificate)
+    }
+
+    func installSignedPath(_ ipaPath: String, certificate: CertificateInfo) throws {
+        try Installer.shared.install(ipaPath: ipaPath, certificate: certificate)
     }
 
     func handleFileOpenedFromOutside(_ url: URL) {
@@ -209,26 +216,32 @@ final class AppState: ObservableObject {
 
     func addCertificate(_ certificate: CertificateInfo) {
         certificates.append(certificate)
+        if selectedCertificate == nil {
+            selectedCertificate = certificates.first { $0.status == .valid } ?? certificate
+        }
         saveState()
     }
 
     func removeCertificate(_ certificate: CertificateInfo) {
         certificates.removeAll { $0.id == certificate.id }
         if selectedCertificate?.id == certificate.id {
-            selectedCertificate = nil
+            selectedCertificate = certificates.first { $0.status == .valid }
         }
         saveState()
     }
 
     func addProfile(_ profile: ProvisioningInfo) {
         profiles.append(profile)
+        if selectedProfile == nil {
+            selectedProfile = profiles.first { $0.status == .valid } ?? profile
+        }
         saveState()
     }
 
     func removeProfile(_ profile: ProvisioningInfo) {
         profiles.removeAll { $0.id == profile.id }
         if selectedProfile?.id == profile.id {
-            selectedProfile = nil
+            selectedProfile = profiles.first { $0.status == .valid }
         }
         saveState()
     }

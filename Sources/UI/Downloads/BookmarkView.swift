@@ -138,4 +138,28 @@ final class BookmarkStore {
         guard let data = try? JSONEncoder().encode(userItems) else { return }
         UserDefaults.standard.set(data, forKey: key)
     }
+
+    func addCurrentPage(_ urlString: String) {
+        guard let url = URL(string: urlString), url.scheme != nil else { return }
+        let all = load()
+        if all.contains(where: { $0.url == urlString }) { return }
+
+        var title = url.absoluteString
+        let path = url.path
+        if !path.isEmpty && path != "/" {
+            title = URL(fileURLWithPath: path).lastPathComponent
+        } else if let host = url.host {
+            title = host
+        }
+
+        let item = BookmarkItem(
+            title: title.isEmpty ? "书签" : title,
+            url: urlString,
+            icon: "bookmark.fill",
+            isPreset: false
+        )
+        var user = all.filter { !$0.isPreset }
+        user.append(item)
+        save(user)
+    }
 }

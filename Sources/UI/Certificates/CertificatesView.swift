@@ -222,17 +222,14 @@ struct CertificatesView: View {
                         summary += "未找到描述文件\n"
                     }
 
-                    // 导入证书（需要密码）
+                    // 导入证书（需要密码）—— 只弹密码框，避免与 alert 冲突
                     if let p12URL = moved.p12URL {
                         pendingImportURL = p12URL
                         showPasswordSheet = true
-                        summary += "证书: 请输入密码\n"
                     } else {
-                        summary += "未找到证书\n"
+                        alertMessage = summary + "未找到证书"
+                        showAlert = true
                     }
-
-                    alertMessage = summary
-                    showAlert = true
                 }
             } catch {
                 DispatchQueue.main.async {

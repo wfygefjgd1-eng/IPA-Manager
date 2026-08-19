@@ -40,8 +40,8 @@ struct AppDetailView: View {
                 }
             }
             .sheet(isPresented: $showSignOptions) {
-                SignOptionsView(app: app) { cert, profile in
-                    startSigning(certificate: cert, profile: profile)
+                SignOptionsView(app: app) { cert, profile, installAfter in
+                    startSigning(certificate: cert, profile: profile, installAfter: installAfter)
                 }
             }
             .sheet(isPresented: $showInstallCertificatePicker) {
@@ -164,12 +164,30 @@ struct AppDetailView: View {
         }
     }
 
-    private func startSigning(certificate: CertificateInfo, profile: ProvisioningInfo) {
+    private func startSigning(certificate: CertificateInfo, profile: ProvisioningInfo, installAfter: Bool) {
         isSigning = true
         signProgress = 0
-        appState.signApp(app, certificate: certificate, profile: profile) { progress in
+        appState.signApp(app, certificate: certificate, profile: profile, progress: { progress in
             signProgress = progress
-        }
+        }, completion: { [self] result in
+            switch result {
+            case .success(let signedPath):
+                isSigning = false
+                if installAfter {
+                    do {
+                        try appState.installSignedPath(signedPath, certificate: certificate)
+                        alertMessage = "签名完成，已发起安装"
+                    } catch {
+                        alertMessage = "签名完成，安装失败: \(error.localizedDescription)"
+                    }
+                    showAlert = true
+                }
+            case .failure(let error):
+                isSigning = false
+                alertMessage = "签名失败: \(error.localizedDescription)"
+                showAlert = true
+            }
+        })
     }
 }
 
@@ -215,14 +233,21 @@ struct SignOptionsView: View {
     @Environment(\.dismiss) private var dismiss
     @EnvironmentObject private var appState: AppState
     let app: AppInfo
-    let onConfirm: (CertificateInfo, ProvisioningInfo) -> Void
+    let onConfirm: (CertificateInfo, ProvisioningInfo, Bool) -> Void
 
     @State private var selectedCert: CertificateInfo?
     @State private var selectedProfile: ProvisioningInfo?
+    @AppStorage("installAfterSigning") private var installAfterSigning = true
 
     var body: some View {
         NavigationView {
             List {
+                Section {
+                    Toggle("签名后自动安装", isOn: $installAfterSigning)
+                } footer: {
+                    Text("开启后签名完成会自动调用安装")
+                }
+
                 Section("选择证书") {
                     ForEach(appState.certificates) { cert in
                         Button {
@@ -280,7 +305,7 @@ struct SignOptionsView: View {
                 ToolbarItem(placement: .navigationBarTrailing) {
                     Button("开始签名") {
                         if let cert = selectedCert, let profile = selectedProfile {
-                            onConfirm(cert, profile)
+                            onConfirm(cert, profile, installAfterSigning)
                             dismiss()
                         }
                     }
