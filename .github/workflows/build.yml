@@ -26,18 +26,20 @@ jobs:
 
       - name: Build OpenSSL for iOS
         run: |
-          curl -L -o /tmp/openssl.tar.gz https://github.com/openssl/openssl/releases/download/openssl-3.3.2/openssl-3.3.2.tar.gz
-          cd /tmp
+          mkdir -p /tmp/ossl_src
+          curl -L -o /tmp/ossl_src/openssl.tar.gz https://github.com/openssl/openssl/releases/download/openssl-3.3.2/openssl-3.3.2.tar.gz
+          cd /tmp/ossl_src
           tar -xzf openssl.tar.gz
           cd openssl-3.3.2
 
-          XCODE_DEV=$(xcode-select -p | sed 's|/Contents/Developer||')
-          echo "Xcode developer path: $XCODE_DEV"
+          # Use workspace-relative output dir to avoid /private/tmp symlink issues
+          OUTDIR="$GITHUB_WORKSPACE/build/openssl-out"
+          mkdir -p "$OUTDIR"
 
           # Build for device (arm64) - ios64-xcrun auto-detects SDK via xcrun
           ./Configure ios64-xcrun \
-            --prefix=/tmp/openssl-out/device \
-            --openssldir=/tmp/openssl-out/device \
+            --prefix="$OUTDIR/device" \
+            --openssldir="$OUTDIR/device" \
             -D__IPHONE_OS_VERSION_MIN_REQUIRED=160000 \
             no-shared no-tests no-unit-test no-apps
           make -j4 build_libs || make build_libs
@@ -46,8 +48,8 @@ jobs:
           # Build for simulator (arm64) - use xcrun auto sdk
           make distclean 2>/dev/null || true
           ./Configure iossimulator-arm64-xcrun \
-            --prefix=/tmp/openssl-out/sim-arm64 \
-            --openssldir=/tmp/openssl-out/sim-arm64 \
+            --prefix="$OUTDIR/sim-arm64" \
+            --openssldir="$OUTDIR/sim-arm64" \
             -D__IPHONE_OS_VERSION_MIN_REQUIRED=160000 \
             no-shared no-tests no-unit-test no-apps
           make -j4 build_libs || make build_libs
@@ -55,13 +57,13 @@ jobs:
 
           # Combine into xcframework (device arm64 + simulator arm64)
           mkdir -p "$GITHUB_WORKSPACE/Vendor/openssl/include"
-          cp -R /tmp/openssl-out/device/include/openssl "$GITHUB_WORKSPACE/Vendor/openssl/include/openssl"
+          cp -R "$OUTDIR/device/include/openssl" "$GITHUB_WORKSPACE/Vendor/openssl/include/openssl"
 
           xcodebuild -create-xcframework \
-            -library /tmp/openssl-out/device/lib/libcrypto.a -headers "$GITHUB_WORKSPACE/Vendor/openssl/include" \
-            -library /tmp/openssl-out/device/lib/libssl.a \
-            -library /tmp/openssl-out/sim-arm64/lib/libcrypto.a -headers "$GITHUB_WORKSPACE/Vendor/openssl/include" \
-            -library /tmp/openssl-out/sim-arm64/lib/libssl.a \
+            -library "$OUTDIR/device/lib/libcrypto.a" -headers "$GITHUB_WORKSPACE/Vendor/openssl/include" \
+            -library "$OUTDIR/device/lib/libssl.a" \
+            -library "$OUTDIR/sim-arm64/lib/libcrypto.a" -headers "$GITHUB_WORKSPACE/Vendor/openssl/include" \
+            -library "$OUTDIR/sim-arm64/lib/libssl.a" \
             -output "$GITHUB_WORKSPACE/Vendor/openssl/openssl.xcframework"
 
       - name: Generate Xcode Project
