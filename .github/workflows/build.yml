@@ -32,45 +32,34 @@ jobs:
           cd openssl-3.3.2
 
           XCODE_DEV=$(xcode-select -p | sed 's|/Contents/Developer||')
-          IOS_SDK_PATH=$(xcrun --sdk iphoneos --show-sdk-path)
-          SIM_SDK_PATH=$(xcrun --sdk iphonesimulator --show-sdk-path)
-          IOS_SDK_NAME=$(basename "$IOS_SDK_PATH")
-          SIM_SDK_NAME=$(basename "$SIM_SDK_PATH")
-          echo "iOS SDK: $IOS_SDK_PATH"
-          echo "Sim SDK: $SIM_SDK_PATH"
+          echo "Xcode developer path: $XCODE_DEV"
 
-          export IOS_CROSS_TOP="$XCODE_DEV/Contents/Developer/Platforms/iPhoneOS.platform"
-          export SIM_CROSS_TOP="$XCODE_DEV/Contents/Developer/Platforms/iPhoneSimulator.platform"
-
-          # Build for device (arm64)
-          export CROSS_TOP="$IOS_CROSS_TOP" CROSS_SDK="$IOS_SDK_NAME"
-          CC="xcrun --sdk iphoneos clang" ./Configure ios64-cross \
+          # Build for device (arm64) - ios64-xcrun auto-detects SDK via xcrun
+          ./Configure ios64-xcrun \
             --prefix=/tmp/openssl-out/device \
             --openssldir=/tmp/openssl-out/device \
             -D__IPHONE_OS_VERSION_MIN_REQUIRED=160000 \
-            no-shared no-tests no-unit-test
+            no-shared no-tests no-unit-test no-apps
           make -j4 build_libs || make build_libs
           make install_dev
 
-          # Build for simulator (arm64)
+          # Build for simulator (arm64) - use xcrun auto sdk
           make distclean 2>/dev/null || true
-          export CROSS_TOP="$SIM_CROSS_TOP" CROSS_SDK="$SIM_SDK_NAME"
-          CC="xcrun --sdk iphonesimulator clang" ./Configure ios-sim-cross-arm64 \
+          ./Configure iossimulator-arm64-xcrun \
             --prefix=/tmp/openssl-out/sim-arm64 \
             --openssldir=/tmp/openssl-out/sim-arm64 \
             -D__IPHONE_OS_VERSION_MIN_REQUIRED=160000 \
-            no-shared no-tests no-unit-test
+            no-shared no-tests no-unit-test no-apps
           make -j4 build_libs || make build_libs
           make install_dev
 
           # Build for simulator (x86_64)
           make distclean 2>/dev/null || true
-          export CROSS_TOP="$SIM_CROSS_TOP" CROSS_SDK="$SIM_SDK_NAME"
-          CC="xcrun --sdk iphonesimulator clang" ./Configure ios-sim-cross-x86_64 \
+          ./Configure iossimulator-x86_64-xcrun \
             --prefix=/tmp/openssl-out/sim-x86_64 \
             --openssldir=/tmp/openssl-out/sim-x86_64 \
             -D__IPHONE_OS_VERSION_MIN_REQUIRED=160000 \
-            no-shared no-tests no-unit-test
+            no-shared no-tests no-unit-test no-apps
           make -j4 build_libs || make build_libs
           make install_dev
 
