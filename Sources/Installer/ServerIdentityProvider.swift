@@ -23,9 +23,10 @@ final class ServerIdentityProvider {
         }
 
         guard let rawIdentity = first[kSecImportItemIdentity as String],
-              let identity = rawIdentity as? SecIdentity else {
+              CFGetTypeID(rawIdentity as CFTypeRef) == SecIdentityGetTypeID() else {
             throw AppError.certificateInvalid("证书中未找到身份")
         }
+        let identity = rawIdentity as! SecIdentity
 
         currentIdentity = identity
         exportToKeychain(identity: identity)
