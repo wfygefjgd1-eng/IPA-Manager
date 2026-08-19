@@ -131,8 +131,8 @@ final class CertificateManager {
 
     private static func parseCertificateValidityDER(_ data: Data) -> (start: Date?, expire: Date?) {
         var parser = DERParser(data: data)
-        guard let tbs = parser.readSequence(),
-              let tbsParser = DERParser(data: tbs) else { return (nil, nil) }
+        guard let tbs = parser.readSequence() else { return (nil, nil) }
+        let tbsParser = DERParser(data: tbs)
 
         var inner = tbsParser
         if inner.peekTag() == 0xA0 { _ = inner.readElement() }
@@ -209,34 +209,40 @@ final class CertificateManager {
     private func parseCertificateDetails(_ certificate: SecCertificate, into info: CertificateInfo) -> CertificateInfo {
         var updated = info
 
-        if let values = SecCertificateCopyValues(certificate, nil, nil) as? [CFString: Any] {
-            if let subject = values[kSecOIDX509V3SubjectName as CFString] as? [[String: Any]] {
-                updated = extractSubjectInfo(subject, into: updated)
+        // iOS-safe subject parsing: extract CN and O from the localized subject summary
+        if let summary = SecCertificateCopySubjectSummary(certificate) as String? {
+            if updated.commonName.isEmpty {
+                updated.commonName = summary
             }
+            updated = extractSubjectInfo(from: summary, into: updated)
         }
 
         return updated
     }
 
-    private func extractSubjectInfo(_ values: [[String: Any]], into info: CertificateInfo) -> CertificateInfo {
+    private func extractSubjectInfo(from summary: String, into info: CertificateInfo) -> CertificateInfo {
         var updated = info
-        for entry in values {
-            guard let label = entry["label"] as? String else { continue }
-            let value = entry["value"] as? String ?? ""
 
-            switch label {
-            case "1.2.840.113549.1.9.1": break
-            case "2.16.840.1.113730.1.1":
-                updated.organization = value
-            case "OU":
-                updated.teamID = value
-            case "CN":
-                if updated.commonName.isEmpty {
-                    updated.commonName = value
-                }
-            default: break
+        // Summary like "Apple Distribution: Company Name (TEAMID)" or "/CN=.../O=..."
+        if updated.commonName.isEmpty {
+            updated.commonName = summary
+        }
+
+        // Team ID: 10-char uppercase alphanumeric inside parentheses
+        if let teamRange = summary.range(of: #"\(\s*([A-Z0-9]{10})\s*\)"#, options: .regularExpression) {
+            let candidate = summary[teamRange]
+            let digits = candidate.filter { $0.isNumber || $0.isUppercase }
+            updated.teamID = String(digits)
+        }
+
+        // Organization: text after "Company:" or between "O=" markers
+        if let orgMarker = summary.range(of: "Company:") {
+            let orgStart = summary.index(orgMarker.upperBound, offsetBy: 1)
+            if let orgEnd = summary[orgStart...].firstIndex(of: "(") {
+                updated.organization = String(summary[orgStart..<orgEnd]).trimmingCharacters(in: .whitespaces)
             }
         }
+
         return updated
     }
 
