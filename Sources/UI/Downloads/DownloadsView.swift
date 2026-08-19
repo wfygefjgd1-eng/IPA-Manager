@@ -171,8 +171,7 @@ struct DownloadsView: View {
             if let app = matchedApp(for: task) {
                 selectedApp = app
             } else {
-                unrecognizedMessage = unrecognizedReason(for: task)
-                showUnrecognizedAlert = true
+                recognizeUnmatchedTask(task)
             }
         }
         .contextMenu {
@@ -212,26 +211,91 @@ struct DownloadsView: View {
         }
     }
 
+    /// 已 completed 但未匹配到已导入应用：先做轻量快速判断（文件缺失 / ZIP 魔数损坏），
+    /// 需要真实解压解析时放到后台执行，避免大文件解压阻塞主线程。
+    private func recognizeUnmatchedTask(_ task: DownloadTask) {
+        let path = task.destinationPath
+        let exists = !path.isEmpty && FileManager.default.fileExists(atPath: path)
+        let isZip = (path as NSString).pathExtension.lowercased() == "zip"
+
+        // 快速失败：文件不存在，或 ZIP 连魔数都不对（截断文件 / HTML 错误页）——无需解析
+        if !exists || (isZip && isCorruptedArchive(at: path)) {
+            unrecognizedMessage = unrecognizedReason(for: task)
+            showUnrecognizedAlert = true
+            return
+        }
+
+        // 魔数正常但仍解析失败：后台实际解析一次拿到真实原因，保持界面流畅
+        DispatchQueue.global(qos: .userInitiated).async {
+            let reason = self.unrecognizedReason(for: task)
+            DispatchQueue.main.async {
+                self.unrecognizedMessage = reason
+                self.showUnrecognizedAlert = true
+            }
+        }
+    }
+
     /// 已 completed 但未匹配到已导入应用时，给出具体导入失败原因而非笼统的“无法识别”。
+    /// 所有路径都会把具体原因写入 Logger（供设置中“收集全部错误并导出”的诊断报告使用）。
     private func unrecognizedReason(for task: DownloadTask) -> String {
         let path = task.destinationPath
         let exists = !path.isEmpty && FileManager.default.fileExists(atPath: path)
 
         if !exists {
-            return "文件已下载，但目标文件不存在（可能已被移动或清理）。可重新下载后再试。"
+            let reason = "文件已下载，但目标文件不存在（可能已被移动或清理）。可重新下载后再试。"
+            Logger.error("无法识别下载文件: \(task.fileName) - \(reason)")
+            return reason
         }
 
         switch (path as NSString).pathExtension.lowercased() {
         case "zip":
             if isCorruptedArchive(at: path) {
-                return "文件损坏或网络异常导致下载不完整，请删除后重新下载"
+                let reason = "文件损坏或网络异常导致下载不完整，请删除后重新下载"
+                Logger.error("无法识别下载文件: \(task.fileName) - \(reason)")
+                return reason
             }
-            return "下载成功，但该 ZIP 未包含可解析的 .app 应用包（可能不是有效的 IPA/ZIP 结构），请确认文件完整后重试。"
+            // 文件头（PK 魔数）正常但自动导入仍失败：这里实际解析一次，
+            // 用真实的解析错误（IPAParser 已把“压缩包内包含：…”等内容细节写进错误信息）代替笼统文案。
+            do {
+                _ = try IPAParser().parse(fileURL: URL(fileURLWithPath: path))
+                let reason = "该 ZIP 可解析为应用，请回到“我的应用”查看；若未出现请重试导入。"
+                Logger.info("下载文件可解析（但未匹配到任务）: \(task.fileName) - \(reason)")
+                return reason
+            } catch {
+                return zipParseFailureReason(task: task, detail: error.localizedDescription)
+            }
         case "ipa":
-            return "自动导入失败：IPA 解析未生成应用记录，文件可能损坏或不是有效的 IPA 包，可重新下载验证。"
+            let reason = "自动导入失败：IPA 解析未生成应用记录，文件可能损坏或不是有效的 IPA 包，可重新下载验证。"
+            Logger.error("无法识别下载文件: \(task.fileName) - \(reason)")
+            return reason
         default:
-            return "自动导入失败：无法将“\(task.fileName)”识别为可签名应用（文件已存在但解析失败）。"
+            let reason = "自动导入失败：无法将“\(task.fileName)”识别为可签名应用（文件已存在但解析失败）。"
+            Logger.error("无法识别下载文件: \(task.fileName) - \(reason)")
+            return reason
         }
+    }
+
+    /// 把 ZIP 真实解析错误（中文）分类成用户可操作的中文提示，并写入诊断日志。
+    private func zipParseFailureReason(task: DownloadTask, detail: String) -> String {
+        let reason: String
+        if detail.contains("解压") || detail.contains("损坏") || detail.contains("不完整")
+            || detail.contains("不是有效的 ZIP") || detail.contains("网页") {
+            reason = "压缩包无法解压（可能损坏或下载不完整），请删除后重新下载。详情：\(detail)"
+        } else if detail.contains("未找到 .app") {
+            // detail 形如“操作失败: 未找到 .app 应用包。压缩包内包含：xxx 等 N 个条目”，
+            // 去掉前缀与重复短语，保留“压缩包内包含：…”内容摘要。
+            let summary = detail
+                .replacingOccurrences(of: "操作失败: ", with: "")
+                .replacingOccurrences(of: "未找到 .app 应用包", with: "")
+                .trimmingCharacters(in: CharacterSet(charactersIn: "。. "))
+            reason = "压缩包内没有找到 .app 应用包，可能不是应用安装包。"
+                + (summary.isEmpty ? "（详情见日志）" : summary)
+        } else {
+            reason = "自动导入失败：\(detail)"
+        }
+        // 日志同时保留用户提示与原始错误全文，方便诊断
+        Logger.error("无法识别下载文件: \(task.fileName) - \(reason)[原始错误: \(detail)]")
+        return reason
     }
 
     /// 判断下载文件是否损坏：文件头不是 zip/ipa 魔数（PK\x03\x04）即视为损坏

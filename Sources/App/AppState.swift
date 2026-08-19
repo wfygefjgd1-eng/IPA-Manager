@@ -31,7 +31,8 @@ final class AppState: ObservableObject {
     private enum DownloadedArchiveKind {
         case certificateBundle
         case appPackage
-        case unknown
+        /// 压缩包能正常解压但既非应用包也非证书包；携带顶层内容摘要，便于定位真实结构
+        case unknown(String)
     }
 
     private func handleDownloadedFile(
@@ -77,8 +78,9 @@ final class AppState: ObservableObject {
                             completion?(result)
                         }
                     }
-                case .unknown:
-                    let message = "该 ZIP 不是应用包（无 Payload/*.app 结构）也不是证书包（无 .p12/.mobileprovision）"
+                case .unknown(let summary):
+                    // 保留原始分类信息，并附上“压缩包内包含：…”内容摘要，方便定位真实结构
+                    let message = "该 ZIP 不是应用包（无 Payload/*.app 结构）也不是证书包（无 .p12/.mobileprovision）。\(summary)"
                     DispatchQueue.main.async {
                         Logger.error("自动解析失败: \(url.lastPathComponent) - \(message)")
                         completion?(.failure(AppError.operationFailed(message)))
@@ -144,8 +146,26 @@ final class AppState: ObservableObject {
         if hasCertificate { return .certificateBundle }
         if hasAppBundle { return .appPackage }
         // 压缩包能正常解压但内部既无 .app 也无证书结构 → 未知类型（下游会报“不是应用包也不是证书包”）
-        Logger.error("压缩包分类失败: \(url.lastPathComponent) - 压缩包内未发现 .app（应用包）或 .p12/.pfx/.mobileprovision（证书包）结构")
-        return .unknown
+        // 附上顶层内容摘要，说明“压缩包里到底有什么”（源码包 / 空包 / 其它结构）。
+        let summary = topLevelSummary(of: tempDir)
+        Logger.error("压缩包分类失败: \(url.lastPathComponent) - 压缩包内未发现 .app（应用包）或 .p12/.pfx/.mobileprovision（证书包）结构。\(summary)")
+        return .unknown(summary)
+    }
+
+    /// 列出解压目录顶层内容（最多 5 个 + 总数），用于错误信息中说明“压缩包里到底有什么”。
+    private func topLevelSummary(of dir: URL) -> String {
+        guard let items = try? FileManager.default.contentsOfDirectory(
+            at: dir,
+            includingPropertiesForKeys: nil
+        ) else {
+            return "压缩包内内容无法读取"
+        }
+        if items.isEmpty { return "压缩包内没有任何内容" }
+        let names = items.map { $0.lastPathComponent }
+        let shown = names.prefix(5).joined(separator: "、")
+        return names.count > 5
+            ? "压缩包内包含：\(shown) 等 \(names.count) 个条目"
+            : "压缩包内包含：\(shown)"
     }
 
     private func isInsideAppBundle(_ url: URL) -> Bool {
@@ -329,12 +349,74 @@ final class AppState: ObservableObject {
         // 这里不再加载，避免与 DownloadManager 的内存态互相覆盖。
         importedApps = store.loadImportedApps()
 
+        // 路径重定位：iOS 更新/重装 app 后沙盒容器路径（Bundle/Data 的 UUID）会变化，
+        // 持久化的旧路径可能失效。用文件名在对应的 Documents 目录下找回，
+        // 找到则更新为稳定路径并持久化；找不到则保留原记录（UI 显示文件缺失），不影响其它记录。
+        relocateProfilePaths()
+        relocateImportedAppPaths()
+
         // 选中项不持久化，恢复后必须重新挑选，避免首页显示“未选择证书”
         if selectedCertificate == nil {
             selectedCertificate = certificates.first { $0.status == .valid } ?? certificates.first
         }
         if selectedProfile == nil {
             selectedProfile = profiles.first { $0.status == .valid } ?? profiles.first
+        }
+    }
+
+    /// 描述文件路径重定位：path 失效时，按文件名（或 `profile-<uuid>.mobileprovision`）在
+    /// Documents/Profiles 下找回文件；找到则更新 path 并落盘，找不到保留原记录。
+    private func relocateProfilePaths() {
+        let available = fileManager.contents(of: .profiles)
+        var changed = false
+        for index in profiles.indices {
+            let profile = profiles[index]
+            guard !profile.path.isEmpty,
+                  !FileManager.default.fileExists(atPath: profile.path) else { continue }
+
+            let oldFileName = URL(fileURLWithPath: profile.path).lastPathComponent
+            let uuidFileName = UUID(uuidString: profile.uuid).map { "profile-\($0.uuidString).mobileprovision" }
+
+            guard let match = available.first(where: { entry in
+                let isDirectory = (try? entry.resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory ?? false
+                guard !isDirectory else { return false }
+                return entry.lastPathComponent == oldFileName
+                    || (uuidFileName != nil && entry.lastPathComponent == uuidFileName)
+            }) else { continue }
+
+            profiles[index].path = match.path
+            changed = true
+            Logger.info("描述文件路径重定位: \(oldFileName) -> \(match.path)")
+        }
+        if changed {
+            store.saveProfiles(profiles)
+        }
+    }
+
+    /// 导入应用路径重定位：与描述文件同理，按文件名在 Documents/IPA 下找回，
+    /// 修复签名/重打包时 “Input file not found” 同类问题。
+    private func relocateImportedAppPaths() {
+        let available = fileManager.contents(of: .ipa)
+        var changed = false
+        for index in importedApps.indices {
+            let app = importedApps[index]
+            guard !app.path.isEmpty,
+                  !FileManager.default.fileExists(atPath: app.path) else { continue }
+
+            let oldFileName = URL(fileURLWithPath: app.path).lastPathComponent
+
+            guard let match = available.first(where: { entry in
+                let isDirectory = (try? entry.resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory ?? false
+                guard !isDirectory else { return false }
+                return entry.lastPathComponent == oldFileName
+            }) else { continue }
+
+            importedApps[index].path = match.path
+            changed = true
+            Logger.info("应用路径重定位: \(oldFileName) -> \(match.path)")
+        }
+        if changed {
+            store.saveImportedApps(importedApps)
         }
     }
 

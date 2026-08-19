@@ -26,10 +26,21 @@ final class IPAParser {
         }
 
         let extractDir = extractedDirectory(for: fileURL)
-        try zipManager.unzip(archiveURL: fileURL, destinationURL: extractDir)
+        do {
+            try zipManager.unzip(archiveURL: fileURL, destinationURL: extractDir)
+        } catch let error as ZipManager.ZipError {
+            // ZipError 的 errorDescription 已经是面向用户的中文
+            // （“不是有效的 ZIP / 下载到的是网页 / 已损坏或下载不完整”），直接透传保留全部细节。
+            throw error
+        } catch {
+            // 其它解压失败（如临时目录创建失败）：把底层原因拼进中文错误，便于定位解压哪一步出错。
+            throw AppError.operationFailed("解压失败：\(error.localizedDescription)")
+        }
 
         guard let appURL = findAppBundle(in: extractDir) else {
-            throw AppError.operationFailed("未找到 .app 应用包")
+            // 解压成功但找不到 .app：列出压缩包顶层实际内容，
+            // 让用户/我们一眼看出这是源码包、证书包、空包还是结构异常的 ZIP。
+            throw AppError.operationFailed(noAppBundleMessage(for: extractDir))
         }
 
         let infoPlistURL = appURL.appendingPathComponent("Info.plist")
@@ -38,6 +49,30 @@ final class IPAParser {
         }
 
         return ParsedPackage(appURL: appURL, infoPlistURL: infoPlistURL, rootURL: extractDir)
+    }
+
+    /// 生成“未找到 .app”的详细中文原因：列出解压目录顶层的实际内容（最多 5 个 +
+    /// 总数），帮助区分压缩包是源码包、证书包、空包还是结构异常的 ZIP。
+    private func noAppBundleMessage(for extractDir: URL) -> String {
+        var message = "未找到 .app 应用包"
+        guard let items = try? fileManager.contentsOfDirectory(
+            at: extractDir,
+            includingPropertiesForKeys: nil
+        ) else {
+            // 解压目录不存在或不可读 → 视为空
+            return message + "。解压目录为空或无法读取"
+        }
+        if items.isEmpty {
+            return message + "。解压目录为空（压缩包内没有任何内容）"
+        }
+        let names = items.map { $0.lastPathComponent }
+        let shown = names.prefix(5).joined(separator: "、")
+        if names.count > 5 {
+            message += "。压缩包内包含：\(shown) 等 \(names.count) 个条目"
+        } else {
+            message += "。压缩包内包含：\(shown)"
+        }
+        return message
     }
 
     func parseAppInfo(fileURL: URL) throws -> AppInfo {

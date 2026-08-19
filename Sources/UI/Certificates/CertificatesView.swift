@@ -209,8 +209,9 @@ struct CertificatesView: View {
                     // 导入描述文件
                     if let profileURL = moved.profileURL {
                         do {
-                            var profile = try ProvisioningManager.shared.importProfile(from: profileURL)
-                            profile.path = profileURL.path
+                            // importProfile 内部归档到 Documents/Profiles（目标本就在该目录时直接复用），
+                            // 返回的 path 稳定，无需再覆盖
+                            let profile = try ProvisioningManager.shared.importProfile(from: profileURL)
                             if !appState.profiles.contains(where: { $0.uuid == profile.uuid }) {
                                 appState.addProfile(profile)
                             }
@@ -254,8 +255,8 @@ struct CertificatesView: View {
 
         do {
             try AppFileManager.shared.copyItem(from: url, to: destination)
-            var profile = try ProvisioningManager.shared.importProfile(from: destination)
-            profile.path = destination.path
+            // importProfile 检测到源已在 Documents/Profiles 内，会直接复用该路径，无需再覆盖
+            let profile = try ProvisioningManager.shared.importProfile(from: destination)
             // 按 uuid 去重：同一描述文件重复导入只保留一份
             if !appState.profiles.contains(where: { $0.uuid == profile.uuid }) {
                 appState.addProfile(profile)

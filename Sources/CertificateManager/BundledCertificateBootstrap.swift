@@ -22,8 +22,10 @@ final class BundledCertificateBootstrap {
         // Import provisioning profile
         var profileOK = false
         do {
-            var profile = try ProvisioningManager.shared.importProfile(from: provURL)
-            profile.path = provURL.path
+            // importProfile 会自动把 Bundle 内描述文件复制到 Documents/Profiles，
+            // 并返回 Documents 下的稳定路径；不要再用 provURL.path（Bundle 内路径）
+            // 覆盖它——Bundle 的 UUID 会随 app 更新/重装变化，导致持久化路径失效。
+            let profile = try ProvisioningManager.shared.importProfile(from: provURL)
             if !appState.profiles.contains(where: { $0.uuid == profile.uuid }) {
                 appState.addProfile(profile)
             }
