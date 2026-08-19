@@ -1,4 +1,5 @@
 #import "TLSIdentityHelper.h"
+#import <Security/SecIdentity.h>
 
 void IPMSetTLSIdentity(sec_protocol_options_t options, SecIdentityRef identity) {
     if (options == NULL || identity == NULL) {
