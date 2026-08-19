@@ -128,7 +128,7 @@ final class LocalInstallServer {
     }
 }
 
-enum ServerQueue {
+final class ServerQueue {
     static let shared = ServerQueue()
     let queue: DispatchQueue
 
