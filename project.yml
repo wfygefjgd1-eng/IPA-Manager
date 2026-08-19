@@ -63,13 +63,9 @@ targets:
         GCC_PREPROCESSOR_DEFINITIONS:
           - MINIZIP_FOPEN_NO_64=1
         OTHER_LDFLAGS:
-          - -lz
-        OTHER_LDFLAGS[sdk=iphoneos*]:
           - $(SRCROOT)/Vendor/openssl/lib/libcrypto-device.a
           - $(SRCROOT)/Vendor/openssl/lib/libssl-device.a
-        OTHER_LDFLAGS[sdk=iphonesimulator*]:
-          - $(SRCROOT)/Vendor/openssl/lib/libcrypto-sim.a
-          - $(SRCROOT)/Vendor/openssl/lib/libssl-sim.a
+          - -lz
         SWIFT_OBJC_BRIDGING_HEADER: $(SRCROOT)/Sources/Bridging-Header.h
         ENABLE_MODULES: YES
     info:

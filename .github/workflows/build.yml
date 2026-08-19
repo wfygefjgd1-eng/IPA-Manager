@@ -24,7 +24,7 @@ jobs:
       - name: Install XcodeGen
         run: brew install xcodegen
 
-      - name: Build OpenSSL for iOS
+      - name: Build OpenSSL for iOS (device arm64)
         run: |
           mkdir -p /tmp/ossl_src
           curl -L -o /tmp/ossl_src/openssl.tar.gz https://github.com/openssl/openssl/releases/download/openssl-3.3.2/openssl-3.3.2.tar.gz
@@ -36,7 +36,6 @@ jobs:
           OUTDIR="$GITHUB_WORKSPACE/build/openssl-out"
           mkdir -p "$OUTDIR"
 
-          # Build for device (arm64) - ios64-xcrun auto-detects SDK via xcrun
           ./Configure ios64-xcrun \
             --prefix="$OUTDIR/device" \
             --openssldir="$OUTDIR/device" \
@@ -45,38 +44,16 @@ jobs:
           make -j4 build_libs || make build_libs
           make install_dev
 
-          # Build for simulator (arm64) - use xcrun auto sdk
-          make distclean 2>/dev/null || true
-          ./Configure iossimulator-arm64-xcrun \
-            --prefix="$OUTDIR/sim-arm64" \
-            --openssldir="$OUTDIR/sim-arm64" \
-            -D__IPHONE_OS_VERSION_MIN_REQUIRED=160000 \
-            no-shared no-tests no-unit-test no-apps
-          make -j4 build_libs || make build_libs
-          make install_dev
-
-          # Copy static libs and headers for SDK-conditional linking
+          # Copy static libs and headers for linking
           mkdir -p "$GITHUB_WORKSPACE/Vendor/openssl/include"
           mkdir -p "$GITHUB_WORKSPACE/Vendor/openssl/lib"
           cp -R "$OUTDIR/device/include/openssl" "$GITHUB_WORKSPACE/Vendor/openssl/include/openssl"
           cp "$OUTDIR/device/lib/libcrypto.a" "$GITHUB_WORKSPACE/Vendor/openssl/lib/libcrypto-device.a"
           cp "$OUTDIR/device/lib/libssl.a" "$GITHUB_WORKSPACE/Vendor/openssl/lib/libssl-device.a"
-          cp "$OUTDIR/sim-arm64/lib/libcrypto.a" "$GITHUB_WORKSPACE/Vendor/openssl/lib/libcrypto-sim.a"
-          cp "$OUTDIR/sim-arm64/lib/libssl.a" "$GITHUB_WORKSPACE/Vendor/openssl/lib/libssl-sim.a"
           echo "OpenSSL libs ready"
 
       - name: Generate Xcode Project
         run: xcodegen generate
-
-      - name: Build (unsigned simulator build for verification)
-        run: |
-          xcodebuild -project "IPA Manager.xcodeproj" \
-            -scheme "IPA Manager" \
-            -sdk iphonesimulator \
-            -destination 'generic/platform=iOS Simulator' \
-            -configuration Debug \
-            CODE_SIGNING_ALLOWED=NO \
-            build
 
       - name: Build unsigned device IPA
         run: |
