@@ -17,6 +17,9 @@ final class SigningEngine: SigningEngineProtocol {
     private let fileManager = AppFileManager.shared
     private let certManager = CertificateManager.shared
     private let zipManager = ZipManager.shared
+    /// 底层文件系统操作（解压/移动/枚举等）统一走 FileManager.default，
+    /// 与 AppFileManager（应用目录/持久化语义）区分开。
+    private let disk = FileManager.default
 
     func sign(
         sourcePath: String,
@@ -52,10 +55,10 @@ final class SigningEngine: SigningEngineProtocol {
         }
         defer {
             if let normalizedWorkDir = normalizedWorkDir {
-                try? fileManager.deleteItem(at: normalizedWorkDir)
+                try? disk.removeItem(at: normalizedWorkDir)
             }
             if let normalizedOutputURL = normalizedOutputURL {
-                try? fileManager.deleteItem(at: normalizedOutputURL)
+                try? disk.removeItem(at: normalizedOutputURL)
             }
         }
 
@@ -283,14 +286,14 @@ final class SigningEngine: SigningEngineProtocol {
 
             // 构造标准结构：workRoot/Payload/<App>.app
             let payloadDir = workRoot.appendingPathComponent("Payload", isDirectory: true)
-            try fileManager.createDirectory(at: payloadDir, withIntermediateDirectories: true)
+            try disk.createDirectory(at: payloadDir, withIntermediateDirectories: true)
             let targetApp = payloadDir.appendingPathComponent(appURL.lastPathComponent)
-            try fileManager.moveItem(at: appURL, to: targetApp)
+            try disk.moveItem(at: appURL, to: targetApp)
 
             // 清理残留解压文件（只保留 Payload/），再整体打包为标准 IPA。
             // 输出文件放在 workRoot 之外：zipItem 打包输入文件夹时若输出也在其中，
             // 会把自己当作待打包内容（异常/递归）。workRoot 与 outputURL 由调用方统一清理。
-            try? fileManager.deleteItem(at: extractDir)
+            try? disk.removeItem(at: extractDir)
             let outputURL = URL(fileURLWithPath: NSTemporaryDirectory())
                 .appendingPathComponent("normalized-\(UUID().uuidString).ipa")
             try zipManager.zip(folderURL: workRoot, outputURL: outputURL, shouldKeepParent: false)
@@ -327,18 +330,18 @@ final class SigningEngine: SigningEngineProtocol {
     /// 在解压目录中查找 .app 应用包（顶层优先，递归兜底）。
     private func findAppBundle(in rootURL: URL) -> URL? {
         // 顶层直接枚举（标准解压后 .app 应在 Payload/ 或根）
-        if let items = try? fileManager.contentsOfDirectory(at: rootURL, includingPropertiesForKeys: nil) {
+        if let items = try? disk.contentsOfDirectory(at: rootURL, includingPropertiesForKeys: nil) {
             for item in items {
                 if item.pathExtension == "app" {
                     var isDir: ObjCBool = false
-                    if fileManager.fileExists(atPath: item.path, isDirectory: &isDir), isDir.boolValue {
+                    if disk.fileExists(atPath: item.path, isDirectory: &isDir), isDir.boolValue {
                         return item
                     }
                 }
             }
         }
         // 递归兜底（zip 内嵌目录结构异常时）
-        guard let enumerator = fileManager.enumerator(
+        guard let enumerator = disk.enumerator(
             at: rootURL,
             includingPropertiesForKeys: [.isDirectoryKey],
             options: [.skipsHiddenFiles]
