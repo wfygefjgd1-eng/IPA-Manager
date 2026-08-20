@@ -54,7 +54,7 @@ final class ServerIdentityProvider {
         // （成功设置 currentIdentity）。loadIdentityViaOpenSSL 返回 false 仅表示直连构造成功
         // （currentCertKey 已设置），此时清除可能残留的 identity；Keychain / 传统 p12 路径
         // 返回 true，内部已设置好各自的身份状态，不能在这里统一清掉。
-        if !loadIdentityViaOpenSSL(p12URL: p12URL, password: password) {
+        if !(try loadIdentityViaOpenSSL(p12URL: p12URL, password: password)) {
             currentIdentity = nil
         }
         Logger.info("已通过 OpenSSL 设置本地服务器 TLS 身份")

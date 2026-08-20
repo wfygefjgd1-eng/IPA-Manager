@@ -221,7 +221,7 @@ final class AppState: ObservableObject {
 
         DispatchQueue.global(qos: .userInitiated).async {
             // destination 声明在 do 外，便于解析失败时清理可能残留的半成品文件
-            var destination = fileManager.directoryURL(.ipa).appendingPathComponent(url.lastPathComponent)
+            var destination = self.fileManager.directoryURL(.ipa).appendingPathComponent(url.lastPathComponent)
             do {
                 // zip 输入先统一转换为标准 .ipa（含内嵌 .ipa 提取、.app 重打包为 Payload）：
                 // 入库后 app.path 一定指向可签名的 .ipa。不含 .app/.ipa 的 zip（如证书包）
@@ -232,7 +232,7 @@ final class AppState: ObservableObject {
                 } else {
                     importURL = url
                 }
-                destination = fileManager.directoryURL(.ipa).appendingPathComponent(importURL.lastPathComponent)
+                destination = self.fileManager.directoryURL(.ipa).appendingPathComponent(importURL.lastPathComponent)
 
                 // 转换得到的 .ipa 已直接输出到 .ipa 目录（importURL 即 destination），跳过复制，避免删掉源文件
                 if importURL.path != destination.path {
