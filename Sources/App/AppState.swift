@@ -244,6 +244,20 @@ final class AppState: ObservableObject {
                 }
                 var app = try self.parser.parseAppInfo(fileURL: destination)
                 app.path = destination.path
+                // 待签名图标持久化：parseAppInfo 返回的 iconPath 是本次解压目录
+                // （Extracted/<baseName>/）内的 .app 内部路径，而每次解析都会解压并整体
+                // 清空重建该目录，图标路径在下一次刷新时即失效。这里复制到
+                // Extracted/Icons/<baseName>/ 稳定目录后回填 app.iconPath，首页「待签名」
+                // 列表才能稳定显示图标（与已签名列表 persistInstalledAppIcon 同源修复）。
+                // 当前仍在后台队列执行，文件复制不阻塞主线程。
+                if let iconPath = app.iconPath,
+                   FileManager.default.fileExists(atPath: iconPath),
+                   let stablePath = persistImportedAppIcon(
+                       from: iconPath,
+                       baseName: destination.deletingPathExtension().lastPathComponent
+                   ) {
+                    app.iconPath = stablePath
+                }
                 DispatchQueue.main.async {
                     if let index = self.importedApps.firstIndex(where: { $0.bundleID == app.bundleID }) {
                         self.importedApps[index] = app
@@ -262,6 +276,36 @@ final class AppState: ObservableObject {
                     completion(.failure(error))
                 }
             }
+        }
+    }
+
+    /// 把导入（待签名）应用解压出的图标复制到稳定位置 Extracted/Icons/<baseName>/，
+    /// 避免后续 parseAppInfo 再次解压时清空重建 Extracted/<baseName>/ 目录导致图标路径失效。
+    /// 与已签名列表的 persistInstalledAppIcon 同模式；复制失败返回 nil（调用方保留原路径兜底）。
+    private func persistImportedAppIcon(from iconPath: String, baseName: String) -> String? {
+        let source = URL(fileURLWithPath: iconPath)
+        // 文件名安全化：只保留字母数字与 ._-，其余替换为 -，避免 copyItem 因非法字符失败
+        let allowed = CharacterSet.alphanumerics.union(CharacterSet(charactersIn: "._-"))
+        var label = String(baseName.unicodeScalars.map { scalar -> Character in
+            allowed.contains(scalar) ? Character(scalar) : "-"
+        })
+        if label.isEmpty { label = baseName }
+        let fileName = "\(label)-icon.\(source.pathExtension.lowercased())"
+        // 注意：不能把图标写回 Extracted/<baseName>/ —— 这正是每次 parse 时
+        // ZipManager.unzip 会整体删除重建的目录；Extracted/Icons/<baseName>/ 才真正稳定。
+        let target = fileManager.directoryURL(.extracted)
+            .appendingPathComponent("Icons", isDirectory: true)
+            .appendingPathComponent(baseName, isDirectory: true)
+            .appendingPathComponent(fileName)
+        do {
+            // AppFileManager.copyItem 会先创建父目录（Extracted/Icons/<baseName>/）、
+            // 再移除已存在的同名目标，重复导入同一 baseName 也安全
+            try fileManager.copyItem(from: source, to: target)
+            Logger.info("待签名应用图标持久化成功: \(target.path)")
+            return target.path
+        } catch {
+            Logger.warning("待签名应用图标持久化失败: \(fileName) - \(error.localizedDescription)")
+            return nil
         }
     }
 

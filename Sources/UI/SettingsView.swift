@@ -42,7 +42,7 @@ struct SettingsView: View {
             .alert("IPA Manager", isPresented: $showAbout) {
                 Button("确定", role: .cancel) {}
             } message: {
-                Text("本地 IPA 签名与管理工具\n版本 1.0\n所有签名均在设备本地完成，不上传任何文件")
+                Text("本地 IPA 签名与管理工具\n版本 \(Self.currentVersion)\n所有签名均在设备本地完成，不上传任何文件")
             }
             // 用 sheet(item:) 绑定 URL，避免旧实现“isPresented + sheet 内 if let”的时序问题：
             // 之前表现为“第一次点击分享是空白的，要返回再点才弹出”。
@@ -50,6 +50,14 @@ struct SettingsView: View {
                 ShareSheet(items: [item.url])
             }
         }
+    }
+
+    /// 当前安装包的真实版本号（读 Info.plist 的 CFBundleShortVersionString + CFBundleVersion，
+    /// 与诊断报告头部显示的版本一致，避免用户误以为一直是 1.0）。
+    private static var currentVersion: String {
+        let short = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "1.0"
+        let build = Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "1"
+        return "\(short) (构建 \(build))"
     }
 
     /// 把诊断报告写入临时 .txt 文件再分享（直接分享 String 时，

@@ -47,7 +47,8 @@ struct DownloadsView: View {
                     .background(Color(.systemGroupedBackground))
                 }
             }
-            .navigationTitle("下载")
+            .navigationTitle("")
+            .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .navigationBarLeading) {
                     if !tasks.isEmpty {
@@ -124,7 +125,7 @@ struct DownloadsView: View {
             Image(systemName: "arrow.down.circle")
                 .font(.system(size: 48))
                 .foregroundColor(.secondary)
-            Text("暂无下载任务")
+            Text("下载任务 0 个")
                 .font(.headline)
             Text("点击右上角 Safari 图标，在浏览器中下载 IPA 或 ZIP")
                 .font(.subheadline)

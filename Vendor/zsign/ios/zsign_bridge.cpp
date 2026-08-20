@@ -14,6 +14,7 @@
 #include <openssl/x509v3.h>
 #include <openssl/err.h>
 #include <openssl/provider.h>
+#include <openssl/providers.h>
 
 #include "common.h"
 #include "openssl.h"
@@ -505,8 +506,23 @@ int zsign_p12_recreate_legacy(const char* p12Path, const char* password,
 
     // 与 zsign_p12_info / zsign_p12_export_identity 一致：加载 legacy + default provider。
     // 解析旧式加密的输入 p12 需要 legacy；重打包用的 RC2-40-CBC 也只由 legacy provider 提供。
+    //
+    // 本工程构建参数为 ios64-xcrun no-shared（静态链接 libcrypto.a，见 .github/workflows/build.yml），
+    // 静态链接下 OSSL_PROVIDER_load 只能尝试通过 DSO 动态加载共享库里的 provider，必然失败并报
+    // "DSO support routines::could not load the shared library"，导致 legacy provider 不可用，
+    // RC2/3DES 等传统算法随后报 "unsupported"、PKCS12_create 加密失败。
+    // 因此先 OSSL_PROVIDER_add_builtin 把编译进 libcrypto.a 的内嵌 legacy provider
+    // （符号 legacy_provider，声明于 <openssl/providers.h>，类型 OSSL_provider_init_fn*，
+    // 默认构建含 legacy provider，OPENSSL_NO_LEGACY 未定义）注册进当前进程，
+    // 随后的 OSSL_PROVIDER_load 直接命中内置实现，无需任何共享库。
+    // 加载后清一次错误队列：重复调用时 add_builtin 会因 provider 已存在而压入
+    // CRYPTO_R_PROVIDER_ALREADY_EXISTS 之类的错误，不清除会污染后面的 GetOpenSSLErrors 诊断。
+#ifndef OPENSSL_NO_LEGACY
+    OSSL_PROVIDER_add_builtin(NULL, "legacy", legacy_provider);
+#endif
     OSSL_PROVIDER_load(NULL, "legacy");
     OSSL_PROVIDER_load(NULL, "default");
+    ERR_clear_error();
 
     PKCS12* p12 = d2i_PKCS12_bio(bio, NULL);
     BIO_free(bio);
