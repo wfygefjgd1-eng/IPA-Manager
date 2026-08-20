@@ -16,7 +16,9 @@ jobs:
 
       - name: Select Xcode
         run: |
-          sudo xcode-select --switch /Applications/Xcode_15.2.app || sudo xcode-select --switch /Applications/Xcode_15.1.app || echo "Using default Xcode"
+          sudo xcode-select --switch /Applications/Xcode_15.2.app 2>/dev/null \
+            || sudo xcode-select --switch /Applications/Xcode_15.1.app 2>/dev/null \
+            || { echo "Required Xcode not found"; exit 1; }
 
       - name: Verify Xcode
         run: xcodebuild -version
@@ -24,33 +26,18 @@ jobs:
       - name: Install XcodeGen
         run: brew install xcodegen
 
+      - name: Cache OpenSSL build
+        id: cache-openssl
+        uses: actions/cache@v4
+        with:
+          path: |
+            Vendor/openssl/lib
+            Vendor/openssl/include
+          key: openssl-ios-${{ runner.os }}-${{ hashFiles('scripts/build-openssl.sh') }}-v1
+
       - name: Build OpenSSL for iOS (device arm64)
-        run: |
-          mkdir -p /tmp/ossl_src
-          curl -L -o /tmp/ossl_src/openssl.tar.gz https://github.com/openssl/openssl/releases/download/openssl-3.3.2/openssl-3.3.2.tar.gz
-          cd /tmp/ossl_src
-          tar -xzf openssl.tar.gz
-          cd openssl-3.3.2
-
-          # Use workspace-relative output dir to avoid /private/tmp symlink issues
-          OUTDIR="$GITHUB_WORKSPACE/build/openssl-out"
-          mkdir -p "$OUTDIR"
-
-          ./Configure ios64-xcrun \
-            --prefix="$OUTDIR/device" \
-            --openssldir="$OUTDIR/device" \
-            -D__IPHONE_OS_VERSION_MIN_REQUIRED=160000 \
-            no-shared no-tests no-unit-test no-apps
-          make -j4 build_libs || make build_libs
-          make install_dev
-
-          # Copy static libs and headers for linking
-          mkdir -p "$GITHUB_WORKSPACE/Vendor/openssl/include"
-          mkdir -p "$GITHUB_WORKSPACE/Vendor/openssl/lib"
-          cp -R "$OUTDIR/device/include/openssl" "$GITHUB_WORKSPACE/Vendor/openssl/include/openssl"
-          cp "$OUTDIR/device/lib/libcrypto.a" "$GITHUB_WORKSPACE/Vendor/openssl/lib/libcrypto-device.a"
-          cp "$OUTDIR/device/lib/libssl.a" "$GITHUB_WORKSPACE/Vendor/openssl/lib/libssl-device.a"
-          echo "OpenSSL libs ready"
+        if: steps.cache-openssl.outputs.cache-hit != 'true'
+        run: bash scripts/build-openssl.sh
 
       - name: Generate Xcode Project
         run: xcodegen generate

@@ -23,6 +23,27 @@ final class AppState: ObservableObject {
     /// 用串行队列保证多次解析互不重叠、不阻塞主线程；@Published 赋值仍回主线程。
     private let installedAppsRefreshQueue = DispatchQueue(label: "com.ipamanager.installed-apps-refresh")
 
+    /// 已签名列表是否正在后台扫描（UI 显示加载态，避免“已签应用”页空态闪烁）
+    @Published var isRefreshingInstalledApps = false
+
+    /// 全局轻提示（外部打开文件失败、后台操作结果等无专门 UI 的场景）；
+    /// 主界面 RootView 用 overlay 展示，非 nil 时显示，自动 3 秒后清除。
+    @Published var toastMessage: String?
+    private var toastWorkItem: DispatchWorkItem?
+
+    /// 在任意线程设置全局轻提示（内部切回主线程并安排自动清除；重复设置会重置计时）。
+    func showToast(_ message: String) {
+        DispatchQueue.main.async {
+            self.toastMessage = message
+            self.toastWorkItem?.cancel()
+            let work = DispatchWorkItem { [weak self] in
+                self?.toastMessage = nil
+            }
+            self.toastWorkItem = work
+            DispatchQueue.main.asyncAfter(deadline: .now() + 3.0, execute: work)
+        }
+    }
+
     init() {
         loadPersistedState()
         refreshInstalledApps()
@@ -235,9 +256,27 @@ final class AppState: ObservableObject {
 
                 // 转换得到的 .ipa 已直接输出到 .ipa 目录（importURL 即 destination），跳过复制，避免删掉源文件
                 if importURL.path != destination.path {
-                    // 目标已存在（重复导入同名文件）时先移除，再用新文件覆盖
+                    // 同名冲突处理（数据安全）：目标已存在时——
+                    // 1) 若已有记录正是同 bundleID（重复导入同一应用）：直接覆盖，记录同步更新；
+                    // 2) 若已存在但归属其它 bundleID（或无可查记录）：改用唯一后缀名，
+                    //    绝不覆盖可能仍被其它记录引用的旧文件（旧记录 path 会指向被替换文件，
+                    //    出现“元数据与磁盘内容错配”）。
                     if FileManager.default.fileExists(atPath: destination.path) {
-                        try FileManager.default.removeItem(at: destination)
+                        let existing = self.importedApps.first { $0.path == destination.path }
+                        let isSameApp = existing?.bundleID == (try? self.parser.parseAppInfo(fileURL: importURL).bundleID) && existing != nil
+                        if !isSameApp {
+                            let base = destination.deletingPathExtension().lastPathComponent
+                            var candidate = self.fileManager.directoryURL(.ipa)
+                                .appendingPathComponent("\(base)-\(UUID().uuidString.prefix(8)).ipa")
+                            // 二次保险：唯一后缀仍可能碰撞（理论上不可能），存在则继续加随机
+                            while FileManager.default.fileExists(atPath: candidate.path) {
+                                candidate = self.fileManager.directoryURL(.ipa)
+                                    .appendingPathComponent("\(base)-\(UUID().uuidString.prefix(8)).ipa")
+                            }
+                            destination = candidate
+                        } else {
+                            try FileManager.default.removeItem(at: destination)
+                        }
                     }
                     try self.fileManager.copyItem(from: importURL, to: destination)
                 }
@@ -352,6 +391,12 @@ final class AppState: ObservableObject {
                         self.signingTasks[index].progress = 1.0
                         self.signingTasks[index].outputPath = signedPath
                     }
+                    // 同步更新 importedApps 旧记录：签名成功后置 isSigned=true 并回填签名产物路径，
+                    // 否则首页“待签名”列表一直显示已签名应用（用户误以为签名失败）。
+                    if let index = self.importedApps.firstIndex(where: { $0.path == app.path || $0.id == app.id }) {
+                        self.importedApps[index].isSigned = true
+                        self.importedApps[index].signedPath = signedPath
+                    }
                     self.saveState()
                     // 已签名列表在后台串行队列解析后回主线程赋值，完成后才回调，
                     // 保证 AppDetailView.liveApp 在 completion 后能立刻按 path 匹配到签名产物。
@@ -397,7 +442,17 @@ final class AppState: ObservableObject {
             // 单个证书相关文件保持原逻辑（zip 才是证书包载体）
             importCertificateBundleOrFile(url)
         default:
-            importFile(from: url) { _ in }
+            importFile(from: url) { result in
+                switch result {
+                case .success(let app):
+                    // 外部打开的应用导入成功后，切到首页并提示（用户可进详情签名）
+                    self.selectedTab = 0
+                    Logger.info("外部打开文件导入成功: \(app.name)")
+                case .failure(let error):
+                    // 外部打开失败必须给反馈（否则用户在文件 App 里点了毫无反应）
+                    self.showToast("导入失败: \(error.localizedDescription)")
+                }
+            }
         }
     }
 
@@ -448,7 +503,21 @@ final class AppState: ObservableObject {
     func loadPersistedState() {
         certificates = store.loadCertificates()
         profiles = store.loadProfiles()
-        signingTasks = store.loadSigningTasks()
+        var restoredTasks = store.loadSigningTasks()
+        // 签名任务启动对账：进程被杀后 .queued/.processing 任务原样持久化会永远“处理中”，
+        // 统一标记为 failed（附“上次会话中断”原因），杜绝永久卡死。
+        var reconciled = false
+        for index in restoredTasks.indices {
+            if restoredTasks[index].status != .success && restoredTasks[index].status != .failed {
+                restoredTasks[index].status = .failed
+                restoredTasks[index].error = "上次会话中断，任务未完成"
+                reconciled = true
+            }
+        }
+        signingTasks = restoredTasks
+        if reconciled {
+            store.saveSigningTasks(signingTasks)
+        }
         // 下载任务由 DownloadManager.restoreSavedTasks() 负责恢复并持久化，
         // 这里不再加载，避免与 DownloadManager 的内存态互相覆盖。
         importedApps = store.loadImportedApps()
@@ -458,6 +527,9 @@ final class AppState: ObservableObject {
         // 找到则更新为稳定路径并持久化；找不到则保留原记录（UI 显示文件缺失），不影响其它记录。
         relocateProfilePaths()
         relocateImportedAppPaths()
+        relocateImportedAppIconPaths()
+        // 孤儿清扫：清理不再被任何记录引用的解析临时目录（避免 Extracted/ 无限膨胀）
+        sweepOrphanExtractDirs()
 
         // 选中项不持久化，恢复后必须重新挑选，避免首页显示“未选择证书”
         if selectedCertificate == nil {
@@ -524,16 +596,54 @@ final class AppState: ObservableObject {
         }
     }
 
+    /// 待签名应用图标路径重定位：iOS 更新/重装后容器 UUID 变化，持久化的
+    /// iconPath（Extracted/Icons/<baseName>/...）整体失效。图标目录虽稳定但在容器
+    /// 迁移后路径前缀失效；按 baseName 在 Extracted/Icons/<baseName>/ 下按文件名找回。
+    private func relocateImportedAppIconPaths() {
+        let iconsRoot = fileManager.directoryURL(.extracted)
+            .appendingPathComponent("Icons", isDirectory: true)
+        guard let entries = try? FileManager.default.contentsOfDirectory(
+            at: iconsRoot, includingPropertiesForKeys: [.isDirectoryKey]
+        ) else { return }
+
+        let iconDirsByBase = Dictionary(grouping: entries) { $0.lastPathComponent }
+        var changed = false
+        for index in importedApps.indices {
+            guard let iconPath = importedApps[index].iconPath,
+                  !iconPath.isEmpty,
+                  !FileManager.default.fileExists(atPath: iconPath) else { continue }
+            let fileName = URL(fileURLWithPath: iconPath).lastPathComponent
+            let baseName = importedApps[index].path.isEmpty
+                ? ""
+                : URL(fileURLWithPath: importedApps[index].path).deletingPathExtension().lastPathComponent
+            // 在对应的 <baseName> 图标目录下找同名文件
+            if let dir = iconDirsByBase[baseName] {
+                let dirURL = dir
+                let matches = (try? FileManager.default.contentsOfDirectory(atPath: dirURL.path)) ?? []
+                if let match = matches.first(where: { $0 == fileName }) {
+                    importedApps[index].iconPath = dirURL.appendingPathComponent(match).path
+                    changed = true
+                    Logger.info("应用图标路径重定位: \(fileName)")
+                }
+            }
+        }
+        if changed {
+            store.saveImportedApps(importedApps)
+        }
+    }
+
     /// 重新扫描 Documents/Signed 下的签名产物并刷新已签名应用列表。
     /// 对每个签名 IPA 完整解析，拿到 bundleID / version / iconPath（修复“未知 Bundle ID”、
     /// 图标不显示）；解析失败时回退为旧逻辑（文件名 + isSigned）。
     /// 解析在串行后台队列执行（解压较慢，不可上主线程），最终 @Published 赋值回到主线程。
     func refreshInstalledApps(completion: (() -> Void)? = nil) {
+        isRefreshingInstalledApps = true
         installedAppsRefreshQueue.async {
             let signedURLs = self.fileManager.contents(of: .signed)
             let apps = signedURLs.map { self.makeInstalledAppInfo(from: $0) }
             DispatchQueue.main.async {
                 self.installedApps = apps
+                self.isRefreshingInstalledApps = false
                 completion?()
             }
         }
@@ -650,16 +760,73 @@ final class AppState: ObservableObject {
     }
 
     func removeSignedApp(_ app: AppInfo) {
-        // 从两条列表中都移除（未签名导入的也会出现在 importedApps）
-        importedApps.removeAll { $0.id == app.id || $0.path == app.path }
-        installedApps.removeAll { $0.path == app.path }
-        let url = URL(fileURLWithPath: app.path)
-        try? fileManager.deleteItem(at: url)
-        // 一并清理对应的解压目录（保留基线安全）
-        let baseName = url.deletingPathExtension().lastPathComponent
-        let extractDir = fileManager.directoryURL(.extracted).appendingPathComponent(baseName, isDirectory: true)
-        try? fileManager.deleteItem(at: extractDir)
+        removeSignedApps([app])
+    }
+
+    /// 批量删除已签应用：逐个清理文件/记录，最后只触发一次 refreshInstalledApps，
+    /// 避免 N 个应用删除时 N 次全量重扫（每次都会逐 IPA 解压解析，重复开销大）。
+    func removeSignedApps(_ apps: [AppInfo]) {
+        guard !apps.isEmpty else { return }
+        for app in apps {
+            // 从两条列表中都移除（未签名导入的也会出现在 importedApps）
+            importedApps.removeAll { $0.id == app.id || $0.path == app.path }
+            installedApps.removeAll { $0.path == app.path }
+            // 同步移除引用该应用源文件的历史签名任务，避免残留“success”指向已删除文件
+            signingTasks.removeAll { $0.sourceFile == app.path || $0.outputPath == app.path }
+            let url = URL(fileURLWithPath: app.path)
+            try? fileManager.deleteItem(at: url)
+            // 一并清理对应的解压目录（保留基线安全）：目录名可能是 <baseName>（旧版）
+            // 或 <baseName>-<UUID>（解析目录加 UUID 后），按前缀匹配清理
+            let baseName = url.deletingPathExtension().lastPathComponent
+            cleanupExtractDirs(matching: baseName)
+            // 清理稳定图标目录 Extracted/Icons/<baseName>/（persistImportedAppIcon /
+            // persistInstalledAppIcon 写入的位置），避免随删除历史单调累积
+            let iconsDir = fileManager.directoryURL(.extracted)
+                .appendingPathComponent("Icons", isDirectory: true)
+                .appendingPathComponent(baseName, isDirectory: true)
+            try? fileManager.deleteItem(at: iconsDir)
+        }
         saveState()
         refreshInstalledApps()
+    }
+
+    /// 删除 Extracted/ 下所有以指定前缀开头的解压目录（兼容旧版 <baseName> 与新版
+    /// <baseName>-<UUID> 两种命名）。
+    private func cleanupExtractDirs(matching prefix: String) {
+        let extractedRoot = fileManager.directoryURL(.extracted)
+        guard let entries = try? FileManager.default.contentsOfDirectory(
+            at: extractedRoot, includingPropertiesForKeys: [.isDirectoryKey]
+        ) else { return }
+        for entry in entries {
+            let isDirectory = (try? entry.resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory ?? false
+            // Icons/ 是稳定图标目录，绝不能按前缀误删
+            guard isDirectory, entry.lastPathComponent != "Icons" else { continue }
+            if entry.lastPathComponent == prefix || entry.lastPathComponent.hasPrefix(prefix + "-") {
+                try? fileManager.deleteItem(at: entry)
+            }
+        }
+    }
+
+    /// 启动时孤儿清扫：删除 Extracted/ 下不被任何记录引用的解析目录
+    /// （parseAppInfo 每次解压都生成 <baseName>-<UUID> 临时目录，路径会随 UUID 变化，
+    /// 无法像 Icons/ 图标那样重定位，必须定期清理避免磁盘无限膨胀）。
+    private func sweepOrphanExtractDirs() {
+        let extractedRoot = fileManager.directoryURL(.extracted)
+        guard let entries = try? FileManager.default.contentsOfDirectory(
+            at: extractedRoot, includingPropertiesForKeys: [.isDirectoryKey]
+        ) else { return }
+        let referencedPaths = (importedApps.map { $0.path }
+            + installedApps.map { $0.path }
+            + importedApps.compactMap { $0.iconPath }
+            + installedApps.compactMap { $0.iconPath })
+        for entry in entries {
+            let isDirectory = (try? entry.resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory ?? false
+            // 保留 Icons/ 稳定目录；只清理确定是解析临时目录的条目
+            guard isDirectory, entry.lastPathComponent != "Icons" else { continue }
+            let isReferenced = referencedPaths.contains { $0.hasPrefix(entry.path) }
+            if !isReferenced {
+                try? fileManager.deleteItem(at: entry)
+            }
+        }
     }
 }

@@ -72,8 +72,20 @@ final class InfoPlistParser {
             candidates.append(contentsOf: files)
         }
 
+        // 先一次性枚举 .app 根目录内容并缓存（items）交给候选匹配，避免每个候选
+        // 都重新 contentsOfDirectory（候选多 + 大目录时反复全目录 IO）。
+        let rootItems: [URL]
+        if let items = try? FileManager.default.contentsOfDirectory(
+            at: appURL,
+            includingPropertiesForKeys: nil
+        ) {
+            rootItems = items
+        } else {
+            rootItems = []
+        }
+
         for candidate in candidates {
-            if let found = searchIcon(named: candidate, in: appURL) {
+            if let found = searchIcon(named: candidate, in: appURL, cachedItems: rootItems) {
                 return found
             }
         }
@@ -83,7 +95,7 @@ final class InfoPlistParser {
         return fallbackIcon(in: appURL)
     }
 
-    private func searchIcon(named name: String, in appDir: URL) -> String? {
+    private func searchIcon(named name: String, in appDir: URL, cachedItems: [URL]) -> String? {
         // 去掉候选名可能带的扩展名（"AppIcon60x60@2x.png" → "AppIcon60x60@2x"），
         // 统一转小写后按前缀匹配实际文件（真实文件形如 AppIcon60x60@2x.png）。
         let base = name
@@ -93,10 +105,8 @@ final class InfoPlistParser {
             .lowercased()
         guard !base.isEmpty else { return nil }
 
-        guard let items = try? FileManager.default.contentsOfDirectory(
-            at: appDir,
-            includingPropertiesForKeys: nil
-        ) else { return nil }
+        // 复用调用方缓存的目录枚举结果，避免每个候选都重新列目录
+        let items = cachedItems
 
         let matched = items
             .filter { item in

@@ -61,7 +61,7 @@ final class SigningEngine: SigningEngineProtocol {
         let keyPath = (keyFileURL ?? p12URL).path
 
         let outputURL = fileManager.directoryURL(.signed)
-            .appendingPathComponent("\(URL(fileURLWithPath: sourcePath).deletingPathExtension().lastPathComponent)-signed-\(Int(Date().timeIntervalSince1970)).ipa")
+            .appendingPathComponent("\(URL(fileURLWithPath: sourcePath).deletingPathExtension().lastPathComponent)-signed-\(UUID().uuidString.prefix(8)).ipa")
 
         // Bridge progress callback: pass a non-capturing C closure + context
         let box = ProgressBox(handler: progress)
@@ -98,9 +98,10 @@ final class SigningEngine: SigningEngineProtocol {
         }
 
         if result != 0 {
-            let message = zsign_last_error().map { String(cString: $0) } ?? "未知错误"
+            let message = CertificateManager.safeZSignError(limit: 512)
+            let userMessage = message.isEmpty ? "签名失败 (错误码 \(result))" : message
             Logger.error("签名失败: \(sourcePath) - \(message)")
-            throw AppError.signFailed(message)
+            throw AppError.signFailed(userMessage)
         }
 
         progress(1.0)
@@ -130,7 +131,12 @@ final class SigningEngine: SigningEngineProtocol {
             Logger.error("导出 PEM 私钥失败: \(reason)")
             throw AppError.signFailed(reason)
         }
-        let identity = rawIdentity as! SecIdentity
+        let identity = rawIdentity as? SecIdentity
+        guard let identity = identity else {
+            let reason = "证书数据格式异常（无法获取签名身份）"
+            Logger.error("导出 PEM 私钥失败: \(reason)")
+            throw AppError.signFailed(reason)
+        }
 
         var privateKey: SecKey?
         let keyStatus = SecIdentityCopyPrivateKey(identity, &privateKey)
@@ -187,6 +193,11 @@ final class SigningEngine: SigningEngineProtocol {
             .appendingPathComponent("sign-key-\(UUID().uuidString).pem")
         do {
             try pem.write(to: outputURL, atomically: true, encoding: .utf8)
+            // 私钥 PEM 只允许当前用户读写（0600），避免同沙箱其他路径可读
+            try? FileManager.default.setAttributes(
+                [.posixPermissions: 0o600],
+                ofItemAtPath: outputURL.path
+            )
         } catch {
             let reason = "无法写入 PEM 私钥文件 (\(error.localizedDescription))"
             Logger.error("导出 PEM 私钥失败: \(reason)")
@@ -197,9 +208,11 @@ final class SigningEngine: SigningEngineProtocol {
     }
 
     private func exportP12(identifier: String) throws -> URL {
-        // 私钥材料写到系统临时目录，避免残留在 Documents 目录
+        // 私钥材料写到系统临时目录，避免残留在 Documents 目录。
+        // 文件名加 UUID：同一证书并发/紧邻两次签名时各自独立文件，
+        // 避免互相覆盖或前一次 defer 删除恰好截断后一次正在读取的 p12。
         let tempURL = URL(fileURLWithPath: NSTemporaryDirectory())
-            .appendingPathComponent("export-\(identifier).p12")
+            .appendingPathComponent("export-\(identifier)-\(UUID().uuidString).p12")
         try certManager.exportP12(identifier: identifier, to: tempURL)
         return tempURL
     }

@@ -43,17 +43,22 @@ final class DownloadManager: NSObject {
     func startDownload(urlString: String, completion: @escaping (DownloadTask) -> Void) {
         var task = DownloadTask()
         task.url = urlString
-        task.fileName = URL(string: urlString)?.lastPathComponent ?? "download"
-        task.status = .downloading
 
-        guard let url = URL(string: urlString) else {
+        guard let url = URL(string: urlString),
+              let scheme = url.scheme?.lowercased(),
+              scheme == "http" || scheme == "https" else {
             task.status = .failed
-            task.error = "无效 URL"
+            task.error = "仅支持 http/https 链接"
+            task.fileName = Self.sanitizeFileName(urlString)
             completion(task)
             return
         }
+        task.fileName = Self.sanitizeFileName(url.lastPathComponent)
+        task.status = .downloading
 
         let sessionTask = session.downloadTask(with: url)
+        // O(1) 回调查找：把任务 id 写入 taskDescription，避免进度回调线性扫描 tasks
+        sessionTask.taskDescription = task.id.uuidString
         taskModels[task.id] = task
         tasks[task.id] = sessionTask
         sessionTask.resume()
@@ -76,6 +81,12 @@ final class DownloadManager: NSObject {
     func cancelDownload(id: UUID) {
         tasks[id]?.cancel()
         tasks.removeValue(forKey: id)
+        if let model = taskModels[id] {
+            // 顺带删除已完成任务在磁盘上的目标文件，避免反复下载/删除堆积垃圾文件
+            if model.status == .completed, !model.destinationPath.isEmpty {
+                try? AppFileManager.shared.deleteItem(at: URL(fileURLWithPath: model.destinationPath))
+            }
+        }
         taskModels.removeValue(forKey: id)
         retryCounts.removeValue(forKey: id)
         persistTasks()
@@ -85,9 +96,17 @@ final class DownloadManager: NSObject {
         Array(taskModels.values)
     }
 
+    /// 更新内存模型并持久化（如自动导入成功后回填 resolvedBundleID）。
+    func updateTask(_ task: DownloadTask) {
+        guard taskModels[task.id] != nil else { return }
+        taskModels[task.id] = task
+        persistTasks()
+    }
+
     /// 启动时从 UserDefaults 恢复上次保存的下载任务。
-    /// 恢复的任务没有活跃的 sessionTask（不放入 `tasks`），列表仅展示状态：
     /// - completed：校验 `destinationPath` 文件是否仍存在；不存在 → 标记 failed「文件已丢失」。
+    /// - downloading/paused：有 resumeData 则重建 sessionTask 续传；否则降级为 failed
+    ///   并提示“应用重启导致下载中断”的明确错误，避免任务在 UI 上永久“下载中」卡死。
     /// - failed / 其它：原样恢复到 taskModels 展示。
     func restoreSavedTasks() {
         let saved = store.loadDownloadTasks()
@@ -105,8 +124,11 @@ final class DownloadManager: NSObject {
                     task.error = "文件已丢失"
                     taskModels[task.id] = task
                 }
+            case .downloading, .paused:
+                // 重建活跃下载：默认会话优先级低，用后台 URLSession 续传或重新下载
+                rebuildTask(&task)
             default:
-                // failed / downloading / paused / waiting：原样恢复展示
+                // failed / waiting：原样恢复展示
                 taskModels[task.id] = task
             }
         }
@@ -114,63 +136,99 @@ final class DownloadManager: NSObject {
         Logger.info("恢复下载任务 \(taskModels.count) 个")
     }
 
+    /// 为恢复的 downloading/paused 任务重建真实 sessionTask：
+    /// 有 resumeData 则断点续传，否则从 0 重新下载（登录/Session 过期后旧 resumeData
+    /// 可能失效，从 0 重下是兜底）。重建失败（URL 无效等）则降级为 failed。
+    private func rebuildTask(_ task: inout DownloadTask) {
+        var candidate = task
+        guard let url = URL(string: candidate.url),
+              let scheme = url.scheme?.lowercased(),
+              scheme == "http" || scheme == "https" else {
+            candidate.status = .failed
+            candidate.error = "无效 URL"
+            taskModels[candidate.id] = candidate
+            return
+        }
+
+        var sessionTask: URLSessionDownloadTask?
+        if let resumeData = candidate.resumeData, !resumeData.isEmpty {
+            sessionTask = session.downloadTask(withResumeData: resumeData)
+        }
+        if sessionTask == nil {
+            sessionTask = session.downloadTask(with: url)
+            candidate.receivedBytes = 0
+            candidate.totalBytes = 0
+        }
+        sessionTask?.taskDescription = candidate.id.uuidString
+        candidate.status = .downloading
+        candidate.error = nil
+        taskModels[candidate.id] = candidate
+        tasks[candidate.id] = sessionTask
+        sessionTask?.resume()
+        Logger.info("已重建下载任务: \(candidate.fileName)")
+    }
+
     // MARK: - 收尾 / 校验 / 重试
 
     /// 下载完成的收尾：移动到持久位置 → 校验内容真实性 → 更新模型并持久化。
     /// 校验失败且属于“网络类”问题（HTML 错误页 / 截断损坏）时自动重试一次。
+    /// 大文件移动放到后台队列执行（跨卷复制几百 MB 的 IPA 不能卡主线程），
+    /// 完成后回到主队列更新模型。
     private func finishDownload(id: UUID, model: DownloadTask, location: URL) {
         var updated = model
         let destination = AppFileManager.shared.directoryURL(.downloads)
-            .appendingPathComponent(updated.fileName.isEmpty ? "download" : updated.fileName)
+            .appendingPathComponent(Self.sanitizeFileName(updated.fileName.isEmpty ? "download" : updated.fileName))
 
         // 校验失败且可重试（HTML / 截断）时自动重下；本地移动失败等不重试。
         var retryableFailure = false
 
-        do {
-            try AppFileManager.shared.moveItem(from: location, to: destination)
-            updated.destinationPath = destination.path
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            guard let self = self else { return }
+            do {
+                try AppFileManager.shared.moveItem(from: location, to: destination)
+                updated.destinationPath = destination.path
 
-            switch classifyDownload(at: destination.path) {
-            case .zip:
-                // 文件头为 PK\x03\x04（zip/ipa 魔数）→ 正常
-                updated.status = .completed
-            case .html:
-                // 下载到的是网页而非文件（404 / 重定向错误页 / 拦截页）
-                updated.status = .failed
-                updated.error = "下载到的是网页而非文件（可能链接失效或被拦截），请检查链接后重试"
-                Logger.error("下载校验失败: \(updated.error ?? "")")
-                try? AppFileManager.shared.deleteItem(at: destination)
-                retryableFailure = true
-            case .other:
-                // 截断 / 损坏
-                updated.status = .failed
-                if updated.totalBytes > 0 && updated.receivedBytes < updated.totalBytes {
-                    updated.error = "下载不完整，文件可能损坏"
-                } else {
-                    updated.error = "下载的文件无法识别，可能已损坏"
+                switch self.classifyDownload(at: destination.path) {
+                case .zip:
+                    updated.status = .completed
+                case .html:
+                    updated.status = .failed
+                    updated.error = "下载到的是网页而非文件（可能链接失效或被拦截），请检查链接后重试"
+                    Logger.error("下载校验失败: \(updated.error ?? "")")
+                    try? AppFileManager.shared.deleteItem(at: destination)
+                    retryableFailure = true
+                case .other:
+                    updated.status = .failed
+                    if updated.totalBytes > 0 && updated.receivedBytes < updated.totalBytes {
+                        updated.error = "下载不完整，文件可能损坏"
+                    } else {
+                        updated.error = "下载的文件无法识别，可能已损坏"
+                    }
+                    Logger.error("下载校验失败: \(updated.error ?? "")")
+                    try? AppFileManager.shared.deleteItem(at: destination)
+                    retryableFailure = true
                 }
-                Logger.error("下载校验失败: \(updated.error ?? "")")
-                try? AppFileManager.shared.deleteItem(at: destination)
-                retryableFailure = true
+            } catch {
+                updated.status = .failed
+                updated.error = error.localizedDescription
+                Logger.error("下载文件移动失败: \(error.localizedDescription)")
             }
-        } catch {
-            updated.status = .failed
-            updated.error = error.localizedDescription
-            Logger.error("下载文件移动失败: \(error.localizedDescription)")
-        }
 
-        tasks.removeValue(forKey: id)
-        taskModels[id] = updated
-        persistTasks()
+            DispatchQueue.main.async {
+                self.tasks.removeValue(forKey: id)
+                self.taskModels[id] = updated
+                self.persistTasks()
 
-        if updated.status == .completed {
-            retryCounts.removeValue(forKey: id)
-            onDownloadComplete?(destination)
-        } else if retryableFailure && (retryCounts[id] ?? 0) < maxRetryCount {
-            Logger.warning("下载内容校验失败，自动重试一次: \(updated.fileName)")
-            retryDownload(id: id, model: updated)
-        } else {
-            retryCounts.removeValue(forKey: id)
+                if updated.status == .completed {
+                    self.retryCounts.removeValue(forKey: id)
+                    self.onDownloadComplete?(destination)
+                } else if retryableFailure && (self.retryCounts[id] ?? 0) < self.maxRetryCount {
+                    Logger.warning("下载内容校验失败，自动重试一次: \(updated.fileName)")
+                    self.retryDownload(id: id, model: updated)
+                } else {
+                    self.retryCounts.removeValue(forKey: id)
+                }
+            }
         }
     }
 
@@ -197,6 +255,7 @@ final class DownloadManager: NSObject {
         retrying.totalBytes = 0
 
         let sessionTask = session.downloadTask(with: url)
+        sessionTask.taskDescription = id.uuidString
         taskModels[id] = retrying
         tasks[id] = sessionTask
         sessionTask.resume()
@@ -215,11 +274,34 @@ final class DownloadManager: NSObject {
         defer { try? handle.close() }
         let data = (try? handle.read(upToCount: 4096)) ?? Data()
         if data.isEmpty { return .other }
-        if data.starts(with: [0x50, 0x4B, 0x03, 0x04]) { return .zip }
+        // 普通 zip (PK\x03\x04) 与 空 zip (PK\x05\x06) 都算有效压缩包，
+        // 与 ZipManager.validateZipHeader 的判断保持一致
+        if data.starts(with: [0x50, 0x4B, 0x03, 0x04])
+            || data.starts(with: [0x50, 0x4B, 0x05, 0x06]) { return .zip }
         let text = String(data: data, encoding: .utf8)?.lowercased() ?? ""
         let htmlSignals = ["<!doctype html", "<html", "<head", "not found", "404"]
         if htmlSignals.contains(where: { text.contains($0) }) { return .html }
         return .other
+    }
+
+    /// 文件名净化：百分号解码、剔除控制字符、拒绝 "." / ".." / 空名回退 "download"。
+    /// 未净化直接用 URL.lastPathComponent 拼路径时，%20 会落进文件名、
+    /// ".." 会让 appendingPathComponent 上跳一阶（路径穿越）。
+    static func sanitizeFileName(_ raw: String) -> String {
+        var name = raw.removingPercentEncoding ?? raw
+        // 剔除控制字符
+        name = name.unicodeScalars.filter { !CharacterSet.controlCharacters.contains($0) }
+            .map { String($0) }.joined()
+        // 拒绝 . 与 ..（整名）与空名
+        if name == "." || name == ".." || name.isEmpty {
+            name = "download"
+        }
+        // 尾部点/斜杠清理（iOS 文件名规则）
+        while name.hasSuffix(".") || name.hasSuffix("/") {
+            name.removeLast()
+            if name.isEmpty { name = "download"; break }
+        }
+        return name
     }
 
     private func persistTasks() {
@@ -228,6 +310,12 @@ final class DownloadManager: NSObject {
 }
 
 extension DownloadManager: URLSessionDownloadDelegate {
+    /// O(1) 回调查找：任务创建时已写 sessionTask.taskDescription = id.uuidString
+    private func taskID(for sessionTask: URLSessionTask) -> UUID? {
+        guard let desc = sessionTask.taskDescription, let id = UUID(uuidString: desc) else { return nil }
+        return id
+    }
+
     func urlSession(
         _ session: URLSession,
         downloadTask: URLSessionDownloadTask,
@@ -235,7 +323,7 @@ extension DownloadManager: URLSessionDownloadDelegate {
         totalBytesWritten: Int64,
         totalBytesExpectedToWrite: Int64
     ) {
-        guard let id = tasks.first(where: { $0.value == downloadTask })?.key else { return }
+        guard let id = taskID(for: downloadTask) else { return }
         taskModels[id]?.receivedBytes = totalBytesWritten
         taskModels[id]?.totalBytes = totalBytesExpectedToWrite
     }
@@ -245,7 +333,7 @@ extension DownloadManager: URLSessionDownloadDelegate {
         downloadTask: URLSessionDownloadTask,
         didFinishDownloadingTo location: URL
     ) {
-        guard let id = tasks.first(where: { $0.value == downloadTask })?.key else { return }
+        guard let id = taskID(for: downloadTask) else { return }
         let model = taskModels[id] ?? DownloadTask()
         finishDownload(id: id, model: model, location: location)
     }
@@ -255,13 +343,18 @@ extension DownloadManager: URLSessionDownloadDelegate {
         task: URLSessionTask,
         didCompleteWithError error: Error?
     ) {
-        // 成功完成（error == nil）时无需处理：didFinishDownloadingTo 已负责收尾。
-        // 失败（error != nil）时才在此标记为 failed。
         guard let error = error else { return }
-        guard let id = tasks.first(where: { $0.value == task })?.key else { return }
-        taskModels[id]?.status = .failed
-        taskModels[id]?.error = error.localizedDescription
+        guard let id = taskID(for: task) else { return }
+
+        // 保存断点续传数据：进程被杀/网络中断后，恢复时可用 resumeData 续传
+        var updated = taskModels[id] ?? DownloadTask()
+        if let resumeData = (error as NSError).userInfo[NSURLSessionDownloadTaskResumeData] as? Data {
+            updated.resumeData = resumeData
+        }
+        updated.status = .failed
+        updated.error = error.localizedDescription
         Logger.error("下载失败: \(error.localizedDescription)")
+        taskModels[id] = updated
         tasks.removeValue(forKey: id)
         retryCounts.removeValue(forKey: id)
         persistTasks()

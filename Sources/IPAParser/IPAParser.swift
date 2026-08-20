@@ -194,7 +194,12 @@ final class IPAParser {
     }
 
     private func extractedDirectory(for fileURL: URL) -> URL {
+        // 解压目录加 UUID 后缀：同名归档（如 App.ipa 与 App.zip，或不同目录下的同名文件）
+        // 不再撞进同一目录（第二次解析时整体删除重建会令第一次解析产出的 .app / 图标 /
+        // 调用方持有的路径全部失效）。目录生命周期由 AppState 启动时的孤儿清扫负责
+        // （Extracted/ 下非 Icons/ 的解析目录均可安全清理）。
         let baseName = fileURL.deletingPathExtension().lastPathComponent
-        return AppFileManager.shared.directoryURL(.extracted).appendingPathComponent(baseName, isDirectory: true)
+        let uniqueName = "\(baseName)-\(UUID().uuidString.prefix(8))"
+        return AppFileManager.shared.directoryURL(.extracted).appendingPathComponent(uniqueName, isDirectory: true)
     }
 }

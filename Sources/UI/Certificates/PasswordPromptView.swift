@@ -20,14 +20,15 @@ struct PasswordPromptView: View {
                 Text("输入 P12 密码")
                     .font(.headline)
 
-                Text("请输入证书的解压密码以读取证书信息")
+                Text("请输入证书的解压密码以读取证书信息；无密码证书可留空直接导入")
                     .font(.subheadline)
                     .foregroundColor(.secondary)
                     .multilineTextAlignment(.center)
 
-                SecureField("证书密码", text: $password)
+                SecureField("证书密码（无密码证书可留空）", text: $password)
                     .textFieldStyle(.roundedBorder)
                     .padding(.horizontal)
+                    .autocorrectionDisabled()
 
                 if showError {
                     Text(errorMessage)
@@ -48,7 +49,8 @@ struct PasswordPromptView: View {
                 }
                 .buttonStyle(.borderedProminent)
                 .padding(.horizontal)
-                .disabled(password.isEmpty || isImporting)
+                // 允许空密码提交：CertificateManager 支持无密码 P12
+                .disabled(isImporting)
             }
             .padding()
             .navigationTitle("证书导入")
@@ -64,7 +66,7 @@ struct PasswordPromptView: View {
     }
 
     private func importCertificate() {
-        guard let url = importURL, !password.isEmpty else { return }
+        guard let url = importURL else { return }
         isImporting = true
         showError = false
 
@@ -75,6 +77,8 @@ struct PasswordPromptView: View {
                 case .success(let certificate):
                     Logger.info("证书导入成功: \(certificate.name)")
                     onImport(certificate)
+                    // dismiss 后清空密码，避免敏感信息滞留内存
+                    password = ""
                     dismiss()
                 case .failure(let error):
                     errorMessage = error.localizedDescription

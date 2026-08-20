@@ -95,10 +95,11 @@ final class ServerIdentityProvider {
         var keyLen: Int32 = 0
         var isRSA: Int32 = 0
         var keyFormat: Int32 = 0
+        var keyBits: Int32 = 0
 
         let result = p12URL.path.withCString { p12Path in
             password.withCString { pwd in
-                zsign_p12_export_identity(p12Path, pwd, &certDER, &certLen, &keyDER, &keyLen, &isRSA, &keyFormat)
+                zsign_p12_export_identity(p12Path, pwd, &certDER, &certLen, &keyDER, &keyLen, &isRSA, &keyFormat, &keyBits)
             }
         }
 
@@ -135,7 +136,7 @@ final class ServerIdentityProvider {
         case 2: formatDesc = "PKCS#1/SEC1"
         default: formatDesc = "未知(\(keyFormat))"
         }
-        Logger.info("OpenSSL 导出成功: certLen=\(certLen) keyLen=\(keyLen) isRSA=\(isRSA) keyFormat=\(formatDesc)")
+        Logger.info("OpenSSL 导出成功: certLen=\(certLen) keyLen=\(keyLen) isRSA=\(isRSA) keyFormat=\(formatDesc) keyBits=\(keyBits)")
 
         guard let cert = SecCertificateCreateWithData(nil, certData as CFData) else {
             Logger.error("SecCertificateCreateWithData 失败 (certLen=\(certLen))")
@@ -149,11 +150,13 @@ final class ServerIdentityProvider {
         ]
         // 关键修复：SecKeyCreateWithData 在多数 iOS 版本上要求显式给出 kSecAttrKeySizeInBits，
         // 否则对 RSA 私钥直接返回失败（"系统拒绝该私钥格式"的常见根因之一）。
-        // 本机密钥为 RSA 2048（PKCS#8 DER 约 1218 字节，已按诊断日志验证）；EC 分支不设置该属性。
+        // 用 C 侧导出的真实位数（EVP_PKEY_bits）而非硬编码 2048：兼容 1024/4096 位证书；
+        // EC 分支不设置该属性。
         var keySizeInBitsApplied = "未设置"
         if isRSA != 0 {
-            keyAttributes[kSecAttrKeySizeInBits as String] = 2048
-            keySizeInBitsApplied = "2048"
+            let bits = Int(keyBits > 0 ? keyBits : 2048) // 兜底 2048，正常情况下由 C 侧带出
+            keyAttributes[kSecAttrKeySizeInBits as String] = bits
+            keySizeInBitsApplied = "\(bits)"
         }
         Logger.info("尝试 SecKeyCreateWithData 直连构造私钥 (isRSA=\(isRSA) keyLen=\(keyLen) keyFormat=\(formatDesc) keySizeInBits=\(keySizeInBitsApplied))")
         guard let key = SecKeyCreateWithData(keyData as CFData, keyAttributes as CFDictionary, nil) else {
@@ -162,7 +165,7 @@ final class ServerIdentityProvider {
             // 用 OpenSSL 把原 p12 重打包成"传统加密" p12（PBE-SHA1-3DES/RC2-40，iOS 原生支持），
             // 再交给 SecPKCS12Import 导入，得到真正配对的 SecIdentity。
             Logger.error("SecKeyCreateWithData 失败 (isRSA=\(isRSA) keyLen=\(keyLen) keyFormat=\(formatDesc) keySizeInBits=\(keySizeInBitsApplied))，尝试 Keychain 导入兜底")
-            if loadIdentityViaKeychain(cert: cert, keyData: keyData, isRSA: isRSA != 0) {
+            if loadIdentityViaKeychain(cert: cert, keyData: keyData, isRSA: isRSA != 0, keyBits: keyBits) {
                 return true
             }
             if loadIdentityViaLegacyP12(p12URL: p12URL, password: password) {
@@ -180,7 +183,7 @@ final class ServerIdentityProvider {
 
     /// Keychain 兜底：SecKeyCreateWithData 拒绝私钥 DER 时，把证书与私钥写入 Keychain 配对成 SecIdentity。
     /// 成功返回 true 并设置 currentIdentity；任何失败路径只记日志（每步带 status 与阶段）并清理本次条目，不抛错。
-    private func loadIdentityViaKeychain(cert: SecCertificate, keyData: Data, isRSA: Bool) -> Bool {
+    private func loadIdentityViaKeychain(cert: SecCertificate, keyData: Data, isRSA: Bool, keyBits: Int32) -> Bool {
         // 先清理上一次兜底产生的 Keychain 条目（避免多次安装累积）
         if let oldLabel = ServerIdentityProvider.lastFallbackLabel {
             removeKeychainIdentity(label: oldLabel)
@@ -214,10 +217,10 @@ final class ServerIdentityProvider {
             kSecAttrAccessible as String: kSecAttrAccessibleWhenUnlockedThisDeviceOnly
         ]
         if isRSA {
-            keyQuery[kSecAttrKeySizeInBits as String] = 2048
+            keyQuery[kSecAttrKeySizeInBits as String] = Int(keyBits > 0 ? keyBits : 2048)
         }
         var keyStatus = SecItemAdd(keyQuery as CFDictionary, nil)
-        Logger.info("Keychain 兜底：私钥添加 (status=\(keyStatus), isRSA=\(isRSA), keyLen=\(keyData.count), keySizeInBits=\(isRSA ? "2048" : "未设置"))")
+        Logger.info("Keychain 兜底：私钥添加 (status=\(keyStatus), isRSA=\(isRSA), keyLen=\(keyData.count), keySizeInBits=\(isRSA ? String(keyBits) : "未设置"))")
         if keyStatus != errSecSuccess {
             Logger.warning("Keychain 私钥添加失败 (status=\(keyStatus))，去掉 kSecAttrAccessible 重试一次")
             keyQuery.removeValue(forKey: kSecAttrAccessible as String)

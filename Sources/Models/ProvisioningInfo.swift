@@ -7,6 +7,8 @@ struct ProvisioningInfo: Identifiable, Codable, Hashable {
     var teamID: String = ""
     var bundleID: String = ""
     var entitlements: [String: AnyCodable] = [:]
+    /// 描述文件注册的设备 UDID 列表（企业分发）——空数组表示未限定设备（通配）
+    var provisionedDevices: [String] = []
     var createdAt: Date?
     var expireDate: Date?
     var path: String = ""

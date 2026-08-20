@@ -32,6 +32,8 @@ final class ZipManager {
         // 解压前先校验文件头，把“根本不是 zip / 下载到的是网页错误页”的情况
         // 挡在解压之前，给出可操作的中文提示（替代底层英文报错）。
         try validateZipHeader(at: archiveURL)
+        // zip-slip 纵深防御：解压前遍历全部条目，拒绝路径穿越条目
+        try validateEntryPaths(at: archiveURL)
 
         if fileManager.fileExists(atPath: destinationURL.path) {
             try fileManager.removeItem(at: destinationURL)
@@ -44,13 +46,53 @@ final class ZipManager {
             // 文件头是 PK 却仍解压失败 → 归档结构已损坏（典型如：下载被截断、
             // 缺少中央目录记录 "End of central directory"），归类为 corrupted。
             Logger.error("ZIP 解压失败（底层原因）: \(error)")
+            // 清理半成品，避免残留不完整文件
+            try? fileManager.removeItem(at: destinationURL)
             throw ZipError.corrupted("ZIP 文件已损坏或下载不完整，请删除后重新下载")
         }
 
         Logger.info("解压完成: \(destinationURL.path)")
     }
 
-    func zip(folderURL: URL, outputURL: URL) throws {
+    /// zip-slip 防御：逐条目校验路径是否安全（拒绝绝对路径、.. 越界、含冒号驱动符）。
+    /// ZIPFoundation 0.9.19 已内置词法包含性检查，这里在 App 侧再加一道保险，
+    /// 并显式拒绝符号链接条目（IPA 极少需要符号链接，恶意压缩包常用其越界写文件）。
+    private func validateEntryPaths(at archiveURL: URL) throws {
+        guard let archive = try? ZipArchive(url: archiveURL, accessMode: .read) else {
+            throw ZipError.corrupted("ZIP 文件无法读取")
+        }
+        defer { archive.close() }
+
+        var totalBytes: UInt64 = 0
+        var entryCount = 0
+        let maxEntries = 50_000
+        let maxTotalBytes: UInt64 = 4 * 1024 * 1024 * 1024 // 4GB 上限，防 zip bomb 撑爆沙箱
+
+        for entry in archive {
+            entryCount += 1
+            if entryCount > maxEntries {
+                throw ZipError.corrupted("ZIP 条目数量超出安全上限，已停止解压")
+            }
+            let path = entry.path
+            // 拒绝路径穿越/绝对路径：含 ".." 组件、以 "/" 开头、或含冒号（驱动符）
+            let components = path.split(separator: "/").map(String.init)
+            if components.contains("..") || path.hasPrefix("/") || path.contains(":") {
+                Logger.error("ZIP 含不安全条目路径，已拒绝: \(path)")
+                throw ZipError.corrupted("ZIP 含非法文件路径，已拦截")
+            }
+            // 拒绝符号链接（IPA 内无需符号链接，恶意压缩包常用其越界写文件）
+            if entry.type == .symlink {
+                Logger.error("ZIP 含符号链接条目，已拒绝: \(path)")
+                throw ZipError.corrupted("ZIP 含符号链接条目，已拦截")
+            }
+            totalBytes += entry.uncompressedSize
+            if totalBytes > maxTotalBytes {
+                throw ZipError.corrupted("ZIP 解压体积超出安全上限，已停止")
+            }
+        }
+    }
+
+    func zip(folderURL: URL, outputURL: URL, shouldKeepParent: Bool = false, compressionMethod: ZipArchive.CompressionMethod = .deflate) throws {
         Logger.info("打包开始: \(outputURL.lastPathComponent)")
 
         if fileManager.fileExists(atPath: outputURL.path) {
@@ -58,7 +100,16 @@ final class ZipManager {
         }
 
         do {
-            try fileManager.zipItem(at: folderURL, to: outputURL)
+            // shouldKeepParent=false：把文件夹内容（Payload/）直接打到压缩包根，
+            // 否则 ZIPFoundation 会把 staging 目录名作为前缀（IPA-Build-<UUID>/Payload/...），
+            // 生成的 ".ipa" 顶层不是 Payload，后续解析/签名/安装全部不可用。
+            // compressionMethod 默认 .deflate：转换产物必须压缩，避免 2~4 倍体积膨胀。
+            try fileManager.zipItem(
+                at: folderURL,
+                to: outputURL,
+                shouldKeepParent: shouldKeepParent,
+                compressionMethod: compressionMethod
+            )
         } catch {
             throw AppError.operationFailed("打包失败: \(outputURL.lastPathComponent)")
         }

@@ -24,6 +24,32 @@ struct BrowserView: View {
     var body: some View {
         NavigationView {
             VStack(spacing: 0) {
+                // 地址栏：显示/输入 URL，回车导航；加载失败时有页内回调提示（见 Coordinator）
+                VStack(spacing: 0) {
+                    HStack(spacing: 8) {
+                        if isLoading {
+                            ProgressView()
+                                .scaleEffect(0.8)
+                        }
+                        TextField("输入网址", text: $urlString)
+                            .keyboardType(.URL)
+                            .textInputAutocapitalization(.never)
+                            .autocorrectionDisabled()
+                            .submitLabel(.go)
+                            .onSubmit {
+                                navigate(to: urlString)
+                            }
+                            .font(.footnote)
+                            .padding(.horizontal, 12)
+                            .padding(.vertical, 7)
+                            .background(Color(.secondarySystemBackground))
+                            .cornerRadius(10)
+                    }
+                    .padding(.horizontal, 12)
+                    .padding(.top, 8)
+                    .padding(.bottom, 4)
+                }
+
                 WebView(
                     url: $urlString,
                     isLoading: $isLoading,
@@ -32,6 +58,13 @@ struct BrowserView: View {
                     onDownloadDetected: { url in
                         // 命中下载链接：不再弹确认框，直接开始下载并切到“下载”标签页
                         startDownload(url)
+                    },
+                    onLoadFailed: { message in
+                        toastMessage = message
+                        showToast = true
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 3) {
+                            showToast = false
+                        }
                     }
                 )
                 .ignoresSafeArea(edges: .bottom)
@@ -129,6 +162,15 @@ struct BrowserView: View {
     }
 
     private func startDownload(_ url: URL) {
+        // 只允许 http/https；其它 scheme（data:/file:/javascript: 等）不建下载任务
+        guard let scheme = url.scheme?.lowercased(), scheme == "http" || scheme == "https" else {
+            toastMessage = "仅支持 http/https 链接下载"
+            showToast = true
+            DispatchQueue.main.asyncAfter(deadline: .now() + 2) {
+                self.showToast = false
+            }
+            return
+        }
         Logger.info("开始下载: \(url.absoluteString)")
         DownloadManager.shared.startDownload(urlString: url.absoluteString) { _ in
             Logger.info("下载任务已创建")
@@ -142,6 +184,31 @@ struct BrowserView: View {
         // 下载已加入队列：关闭浏览器并切到“下载”标签页
         appState.selectedTab = 2
         dismiss()
+    }
+
+    /// 地址栏提交：规范化 URL 并导航（补全缺省 https:// 前缀；只接受 http/https）。
+    /// 修改 urlString 会触发 WebView.updateUIView 中的 load。
+    private func navigate(to raw: String) {
+        var candidate = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !candidate.isEmpty else { return }
+
+        // 缺 scheme 时默认补 https://（用户输入多了不带协议的域名/IP）
+        if !candidate.lowercased().hasPrefix("http://"),
+           !candidate.lowercased().hasPrefix("https://") {
+            candidate = "https://" + candidate
+        }
+        // 只允许 http/https；其它 scheme 一律拒绝并提示（避免 javascript:/file: 等异常导航）
+        guard let url = URL(string: candidate),
+              let scheme = url.scheme?.lowercased(),
+              scheme == "http" || scheme == "https" else {
+            toastMessage = "仅支持 http/https 网址"
+            showToast = true
+            DispatchQueue.main.asyncAfter(deadline: .now() + 2) {
+                self.showToast = false
+            }
+            return
+        }
+        urlString = url.absoluteString
     }
 
     private func addCurrentPageToBookmarks() {
@@ -166,6 +233,8 @@ private struct WebView: UIViewRepresentable {
     @Binding var canGoBack: Bool
     @Binding var canGoForward: Bool
     var onDownloadDetected: (URL) -> Void
+    /// 加载失败回调（向用户展示中文提示，替代仅写日志的静默失败）
+    var onLoadFailed: (String) -> Void
 
     func makeUIView(context: Context) -> WKWebView {
         let configuration = WKWebViewConfiguration()
@@ -285,11 +354,35 @@ private struct WebView: UIViewRepresentable {
         func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) {
             DispatchQueue.main.async {
                 self.parent.isLoading = false
+                self.parent.onLoadFailed("页面加载失败：\(error.localizedDescription)")
             }
             Logger.error("网页加载失败: \(error)")
         }
 
-        // 拦截下载：匹配扩展名或 GitHub release/download 链接
+        // 关键修复：provisional 阶段加载失败（证书错误 / 断网 / 被 .cancel 的下载导航）时
+        // 复位 isLoading，否则工具栏 ProgressView 永远转圈（状态机不闭合）
+        func webView(
+            _ webView: WKWebView,
+            didFailProvisionalNavigation navigation: WKNavigation!,
+            withError error: Error
+        ) {
+            DispatchQueue.main.async {
+                self.parent.isLoading = false
+                self.parent.canGoBack = webView.canGoBack
+                self.parent.canGoForward = webView.canGoForward
+            }
+            // 下载被 cancel 属于预期路径，不必记为错误
+            if (error as NSError).code != NSURLErrorCancelled {
+                // 用户可见提示：证书错误/断网等失败场景给明确反馈
+                DispatchQueue.main.async {
+                    self.parent.onLoadFailed("加载失败：\(error.localizedDescription)")
+                }
+                Logger.error("网页加载失败(临时): \(error)")
+            }
+        }
+
+        // 拦截下载：以扩展名命中为主；releases/download 仅在扩展名为空时兜底，
+        // 避免把 release 详情页跳转等普通导航误判为下载
         func webView(
             _ webView: WKWebView,
             decidePolicyFor navigationAction: WKNavigationAction,
@@ -303,10 +396,11 @@ private struct WebView: UIViewRepresentable {
             let urlStr = url.absoluteString.lowercased()
             let ext = url.pathExtension.lowercased()
             let isDownloadExt = ext == "ipa" || ext == "zip" || ext == "tar" || ext == "apk" || urlStr.hasSuffix(".tar.gz")
-            let isReleaseDownload = urlStr.contains("releases/download")
+            // 兜底：releases/download 且无扩展名（GitHub 有时不带扩展名重定向）
+            let isReleaseDownload = ext.isEmpty && urlStr.contains("releases/download")
             let isNewWindow = navigationAction.targetFrame == nil
 
-            if isDownloadExt || isReleaseDownload || isNewWindow && isReleaseDownload {
+            if isDownloadExt || (isNewWindow && isReleaseDownload) {
                 parent.onDownloadDetected(url)
                 decisionHandler(.cancel)
                 return
@@ -344,7 +438,7 @@ private struct WebView: UIViewRepresentable {
             if let url = navigationAction.request.url {
                 let urlStr = url.absoluteString.lowercased()
                 let ext = url.pathExtension.lowercased()
-                let isDownload = ext == "ipa" || ext == "zip" || ext == "tar" || urlStr.hasSuffix(".tar.gz") || urlStr.contains("releases/download")
+                let isDownload = ext == "ipa" || ext == "zip" || ext == "tar" || urlStr.hasSuffix(".tar.gz")
                 if isDownload {
                     parent.onDownloadDetected(url)
                     return nil

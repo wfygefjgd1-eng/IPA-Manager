@@ -14,6 +14,16 @@ struct AppDetailView: View {
     @State private var signProgress: Double = 0
     /// 本次会话中签名完成后的输出路径，用于在详情页实时反映“已签名”状态
     @State private var signedOutputPath: String?
+    /// 签名完成弹窗：true 表示签名已成功并已发起安装
+    @State private var showSignedAlert = false
+    /// 签名完成后是否已自动安装（决定弹窗文案与“返回”行为）
+    @State private var signedDidInstall = false
+    /// 删除二次确认
+    @State private var showDeleteConfirm = false
+    /// 进度节流：仅当变化 ≥1% 或距离上次更新 ≥0.1s 才写入 @State
+    @State private var lastProgressUpdate = Date.distantPast
+    /// 签名中禁止关闭详情页
+    @State private var closeLocked = false
 
     /// 展示层使用的“实时”AppInfo：
     /// - 签名刚完成 → 以签名输出为准（合并原快照的元数据，isSigned = true，path 指向签名产物）；
@@ -59,9 +69,11 @@ struct AppDetailView: View {
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .navigationBarTrailing) {
+                    // 签名进行中禁用“关闭”，避免用户关掉页面后签名完成无任何反馈
                     Button("关闭") {
                         dismiss()
                     }
+                    .disabled(closeLocked)
                 }
             }
             .sheet(isPresented: $showSignOptions) {
@@ -89,12 +101,34 @@ struct AppDetailView: View {
             } message: {
                 Text(alertMessage)
             }
+            // 签名完成弹窗：内容“签名完成，已发起安装”，旁边“确定”和“返回”两个按钮。
+            // “返回”：关闭当前详情界面并回到首页（应用主界面 / 桌面）。
+            .alert("签名完成", isPresented: $showSignedAlert) {
+                Button("确定", role: .cancel) {}
+                Button("返回") {
+                    dismiss()
+                    appState.selectedTab = 0
+                }
+            } message: {
+                Text(signedDidInstall ? "签名完成，已发起安装" : "签名完成，未自动安装")
+            }
+            .confirmationDialog(
+                "删除后文件不可恢复，确定删除吗？",
+                isPresented: $showDeleteConfirm,
+                titleVisibility: .visible
+            ) {
+                Button("删除", role: .destructive) {
+                    appState.removeSignedApp(liveApp)
+                    dismiss()
+                }
+                Button("取消", role: .cancel) {}
+            }
         }
     }
 
     private var headerSection: some View {
         VStack(spacing: 12) {
-            AppIconView(iconPath: liveApp.iconPath)
+            AppIconView(iconPath: liveApp.iconPath, size: 80)
                 .frame(width: 80, height: 80)
 
             Text(liveApp.name.isEmpty ? "未命名" : liveApp.name)
@@ -181,8 +215,8 @@ struct AppDetailView: View {
             .disabled(isSigning)
 
             Button(role: .destructive) {
-                appState.removeSignedApp(liveApp)
-                dismiss()
+                // 删除是永久性磁盘操作，加二次确认，与全部清除一致的交互风格
+                showDeleteConfirm = true
             } label: {
                 Label("删除", systemImage: "trash")
                     .frame(maxWidth: .infinity)
@@ -210,26 +244,40 @@ struct AppDetailView: View {
 
     private func startSigning(certificate: CertificateInfo, profile: ProvisioningInfo, installAfter: Bool) {
         isSigning = true
+        closeLocked = true
         signProgress = 0
+        lastProgressUpdate = Date.distantPast
         appState.signApp(app, certificate: certificate, profile: profile, progress: { progress in
-            signProgress = progress
+            // 进度节流：变化 ≥1% 或间隔 ≥0.1s 才更新 @State，避免详情页频繁重算
+            let now = Date()
+            if abs(progress - signProgress) >= 0.01 || now.timeIntervalSince(lastProgressUpdate) >= 0.1 {
+                signProgress = progress
+                lastProgressUpdate = now
+            }
         }, completion: { [self] result in
             switch result {
             case .success(let signedPath):
                 isSigning = false
+                closeLocked = false
                 // 记录签名产物路径，供 liveApp 实时反映“已签名”状态（installedApps 会在回调前由 refreshInstalledApps 刷新）
                 signedOutputPath = signedPath
+                signedDidInstall = installAfter
                 if installAfter {
                     do {
                         try appState.installSignedPath(signedPath, certificate: certificate)
-                        alertMessage = "签名完成，已发起安装"
+                        // 弹窗内容：签名完成，已发起安装（旁边有“确定”与“返回”）
+                        showSignedAlert = true
                     } catch {
                         alertMessage = "签名完成，安装失败: \(error.localizedDescription)"
+                        showAlert = true
                     }
-                    showAlert = true
+                } else {
+                    // 未自动安装也给出明确反馈（否则静默成功用户不确定是否完成）
+                    showSignedAlert = true
                 }
             case .failure(let error):
                 isSigning = false
+                closeLocked = false
                 alertMessage = signingFailureMessage(for: error)
                 showAlert = true
             }
@@ -306,22 +354,28 @@ struct SignOptionsView: View {
                 }
 
                 Section("选择证书") {
-                    ForEach(appState.certificates) { cert in
-                        Button {
-                            selectedCert = cert
-                        } label: {
-                            HStack {
-                                VStack(alignment: .leading) {
-                                    Text(cert.name)
-                                        .foregroundColor(.primary)
-                                    Text("到期: \(cert.expireDateDescription)")
-                                        .font(.caption)
-                                        .foregroundColor(.secondary)
-                                }
-                                Spacer()
-                                if selectedCert?.id == cert.id {
-                                    Image(systemName: "checkmark")
-                                        .foregroundColor(.accentColor)
+                    if appState.certificates.isEmpty {
+                        Text("还没有证书，请先在「证书」标签页导入 P12/zip 证书包")
+                            .font(.subheadline)
+                            .foregroundColor(.secondary)
+                    } else {
+                        ForEach(appState.certificates) { cert in
+                            Button {
+                                selectedCert = cert
+                            } label: {
+                                HStack {
+                                    VStack(alignment: .leading) {
+                                        Text(cert.name)
+                                            .foregroundColor(.primary)
+                                        Text("到期: \(cert.expireDateDescription)")
+                                            .font(.caption)
+                                            .foregroundColor(.secondary)
+                                    }
+                                    Spacer()
+                                    if selectedCert?.id == cert.id {
+                                        Image(systemName: "checkmark")
+                                            .foregroundColor(.accentColor)
+                                    }
                                 }
                             }
                         }
@@ -329,22 +383,28 @@ struct SignOptionsView: View {
                 }
 
                 Section("选择描述文件") {
-                    ForEach(appState.profiles) { profile in
-                        Button {
-                            selectedProfile = profile
-                        } label: {
-                            HStack {
-                                VStack(alignment: .leading) {
-                                    Text(profile.name)
-                                        .foregroundColor(.primary)
-                                    Text("到期: \(profile.expireDateDescription)")
-                                        .font(.caption)
-                                        .foregroundColor(.secondary)
-                                }
-                                Spacer()
-                                if selectedProfile?.id == profile.id {
-                                    Image(systemName: "checkmark")
-                                        .foregroundColor(.accentColor)
+                    if appState.profiles.isEmpty {
+                        Text("还没有描述文件，请先在「证书」标签页导入 mobileprovision/zip 证书包")
+                            .font(.subheadline)
+                            .foregroundColor(.secondary)
+                    } else {
+                        ForEach(appState.profiles) { profile in
+                            Button {
+                                selectedProfile = profile
+                            } label: {
+                                HStack {
+                                    VStack(alignment: .leading) {
+                                        Text(profile.name)
+                                            .foregroundColor(.primary)
+                                        Text("到期: \(profile.expireDateDescription)")
+                                            .font(.caption)
+                                            .foregroundColor(.secondary)
+                                    }
+                                    Spacer()
+                                    if selectedProfile?.id == profile.id {
+                                        Image(systemName: "checkmark")
+                                            .foregroundColor(.accentColor)
+                                    }
                                 }
                             }
                         }

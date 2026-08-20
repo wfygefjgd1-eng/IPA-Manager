@@ -8,6 +8,10 @@ struct HomeView: View {
     @State private var showAlert = false
     @State private var alertMessage = ""
     @State private var selectedApp: AppInfo?
+    /// 多选导入：记录成功/失败数，全部结束后弹汇总（当前 sheet 打开详情页时仍显示）
+    @State private var importSuccessCount = 0
+    @State private var importFailureCount = 0
+    @State private var pendingImportCount = 0
 
     var body: some View {
         NavigationView {
@@ -25,6 +29,9 @@ struct HomeView: View {
                     // 多选导入：逐个交给 handleImportedFile，每个文件独立出结果提示
                     onPickMany: { urls in
                         showFileImporter = false
+                        importSuccessCount = 0
+                        importFailureCount = 0
+                        pendingImportCount = urls.count
                         for url in urls {
                             handleImportedFile(url)
                         }
@@ -73,7 +80,7 @@ struct HomeView: View {
             selectedApp = app
         } label: {
             HStack(spacing: 12) {
-                AppIconView(iconPath: app.iconPath)
+                AppIconView(iconPath: app.iconPath, size: 40)
                     .frame(width: 40, height: 40)
                 VStack(alignment: .leading, spacing: 2) {
                     Text(app.name.isEmpty ? "未命名" : app.name)
@@ -160,20 +167,46 @@ struct HomeView: View {
         appState.importFile(from: url) { importResult in
             switch importResult {
             case .success(let app):
-                // 导入成功且是应用（bundleID 非空）→ 自动打开签名详情页，不再弹“已导入”提示
+                importSuccessCount += 1
+                // 导入成功且是应用（bundleID 非空）
                 guard !app.bundleID.isEmpty else {
-                    self.alertMessage = "导入成功，但无法识别该应用的 Bundle ID"
-                    self.showAlert = true
+                    alertMessage = "导入成功，但无法识别该应用的 Bundle ID"
+                    showAlert = true
                     return
                 }
-                self.selectedApp = app
+                // 单个导入：立即打开签名详情页；多选：全部完成后弹汇总
+                if pendingImportCount <= 1 {
+                    selectedApp = app
+                } else if importSuccessCount + importFailureCount >= pendingImportCount {
+                    showImportSummary()
+                }
             case .failure(let error):
-                self.alertMessage = isZip
-                    ? self.zipImportFailureMessage(error.localizedDescription)
-                    : error.localizedDescription
-                self.showAlert = true
+                importFailureCount += 1
+                if pendingImportCount > 1, importSuccessCount + importFailureCount >= pendingImportCount {
+                    // 多选：错误并入汇总，不逐一弹窗打断
+                    showImportSummary()
+                } else {
+                    alertMessage = isZip
+                        ? zipImportFailureMessage(error.localizedDescription)
+                        : error.localizedDescription
+                    showAlert = true
+                }
             }
         }
+    }
+
+    /// 多选导入结束后的汇总提示（成功/失败个数）
+    private func showImportSummary() {
+        let total = importSuccessCount + importFailureCount
+        guard total > 1 else { return }
+        let summary: String
+        if importFailureCount > 0 {
+            summary = "已导入 \(importSuccessCount)/\(total) 个应用，\(importFailureCount) 个失败（详见具体提示）。"
+        } else {
+            summary = "已成功导入 \(importSuccessCount) 个应用。"
+        }
+        alertMessage = summary
+        showAlert = true
     }
 
     /// zip 导入失败时给出更贴合用户的中文提示：含 .app/.ipa 才是应用包；

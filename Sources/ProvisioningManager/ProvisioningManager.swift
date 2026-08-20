@@ -78,6 +78,10 @@ final class ProvisioningManager {
         info.teamID = (plist["TeamIdentifier"] as? [String])?.first ?? ""
         info.createdAt = plist["CreationDate"] as? Date
         info.expireDate = plist["ExpirationDate"] as? Date
+        // 注册设备 UDID 列表（企业分发描述文件含此字段；用户可据此判断设备是否在白名单内）
+        if let devices = plist["ProvisionedDevices"] as? [String] {
+            info.provisionedDevices = devices
+        }
 
         let entitlements = plist["Entitlements"] as? [String: Any] ?? [:]
         if let entitlementsDict = entitlements as? [String: Any] {
@@ -100,8 +104,35 @@ final class ProvisioningManager {
         return bundleID == teamID + ".*"
     }
 
+    /// 从 CMS 签名信封（PKCS#7）中剥离出内层 plist。
+    /// 兼容：只匹配 ASCII 小写 "<plist" 不够（UTF-16/异常大小写），
+    /// 先按文本查找 "<plist"（区分大小写 + 忽略大小写各试一次），
+    /// 找到后截取到 "</plist>"（含闭合标签）结束；找不到闭合标签或
+    /// 文本查找失败再回退"最后一个 <plist 截到末尾"方案。
     private static func stripCMSEnvelope(from data: Data) -> Data? {
-        guard let range = data.range(of: Data("<plist".utf8), options: .backwards) else { return nil }
-        return data.subdata(in: range.lowerBound..<data.count)
+        func range(of marker: String, options: String.CompareOptions) -> Range<Data.Index>? {
+            data.range(of: Data(marker.utf8), options: options)
+        }
+
+        var startBound: Data.Index?
+        var endBound: Data.Index?
+        // 先从数据整体找 ASCII 小写；找不到再忽略大小写找（覆盖异常大小写）
+        if let r = range(of: "<plist", options: [.backwards]) {
+            startBound = r.lowerBound
+        } else if let r = range(of: "<plist", options: [.backwards, .caseInsensitive]) {
+            startBound = r.lowerBound
+        }
+        guard let start = startBound else { return nil }
+
+        // 找闭合标签（从 start 之后开始找）
+        if let r = data.range(of: Data("</plist>".utf8), options: [.caseInsensitive], in: start..<data.endIndex) {
+            endBound = r.upperBound
+        }
+
+        if let end = endBound, end > start {
+            return data.subdata(in: start..<end)
+        }
+        // 兜底：无闭合标签时取到文件末尾（旧行为），解析失败由调用方处理
+        return data.subdata(in: start..<data.count)
     }
 }

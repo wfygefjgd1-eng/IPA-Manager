@@ -143,8 +143,15 @@ final class LocalInstallServer {
         BackgroundAudioKeepAlive.shared.start()
 
         Task { [weak self] in
+            // 自检只报告可达性，不再要求用户改网络：manifest 走公网 HTTPS（palera.in），
+            // 回环 127.0.0.1 在任何网络（蜂窝/VPN 代理）下都对本机可达，
+            // 只有回环都不可达才说明服务器本身异常。
             let ok = await self?.isReachable() ?? false
-            Logger.info("安装服务器自检结果: \(ok ? "可达（本机 HTTP 正常）" : "不可达（本机 HTTP 失败！）") — 请关闭 VPN/代理并连接 Wi-Fi 后重试")
+            if ok {
+                Logger.info("安装服务器自检结果: 可达（本机 HTTP 正常，可配合公网 manifest 安装）")
+            } else {
+                Logger.error("安装服务器自检结果: 不可达（本机 HTTP 失败，服务器可能未正常启动）")
+            }
         }
         return baseURL
     }

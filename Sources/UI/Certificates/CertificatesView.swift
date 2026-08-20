@@ -5,6 +5,8 @@ struct CertificatesView: View {
     @EnvironmentObject private var appState: AppState
     @State private var showImporter = false
     @State private var pendingImportURL: URL?
+    @State private var managedPendingP12: URL?
+    @State private var pendingExtractDir: URL?
     @State private var showPasswordSheet = false
     @State private var showAlert = false
     @State private var alertMessage = ""
@@ -40,6 +42,19 @@ struct CertificatesView: View {
             .sheet(isPresented: $showPasswordSheet) {
                 PasswordPromptView(importURL: pendingImportURL) { cert in
                     appState.addCertificate(cert)
+                    // 证书已导入 Keychain：删除 Documents 中的 P12 明文副本与解压目录，
+                    // 避免私钥材料明文常驻（iTunes 文件共享/备份可导出）
+                    let managed = managedPendingP12
+                    let extractDir = pendingExtractDir
+                    managedPendingP12 = nil
+                    pendingExtractDir = nil
+                    pendingImportURL = nil
+                    if let managed = managed {
+                        CertificateBundleImporter.shared.deleteManagedP12(managed)
+                    }
+                    if let extractDir = extractDir {
+                        CertificateBundleImporter.shared.cleanup(extractDir: extractDir)
+                    }
                 }
             }
             .alert("提示", isPresented: $showAlert) {
@@ -69,8 +84,13 @@ struct CertificatesView: View {
                     certificateRow(certificate)
                 }
                 .onDelete { indexSet in
-                    for index in indexSet {
-                        appState.removeCertificate(appState.certificates[index])
+                    // 快照待删证书再统一删除，避免循环内数组缩短导致删错/越界
+                    let toDelete = indexSet.compactMap { index -> CertificateInfo? in
+                        guard index < appState.certificates.count else { return nil }
+                        return appState.certificates[index]
+                    }
+                    for certificate in toDelete {
+                        appState.removeCertificate(certificate)
                     }
                 }
             }
@@ -88,8 +108,13 @@ struct CertificatesView: View {
                     profileRow(profile)
                 }
                 .onDelete { indexSet in
-                    for index in indexSet {
-                        appState.removeProfile(appState.profiles[index])
+                    // 快照待删描述文件再统一删除，避免循环内数组缩短导致删错/越界
+                    let toDelete = indexSet.compactMap { index -> ProvisioningInfo? in
+                        guard index < appState.profiles.count else { return nil }
+                        return appState.profiles[index]
+                    }
+                    for profile in toDelete {
+                        appState.removeProfile(profile)
                     }
                 }
             }
@@ -113,6 +138,13 @@ struct CertificatesView: View {
             }
 
             Spacer()
+
+            // 默认选中态标记：与 SignOptionsView 的选中样式一致，让用户明确知道
+            // 「一键签名」默认使用哪张证书
+            if appState.selectedCertificate?.id == certificate.id {
+                Image(systemName: "checkmark.circle.fill")
+                    .foregroundColor(.accentColor)
+            }
 
             Text(certificate.statusDescription)
                 .font(.caption)
@@ -144,6 +176,12 @@ struct CertificatesView: View {
             }
 
             Spacer()
+
+            // 默认选中态标记
+            if appState.selectedProfile?.uuid == profile.uuid {
+                Image(systemName: "checkmark.circle.fill")
+                    .foregroundColor(.accentColor)
+            }
 
             Text(profile.statusDescription)
                 .font(.caption)
@@ -194,13 +232,18 @@ struct CertificatesView: View {
     // 一键导入 zip（自动识别 p12 + mobileprovision）
     private func importBundle(_ url: URL) {
         isImporting = true
+        var extractDir: URL? = nil
         DispatchQueue.global(qos: .userInitiated).async {
             do {
                 let content = try CertificateBundleImporter.shared.extract(from: url)
+                // 记录解压目录：无论成功失败都要删除，避免 bundle-extract-* 明文泄漏堆积
+                extractDir = content.p12URL?.deletingLastPathComponent()
                 let moved = try CertificateBundleImporter.shared.moveToManagedLocation(
                     p12URL: content.p12URL,
                     profileURL: content.profileURL
                 )
+                // 证书导入 Keychain 成功后删除 Documents 中的 P12 明文副本
+                let managedP12 = moved.p12URL
 
                 DispatchQueue.main.async {
                     isImporting = false
@@ -234,8 +277,14 @@ struct CertificatesView: View {
                     // 导入证书（需要密码）—— 只弹密码框，避免与 alert 冲突
                     if let p12URL = moved.p12URL {
                         pendingImportURL = p12URL
+                        managedPendingP12 = managedP12
+                        pendingExtractDir = extractDir
                         showPasswordSheet = true
                     } else {
+                        // 无证书：解压目录与托管副本都不需要保留
+                        if let extractDir = extractDir {
+                            CertificateBundleImporter.shared.cleanup(extractDir: extractDir)
+                        }
                         alertMessage = summary + "未找到证书"
                         showAlert = true
                     }
@@ -243,6 +292,10 @@ struct CertificatesView: View {
             } catch {
                 DispatchQueue.main.async {
                     isImporting = false
+                    // 解压/移动失败：清理解压残留
+                    if let extractDir = extractDir {
+                        CertificateBundleImporter.shared.cleanup(extractDir: extractDir)
+                    }
                     alertMessage = "导入失败: \(error.localizedDescription)"
                     showAlert = true
                 }

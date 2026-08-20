@@ -83,8 +83,13 @@ targets:
         UIFileSharingEnabled: true
         LSSupportsOpeningDocumentsInPlace: true
         UISupportsDocumentBrowser: true
+        # ATS：安装链路 manifest 已走公网 HTTPS（api.palera.in），App 自身本地服务器
+        # 自检（127.0.0.1）依赖明文 HTTP；内置浏览器需访问 http:// 下载站
+        # （大量 IPA 站点仍为明文 http）。权衡功能可用性后保留 NSAllowsArbitraryLoads
+        # 并配合 NSAllowsLocalNetworking（后者保证本地回环/局域网明文）。
         NSAppTransportSecurity:
           NSAllowsArbitraryLoads: true
+          NSAllowsLocalNetworking: true
         # iOS 14+ 本地网络隐私：itms-services 用设备局域网 IP（192.168.x.x）下载
         # manifest/ipa 时，SpringBoard 需访问本地网络。声明用途并允许明文 HTTP。
         NSLocalNetworkUsageDescription: 安装 IPA 时需要通过本地网络将签名后的应用传送到系统安装器

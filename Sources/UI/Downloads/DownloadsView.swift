@@ -228,6 +228,7 @@ struct DownloadsView: View {
         .onTapGesture {
             guard task.status == .completed else { return }
             if let app = matchedApp(for: task) {
+                rememberResolvedTask(task: task, app: app)
                 selectedApp = app
             } else {
                 recognizeUnmatchedTask(task)
@@ -309,9 +310,28 @@ struct DownloadsView: View {
         "\(ByteCountFormatter.string(fromByteCount: task.receivedBytes, countStyle: .file)) / \(ByteCountFormatter.string(fromByteCount: task.totalBytes, countStyle: .file))"
     }
 
+    /// 记录任务解析出的 bundleID：回填到本地 tasks 副本（随后由 DownloadManager
+    /// 的 task 持久化保存），供后续 matchedApp 精确匹配。
+    private func rememberResolvedTask(task: DownloadTask, app: AppInfo) {
+        guard !app.bundleID.isEmpty else { return }
+        var updated = task
+        updated.resolvedBundleID = app.bundleID
+        if let index = tasks.firstIndex(where: { $0.id == task.id }) {
+            tasks[index] = updated
+        }
+        DownloadManager.shared.updateTask(updated)
+    }
+
     private func matchedApp(for task: DownloadTask) -> AppInfo? {
         let fileName = task.fileName
         let baseName = (fileName as NSString).deletingPathExtension
+
+        // 0) 精确优先：自动导入成功时回填的 bundleID（与已导入应用的 bundleID 唯一匹配，
+        //    不受文件名/应用名重名干扰）
+        if let bundleID = task.resolvedBundleID, !bundleID.isEmpty,
+           let app = appState.importedApps.first(where: { $0.bundleID == bundleID }) {
+            return app
+        }
 
         return appState.importedApps.first { app in
             // 1) 优先：导入后应用路径与任务目标路径一致 → 直接命中
@@ -361,6 +381,7 @@ struct DownloadsView: View {
         // 也绝不给用户弹任何 alert。
         if let app = matchedApp(for: task) {
             Logger.info("下载文件已识别（自动导入已完成），零延迟打开签名页: \(app.name)")
+            rememberResolvedTask(task: task, app: app)
             selectedApp = app
             return
         }
@@ -432,6 +453,7 @@ struct DownloadsView: View {
                 DispatchQueue.main.async {
                     if let app = self.matchedApp(for: task) {
                         Logger.info("zip 已自动导入成功，零延迟打开签名页: \(app.name)")
+                        self.rememberResolvedTask(task: task, app: app)
                         self.openSigning(for: app)
                         return
                     }
@@ -445,6 +467,8 @@ struct DownloadsView: View {
                             switch result {
                             case .success(let app):
                                 Logger.info("zip 补导入成功，零延迟打开签名页: \(app.name)")
+                                // 回填 bundleID：后续 matchedApp 可精确匹配，不依赖名称
+                                self.rememberResolvedTask(task: task, app: app)
                                 self.openSigning(for: app)
                             case .failure(let error):
                                 let reason = self.zipParseFailureReason(task: task, detail: error.localizedDescription)
@@ -457,6 +481,7 @@ struct DownloadsView: View {
                         guard !finished else { return }
                         finished = true
                         if let app = self.matchedApp(for: task) {
+                            self.rememberResolvedTask(task: task, app: app)
                             self.openSigning(for: app)
                         } else {
                             let reason = "压缩包内包含应用（.app 或 .ipa），已重新尝试导入。若仍失败，请查看下方具体原因。"

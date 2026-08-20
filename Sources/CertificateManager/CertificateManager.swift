@@ -21,11 +21,42 @@ final class CertificateManager {
             }
             do {
                 let certificate = try self.readCertificate(from: url, password: password)
-                self.storePrivateKey(from: url, password: password, identifier: certificate.keychainIdentifier, passwordIdentifier: certificate.passwordKeychainIdentifier)
-                completion(.success(certificate))
+                let storeStatus = self.storePrivateKey(
+                    from: url, password: password,
+                    identifier: certificate.keychainIdentifier,
+                    passwordIdentifier: certificate.passwordKeychainIdentifier
+                )
+                guard let storeStatus = storeStatus, storeStatus == errSecSuccess else {
+                    let code = storeStatus ?? -1
+                    let reason: String
+                    switch code {
+                    case errSecAuthFailed:
+                        reason = "私钥写入失败：钥匙串验证失败，请检查设备锁屏密码设置后重试"
+                    case errSecInteractionNotAllowed:
+                        reason = "私钥写入失败：设备锁定时无法访问钥匙串，请解锁后重试"
+                    default:
+                        reason = "私钥写入失败，请检查设备钥匙串状态后重试 (错误码 \(code))"
+                    }
+                    Logger.error("私钥落库失败: \(reason)")
+                    self.deliver(.failure(AppError.certificateInvalid(reason)), completion: completion)
+                    return
+                }
+                self.deliver(.success(certificate), completion: completion)
             } catch {
-                completion(.failure(error))
+                self.deliver(.failure(error), completion: completion)
             }
+        }
+    }
+
+    /// API 线程契约：completion 统一在主线程回调，调用方无需自行切主。
+    private func deliver(
+        _ result: Result<CertificateInfo, Error>,
+        completion: @escaping (Result<CertificateInfo, Error>) -> Void
+    ) {
+        if Thread.isMainThread {
+            completion(result)
+        } else {
+            DispatchQueue.main.async { completion(result) }
         }
     }
 
@@ -74,24 +105,37 @@ final class CertificateManager {
         }
     }
 
-    func deleteCertificate(_ certificate: CertificateInfo) {
-        guard let identifier = certificate.keychainIdentifier else { return }
+    /// 删除证书及其对应密码条目。返回是否成功（errSecItemNotFound 视为成功）。
+    /// 密码条目按证书 identifier 反查删除，不依赖可能缺失的 passwordKeychainIdentifier，
+    /// 顺带清除历史版本遗留的孤儿密码。
+    @discardableResult
+    func deleteCertificate(_ certificate: CertificateInfo) -> Bool {
+        guard let identifier = certificate.keychainIdentifier else { return false }
         let query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: keychainService,
             kSecAttrAccount as String: identifier
         ]
-        SecItemDelete(query as CFDictionary)
+        let status = SecItemDelete(query as CFDictionary)
+        if status != errSecSuccess && status != errSecItemNotFound {
+            Logger.error("证书条目删除失败: \(status)")
+        }
 
-        // 同时删除对应的密码条目
-        if let passwordID = certificate.passwordKeychainIdentifier {
+        // 删除对应密码条目：优先用记录的 passwordKeychainIdentifier，
+        // 缺失时按证书 identifier 反查（兼容旧版本持久化的证书）
+        let pwdIDs = [certificate.passwordKeychainIdentifier, identifier].compactMap { $0 }
+        for pwdID in Set(pwdIDs) {
             let pwdQuery: [String: Any] = [
                 kSecClass as String: kSecClassGenericPassword,
                 kSecAttrService as String: keychainPasswordService,
-                kSecAttrAccount as String: passwordID
+                kSecAttrAccount as String: pwdID
             ]
-            SecItemDelete(pwdQuery as CFDictionary)
+            let pwdStatus = SecItemDelete(pwdQuery as CFDictionary)
+            if pwdStatus != errSecSuccess && pwdStatus != errSecItemNotFound {
+                Logger.warning("密码条目删除失败: \(pwdStatus)")
+            }
         }
+        return status == errSecSuccess || status == errSecItemNotFound
     }
 
     private func readCertificate(from url: URL, password: String) throws -> CertificateInfo {
@@ -142,8 +186,14 @@ final class CertificateManager {
         case -2:
             throw AppError.certificateInvalid("密码错误或证书格式不支持 (OpenSSL)")
         default:
-            let message = zsign_last_error().map { String(cString: $0) } ?? "证书读取失败 (错误码: \(result))"
-            throw AppError.certificateInvalid(message)
+            // zsign_last_error 返回 C 指针：先判空再用 strnlen 限定长度复制，避免越界读。
+            let rawError = Self.safeZSignError(limit: 512)
+            if rawError.isEmpty {
+                throw AppError.certificateInvalid("证书读取失败 (错误码: \(result))")
+            }
+            // 底层英文进日志，用户只看到中文可操作提示
+            Logger.error("OpenSSL p12 读取失败 (code \(result)): \(rawError)")
+            throw AppError.certificateInvalid("证书文件无效或格式不受支持")
         }
     }
 
@@ -159,10 +209,20 @@ final class CertificateManager {
         let status = SecPKCS12Import(data as CFData, options as CFDictionary, &items)
 
         guard status == errSecSuccess, let array = items as? [[String: Any]], let first = array.first else {
-            if status == errSecAuthFailed {
-                throw AppError.certificateInvalid("密码错误")
+            // 把系统错误码映射成用户可操作的中文提示（底层数字/英文只进日志）
+            let userMessage: String
+            switch status {
+            case errSecAuthFailed:
+                userMessage = "密码错误，请重新输入"
+            case errSecDecode:
+                userMessage = "证书格式不支持或文件已损坏"
+            case errSecPassphraseRequired:
+                userMessage = "该证书需要密码，请输入密码后重试"
+            default:
+                userMessage = "证书读取失败，请确认文件有效后重试"
             }
-            throw AppError.certificateInvalid("证书读取失败 (错误码: \(status))")
+            Logger.error("SecPKCS12Import 失败: status=\(status)")
+            throw AppError.certificateInvalid(userMessage)
         }
 
         let certChain = first[kSecImportItemCertChain as String] as? [SecCertificate] ?? []
@@ -308,36 +368,98 @@ final class CertificateManager {
         }
     }
 
-    private func storePrivateKey(from url: URL, password: String, identifier: String?, passwordIdentifier: String?) {
-        guard let identifier = identifier else { return }
-        guard let data = try? Data(contentsOf: url) else { return }
+    /// 安全读取 zsign_last_error()：判空 + strnlen 限定长度，避免依赖 C 侧
+    /// 缓冲区生命周期/非 NUL 结尾导致越界读。
+    private static func safeZSignError(limit: Int = 512) -> String {
+        guard let ptr = zsign_last_error() else { return "" }
+        let len = strnlen(ptr, limit)
+        guard len > 0 else { return "" }
+        return String(cString: ptr)
+    }
 
-        let query: [String: Any] = [
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: keychainService,
-            kSecAttrAccount as String: identifier,
-            kSecValueData as String: data,
-            kSecAttrAccessible as String: kSecAttrAccessibleWhenUnlockedThisDeviceOnly
-        ]
+    /// 把 P12 材料与密码写入 Keychain。返回 SecItemAdd 的最终状态码
+    /// （errSecSuccess 表示成功；nil 表示参数缺失未执行）。
+    /// 先按 class+service+account 精确删除旧条目，再写入；
+    /// 若仍返回 -25299（errSecDuplicateItem，常见于旧条目 access 属性不一致
+    /// 导致 delete 匹配不到），再强制 remove 一次并重试 Add。
+    @discardableResult
+    private func storePrivateKey(from url: URL, password: String, identifier: String?, passwordIdentifier: String?) -> OSStatus? {
+        guard let identifier = identifier else { return nil }
+        guard let data = try? Data(contentsOf: url) else { return errSecDecode }
 
-        SecItemDelete(query as CFDictionary)
-        let status = SecItemAdd(query as CFDictionary, nil)
+        var status = upsertKeychain(
+            service: keychainService,
+            account: identifier,
+            data: data
+        )
 
         if let passwordIdentifier = passwordIdentifier, !password.isEmpty {
             let pwdData = Data(password.utf8)
-            let pwdQuery: [String: Any] = [
-                kSecClass as String: kSecClassGenericPassword,
-                kSecAttrService as String: keychainPasswordService,
-                kSecAttrAccount as String: passwordIdentifier,
-                kSecValueData as String: pwdData,
-                kSecAttrAccessible as String: kSecAttrAccessibleWhenUnlockedThisDeviceOnly
-            ]
-            SecItemDelete(pwdQuery as CFDictionary)
-            let pwdStatus = SecItemAdd(pwdQuery as CFDictionary, nil)
+            let pwdStatus = upsertKeychain(
+                service: keychainPasswordService,
+                account: passwordIdentifier,
+                data: pwdData
+            )
             Logger.info("密码存储状态: \(pwdStatus)")
+            if pwdStatus != errSecSuccess {
+                Logger.error("密码写入 Keychain 失败: \(pwdStatus)")
+                status = pwdStatus
+            }
         }
 
         Logger.info("私钥存储状态: \(status)")
+        return status
+    }
+
+    /// 先删后写：精确匹配 class+service+account 删除旧条目（errSecItemNotFound 视为预期），
+    /// 再写入数据。accessibility 优先用 WhenPasscodeSetThisDeviceOnly（要求设备密码的
+    /// 最强数据保护），设备未设密码等失败场景自动降级 WhenUnlockedThisDeviceOnly；
+    /// 若 Add 返回 -25299，再做一次 remove 并重试。
+    private func upsertKeychain(service: String, account: String, data: Data) -> OSStatus {
+        let match: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: service,
+            kSecAttrAccount as String: account
+        ]
+        let delStatus = SecItemDelete(match as CFDictionary)
+        if delStatus != errSecSuccess && delStatus != errSecItemNotFound {
+            Logger.warning("Keychain 旧条目删除失败: \(delStatus)（继续尝试写入）")
+        }
+
+        // 最强保护优先：要求设备已设置密码口令，若该策略写入失败（如设备未设密码）
+        // 自动降级为 WhenUnlockedThisDeviceOnly 再试一次。
+        let passcodeQuery: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: service,
+            kSecAttrAccount as String: account,
+            kSecValueData as String: data,
+            kSecAttrAccessible as String: kSecAttrAccessibleWhenPasscodeSetThisDeviceOnly
+        ]
+        var status = SecItemAdd(passcodeQuery as CFDictionary, nil)
+        if status != errSecSuccess {
+            let unlockQuery: [String: Any] = [
+                kSecClass as String: kSecClassGenericPassword,
+                kSecAttrService as String: service,
+                kSecAttrAccount as String: account,
+                kSecValueData as String: data,
+                kSecAttrAccessible as String: kSecAttrAccessibleWhenUnlockedThisDeviceOnly
+            ]
+            SecItemDelete(match as CFDictionary)
+            status = SecItemAdd(unlockQuery as CFDictionary, nil)
+        }
+        if status == errSecDuplicateItem {
+            // delete 匹配不到旧条目时 Add 报重复：强制再删一次并重试（用解锁策略）
+            SecItemDelete(match as CFDictionary)
+            let retryQuery: [String: Any] = [
+                kSecClass as String: kSecClassGenericPassword,
+                kSecAttrService as String: service,
+                kSecAttrAccount as String: account,
+                kSecValueData as String: data,
+                kSecAttrAccessible as String: kSecAttrAccessibleWhenUnlockedThisDeviceOnly
+            ]
+            status = SecItemAdd(retryQuery as CFDictionary, nil)
+        }
+        return status
     }
 
     private func readP12Data(identifier: String) -> Data? {

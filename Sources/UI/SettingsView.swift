@@ -4,6 +4,8 @@ struct SettingsView: View {
     @State private var showAbout = false
     /// 诊断报告临时文件（写入成功后再赋值为非 nil，触发分享 sheet）
     @State private var shareItem: ShareItem?
+    /// 诊断报告写入失败时的错误提示
+    @State private var reportError: String?
 
     var body: some View {
         NavigationView {
@@ -44,6 +46,12 @@ struct SettingsView: View {
             } message: {
                 Text("本地 IPA 签名与管理工具\n版本 \(Self.currentVersion)\n所有签名均在设备本地完成，不上传任何文件")
             }
+            // 诊断报告写入失败提示（与分享 sheet 分开，避免相互覆盖）
+            .alert("提示", isPresented: Binding(get: { reportError != nil }, set: { if !$0 { reportError = nil } })) {
+                Button("确定", role: .cancel) {}
+            } message: {
+                Text(reportError ?? "")
+            }
             // 用 sheet(item:) 绑定 URL，避免旧实现“isPresented + sheet 内 if let”的时序问题：
             // 之前表现为“第一次点击分享是空白的，要返回再点才弹出”。
             .sheet(item: $shareItem) { item in
@@ -72,6 +80,7 @@ struct SettingsView: View {
             shareItem = ShareItem(url: tempURL)
         } catch {
             Logger.error("诊断报告写入失败: \(error.localizedDescription)")
+            reportError = "诊断报告生成失败: \(error.localizedDescription)"
         }
     }
 }

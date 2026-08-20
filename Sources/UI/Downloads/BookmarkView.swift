@@ -162,7 +162,9 @@ struct BookmarkView: View {
 
     private func deleteBookmarks(_ indexSet: IndexSet) {
         let userStart = bookmarks.prefix(while: { $0.isPreset }).count
-        for index in indexSet {
+        // 降序删除：后面索引先删，前面索引不受前面元素被删的影响，避免删错条目
+        let targets = indexSet.sorted(by: >)
+        for index in targets {
             let target = userStart + index
             guard target < bookmarks.count else { continue }
             bookmarks.remove(at: target)
@@ -180,7 +182,7 @@ struct BookmarkItem: Codable, Identifiable, Hashable {
 
     static let githubPresets: [BookmarkItem] = [
         BookmarkItem(title: "GitHub", url: "https://github.com", icon: "globe"),
-        BookmarkItem(title: "GitHub Releases", url: "https://github.com/login?return_to=%2F", icon: "tag.fill")
+        BookmarkItem(title: "GitHub Releases", url: "https://github.com/releases", icon: "tag.fill")
     ]
 }
 
@@ -204,6 +206,8 @@ final class BookmarkStore {
         UserDefaults.standard.set(data, forKey: key)
     }
 
+    /// 收藏当前页：返回 true 表示（已存在或已新增）收藏成功；false 表示 URL 无效被拒绝。
+    /// 与 BookmarkView.addFromTextField 的“重复不再提示新增”语义保持一致。
     func addCurrentPage(_ urlString: String) -> Bool {
         guard let url = URL(string: urlString), url.scheme != nil else { return false }
         let all = load()

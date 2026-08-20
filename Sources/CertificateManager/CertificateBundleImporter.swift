@@ -56,6 +56,17 @@ final class CertificateBundleImporter {
         try? fileManager.deleteItem(at: extractDir)
     }
 
+    /// 删除已复制到 Documents 的敏感 P12 副本（私钥材料不应明文常驻 Documents）。
+    /// 证书一旦导入 Keychain，其 P12 明文副本即无用且危险（iTunes 文件共享/备份可导出）。
+    func deleteManagedP12(_ url: URL?) {
+        guard let url = url else { return }
+        let dir = fileManager.directoryURL(.certificates).path
+        // 只清理位于托管目录内的 cert-*.p12 副本，避免误删用户原始文件
+        if url.path.hasPrefix(dir) {
+            try? fileManager.deleteItem(at: url)
+        }
+    }
+
     private func findFile(extension ext: String, in directory: URL) throws -> String? {
         guard let items = try? FileManager.default.contentsOfDirectory(atPath: directory.path) else {
             return nil

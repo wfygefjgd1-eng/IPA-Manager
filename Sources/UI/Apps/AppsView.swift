@@ -8,7 +8,11 @@ struct AppsView: View {
     var body: some View {
         NavigationView {
             Group {
-                if appState.installedApps.isEmpty {
+                if appState.isRefreshingInstalledApps && appState.installedApps.isEmpty {
+                    // 启动/删除后的扫描期：显示加载态而非“暂无应用”空态，避免误认为没有应用
+                    ProgressView("正在扫描已签应用...")
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                } else if appState.installedApps.isEmpty {
                     emptyView
                 } else {
                     List {
@@ -64,7 +68,7 @@ struct AppsView: View {
 
     private func appRow(_ app: AppInfo) -> some View {
         HStack(spacing: 12) {
-            AppIconView(iconPath: app.iconPath)
+            AppIconView(iconPath: app.iconPath, size: 48)
             VStack(alignment: .leading, spacing: 4) {
                 Text(app.name.isEmpty ? "未命名" : app.name)
                     .font(.headline)
@@ -83,19 +87,16 @@ struct AppsView: View {
         .padding(.vertical, 4)
     }
 
-    /// 滑动删除：移除指定索引的已签应用。
+    /// 滑动删除：移除指定索引的已签应用（批量删除只触发一次全量重扫）
     private func deleteApps(at offsets: IndexSet) {
+        guard offsets.allSatisfy({ $0 < appState.installedApps.count }) else { return }
         let appsToRemove = offsets.map { appState.installedApps[$0] }
-        for app in appsToRemove {
-            appState.removeSignedApp(app)
-        }
+        appState.removeSignedApps(appsToRemove)
     }
 
-    /// 全部清除：移除所有已签应用及其文件。
+    /// 全部清除：移除所有已签应用及其文件（批量删除只触发一次全量重扫）
     private func clearAllSignedApps() {
         let all = appState.installedApps
-        for app in all {
-            appState.removeSignedApp(app)
-        }
+        appState.removeSignedApps(all)
     }
 }

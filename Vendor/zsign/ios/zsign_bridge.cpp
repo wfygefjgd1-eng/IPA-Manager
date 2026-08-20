@@ -23,7 +23,10 @@
 #include "fs.h"
 #include "util.h"
 
-static std::string g_lastError;
+// 线程安全：Swift 侧签名任务在并发全局队列执行，多个任务可同时进入桥接层。
+// 文件级 static std::string 是数据竞争（UB），改为 thread_local 使错误缓冲
+// 每个线程独立，杜绝跨线程串扰与崩溃。
+static thread_local std::string g_lastError;
 
 const char* zsign_last_error(void) {
     return g_lastError.c_str();
@@ -160,14 +163,22 @@ int zsign_sign(const ZSignOptions* options) {
         options->progressCallback(options->context, 85, "正在重新打包...");
     }
 
-    size_t pos = bundle.m_strAppFolder.rfind("Payload");
+    // 用路径组件匹配（避免裸 rfind 子串误判）：找目录组件 /Payload/ 的最后一个
+    // 出现位置并以此为根目录边界。若 .app 目录名本身含 "Payload" 子串
+    // （如 MyAppPayload.app），裸 rfind("Payload") 会命中名字内部，导致
+    // strBaseFolder 截断错误、打包出结构损坏的 IPA；按组件匹配则不会。
+    size_t pos = bundle.m_strAppFolder.rfind("/Payload/");
     if (std::string::npos == pos || pos == 0) {
-        g_lastError = "Can't find payload directory";
-        ZFile::RemoveFolder(strTempFolder.c_str());
-        return -1;
+        // 兼容 Payload 恰为末尾组件的异常形式（如 /tmp/x/Payload/）
+        pos = bundle.m_strAppFolder.rfind("/Payload");
+        if (std::string::npos == pos || pos == 0) {
+            g_lastError = "Can't find payload directory";
+            ZFile::RemoveFolder(strTempFolder.c_str());
+            return -1;
+        }
     }
 
-    std::string strBaseFolder = bundle.m_strAppFolder.substr(0, pos - 1);
+    std::string strBaseFolder = bundle.m_strAppFolder.substr(0, pos);
     // zipLevel 直接传 int（0-9 为合法压缩级别；-1 由 Zip::Archive 解释为默认级别）
     int nZipLevel = options->zipLevel;
     if (nZipLevel < -1 || nZipLevel > 9) {
@@ -237,9 +248,12 @@ int zsign_p12_info(const char* p12Path, const char* password, ZSignP12Info* info
         return -1;
     }
 
-    // Load legacy provider for older p12 encryption schemes
+    // Load providers (best effort): 本工程静态 OpenSSL 未启用 legacy provider，
+    // OSSL_PROVIDER_load("legacy") 必然失败并在本线程错误队列压入 provider not found。
+    // 这里显式忽略其返回值并立即清空错误队列，避免污染后续 OpenSSL 操作的诊断。
     OSSL_PROVIDER_load(NULL, "legacy");
     OSSL_PROVIDER_load(NULL, "default");
+    ERR_clear_error();
 
     PKCS12* p12 = d2i_PKCS12_bio(bio, NULL);
     BIO_free(bio);
@@ -316,8 +330,8 @@ int zsign_p12_info(const char* p12Path, const char* password, ZSignP12Info* info
 int zsign_p12_export_identity(const char* p12Path, const char* password,
                               unsigned char** outCertDER, int* outCertLen,
                               unsigned char** outKeyDER,  int* outKeyLen,
-                              int* outIsRSA, int* outKeyFormat) {
-    if (!p12Path || !outCertDER || !outCertLen || !outKeyDER || !outKeyLen || !outIsRSA || !outKeyFormat) {
+                              int* outIsRSA, int* outKeyFormat, int* outKeyBits) {
+    if (!p12Path || !outCertDER || !outCertLen || !outKeyDER || !outKeyLen || !outIsRSA || !outKeyFormat || !outKeyBits) {
         g_lastError = "无效的 p12 导出参数";
         return -1;
     }
@@ -328,6 +342,7 @@ int zsign_p12_export_identity(const char* p12Path, const char* password,
     *outKeyLen = 0;
     *outIsRSA = 0;
     *outKeyFormat = 0;
+    *outKeyBits = 0;
 
     BIO* bio = BIO_new_file(p12Path, "rb");
     if (!bio) {
@@ -335,10 +350,11 @@ int zsign_p12_export_identity(const char* p12Path, const char* password,
         return -1;
     }
 
-    // 与 zsign_p12_info 一致：加载 legacy + default provider，
-    // 兼容新版 PBES2/AES 与旧版加密算法的 p12。
+    // 与 zsign_p12_info 一致：加载 legacy + default provider（best effort）。
+    // legacy 在本构建加载必然失败，立即清空错误队列避免污染诊断。
     OSSL_PROVIDER_load(NULL, "legacy");
     OSSL_PROVIDER_load(NULL, "default");
+    ERR_clear_error();
 
     PKCS12* p12 = d2i_PKCS12_bio(bio, NULL);
     BIO_free(bio);
@@ -472,6 +488,7 @@ int zsign_p12_export_identity(const char* p12Path, const char* password,
     *outKeyLen = nKeyLen;
     *outIsRSA = isRSA;
     *outKeyFormat = nKeyFormat;
+    *outKeyBits = EVP_PKEY_bits(pkey);
 
     EVP_PKEY_free(pkey);
     X509_free(cert);

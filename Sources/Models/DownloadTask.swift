@@ -8,6 +8,8 @@ struct DownloadTask: Identifiable, Codable, Hashable {
     var totalBytes: Int64 = 0
     var receivedBytes: Int64 = 0
     var createdAt: Date = Date()
+    /// 断点续传数据：下载中断/失败时由 URLSession 提供，重启后可续传
+    var resumeData: Data?
 
     enum Status: String, Codable {
         case waiting
@@ -19,6 +21,9 @@ struct DownloadTask: Identifiable, Codable, Hashable {
 
     var status: Status = .waiting
     var error: String?
+    /// 自动导入成功后回填的 bundleID：matchedApp 优先按它精确匹配，
+    /// 不依赖可能重名的文件名/应用名
+    var resolvedBundleID: String?
 
     var progress: Double {
         guard totalBytes > 0 else { return 0 }
