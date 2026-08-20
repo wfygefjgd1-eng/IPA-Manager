@@ -18,22 +18,18 @@ struct CertificatesView: View {
                 certificatesSection
                 profilesSection
             }
+            .listStyle(.plain)
             .scrollContentBackground(.hidden)
-            // 毛玻璃背景：List 已透明化（scrollContentBackground(.hidden)），
-            // 这里在导航容器外层铺渐变 + 半透明材质，列表内容透出玻璃质感
             .navigationTitle("证书管理")
             .toolbar {
-                ToolbarItemGroup(placement: .navigationBarTrailing) {
+                ToolbarItem(placement: .navigationBarTrailing) {
+                    // 一键导入：支持 zip（含 p12 + mobileprovision）/ 单独 p12 / mobileprovision；
+                    // 原先的“+”与一键导入完全相同（打开同一个文件选择器），已合并为一个按钮
                     Button {
                         showImporter = true
                     } label: {
-                        Text("一键导入")
-                    }
-
-                    Button {
-                        showImporter = true
-                    } label: {
-                        Image(systemName: "plus")
+                        Label("一键导入", systemImage: "square.and.arrow.down")
+                            .font(.subheadline.weight(.medium))
                     }
                 }
             }
@@ -81,14 +77,19 @@ struct CertificatesView: View {
     }
 
     private var certificatesSection: some View {
-        Section("企业证书") {
+        Section {
             if appState.certificates.isEmpty {
-                Text("暂无证书，点击右上角 + 导入 P12 或 zip 一键导入")
-                    .font(.subheadline)
-                    .foregroundColor(.secondary)
+                emptyCard(
+                    icon: "key.fill",
+                    title: "暂无企业证书",
+                    subtitle: "点击右上角「一键导入」\n支持 P12 / PFX 或 zip 一键导入"
+                )
             } else {
                 ForEach(appState.certificates) { certificate in
                     certificateRow(certificate)
+                        .listRowInsets(EdgeInsets(top: 5, leading: 16, bottom: 5, trailing: 16))
+                        .listRowSeparator(.hidden)
+                        .listRowBackground(Color.clear)
                 }
                 .onDelete { indexSet in
                     // 快照待删证书再统一删除，避免循环内数组缩短导致删错/越界
@@ -101,18 +102,25 @@ struct CertificatesView: View {
                     }
                 }
             }
+        } header: {
+            sectionHeader(icon: "key.fill", title: "企业证书")
         }
     }
 
     private var profilesSection: some View {
-        Section("描述文件") {
+        Section {
             if appState.profiles.isEmpty {
-                Text("暂无描述文件，导入 zip 或单独导入 mobileprovision")
-                    .font(.subheadline)
-                    .foregroundColor(.secondary)
+                emptyCard(
+                    icon: "doc.badge.gearshape",
+                    title: "暂无描述文件",
+                    subtitle: "点击右上角「一键导入」\n支持 zip 或单独 mobileprovision"
+                )
             } else {
                 ForEach(appState.profiles) { profile in
                     profileRow(profile)
+                        .listRowInsets(EdgeInsets(top: 5, leading: 16, bottom: 5, trailing: 16))
+                        .listRowSeparator(.hidden)
+                        .listRowBackground(Color.clear)
                 }
                 .onDelete { indexSet in
                     // 快照待删描述文件再统一删除，避免循环内数组缩短导致删错/越界
@@ -125,40 +133,120 @@ struct CertificatesView: View {
                     }
                 }
             }
+        } header: {
+            sectionHeader(icon: "doc.badge.gearshape", title: "描述文件")
         }
     }
 
-    private func certificateRow(_ certificate: CertificateInfo) -> some View {
-        HStack {
-            Image(systemName: "lock.fill")
-                .foregroundColor(certificate.status == .valid ? .green : .red)
-
-            VStack(alignment: .leading, spacing: 4) {
-                Text(certificate.name.isEmpty ? "未命名证书" : certificate.name)
-                    .font(.headline)
-                Text("Team ID: \(certificate.teamID.isEmpty ? "未知" : certificate.teamID)")
-                    .font(.caption)
-                    .foregroundColor(.secondary)
-                Text("到期: \(certificate.expireDateDescription)")
-                    .font(.caption)
-                    .foregroundColor(.secondary)
-            }
-
-            Spacer()
-
-            // 默认选中态标记：与 SignOptionsView 的选中样式一致，让用户明确知道
-            // 「一键签名」默认使用哪张证书
-            if appState.selectedCertificate?.id == certificate.id {
-                Image(systemName: "checkmark.circle.fill")
-                    .foregroundColor(.accentColor)
-            }
-
-            Text(certificate.statusDescription)
+    /// Section 标题：左侧小图标 + 文字，与卡片化布局呼应，不再光秃秃一行字
+    private func sectionHeader(icon: String, title: String) -> some View {
+        HStack(spacing: 6) {
+            Image(systemName: icon)
                 .font(.caption)
-                .padding(.horizontal, 8)
-                .padding(.vertical, 4)
-                .background(certificate.status == .valid ? Color.green.opacity(0.2) : Color.red.opacity(0.2))
-                .cornerRadius(6)
+                .foregroundColor(.secondary)
+            Text(title)
+                .font(.subheadline.weight(.semibold))
+                .foregroundColor(.secondary)
+        }
+        .textCase(nil)
+        .padding(.vertical, 2)
+    }
+
+    /// 空态卡片：虚线圆角框，图标 + 主标题 + 引导文字，比单行灰字完整
+    private func emptyCard(icon: String, title: String, subtitle: String) -> some View {
+        VStack(spacing: 8) {
+            Image(systemName: icon)
+                .font(.system(size: 30))
+                .foregroundColor(.secondary.opacity(0.7))
+            Text(title)
+                .font(.subheadline.weight(.medium))
+                .foregroundColor(.secondary)
+            Text(subtitle)
+                .font(.caption)
+                .foregroundColor(.secondary.opacity(0.8))
+                .multilineTextAlignment(.center)
+        }
+        .frame(maxWidth: .infinity)
+        .padding(.vertical, 28)
+        .padding(.horizontal, 12)
+        .background(
+            RoundedRectangle(cornerRadius: 14, style: .continuous)
+                .stroke(Color.secondary.opacity(0.18), lineWidth: 0.8)
+        )
+        .listRowInsets(EdgeInsets(top: 5, leading: 16, bottom: 5, trailing: 16))
+        .listRowSeparator(.hidden)
+        .listRowBackground(Color.clear)
+    }
+
+    /// 卡片通用容器：半透明圆角底 + 细描边，与已签应用/下载页一致
+    private func cardContainer<Content: View>(@ViewBuilder content: () -> Content) -> some View {
+        content()
+            .padding(12)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(
+                RoundedRectangle(cornerRadius: 14, style: .continuous)
+                    .fill(Color(.secondarySystemGroupedBackground).opacity(0.85))
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: 14, style: .continuous)
+                    .stroke(Color.primary.opacity(0.06), lineWidth: 0.5)
+            )
+    }
+
+    private func certificateRow(_ certificate: CertificateInfo) -> some View {
+        cardContainer {
+            HStack(spacing: 12) {
+                // 图标底：有效/过期不同浅色，一眼看到状态
+                Image(systemName: "key.fill")
+                    .font(.system(size: 20, weight: .medium))
+                    .foregroundColor(certificate.status == .valid ? .green : (certificate.status == .expired ? .red : .secondary))
+                    .frame(width: 44, height: 44)
+                    .background(
+                        RoundedRectangle(cornerRadius: 11, style: .continuous)
+                            .fill((certificate.status == .valid ? Color.green : (certificate.status == .expired ? Color.red : Color.secondary)).opacity(0.14))
+                    )
+
+                VStack(alignment: .leading, spacing: 5) {
+                    HStack(spacing: 6) {
+                        Text(certificate.name.isEmpty ? "未命名证书" : certificate.name)
+                            .font(.headline)
+                            .foregroundColor(.primary)
+                            .lineLimit(1)
+
+                        // 默认选中态标记：与 SignOptionsView 的选中样式一致，
+                        // 让用户明确知道「一键签名」默认使用哪张证书
+                        if appState.selectedCertificate?.id == certificate.id {
+                            Image(systemName: "checkmark.circle.fill")
+                                .font(.caption)
+                                .foregroundColor(.accentColor)
+                        }
+                    }
+
+                    if !certificate.organization.isEmpty || !certificate.commonName.isEmpty {
+                        Label(
+                            certificate.organization.isEmpty ? certificate.commonName : certificate.organization,
+                            systemImage: "building.2"
+                        )
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                        .lineLimit(1)
+                    }
+
+                    Label("Team ID：\(certificate.teamID.isEmpty ? "未知" : certificate.teamID)", systemImage: "number")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+
+                    HStack(spacing: 6) {
+                        Label(dateSpanText(certificate.startDate, certificate.expireDate), systemImage: "calendar")
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                        Spacer()
+                        statusChip(certificate.statusDescription, isGood: certificate.status != .expired, expired: certificate.status == .expired)
+                    }
+                }
+
+                Spacer(minLength: 4)
+            }
         }
         .contentShape(Rectangle())
         .onTapGesture {
@@ -167,40 +255,92 @@ struct CertificatesView: View {
     }
 
     private func profileRow(_ profile: ProvisioningInfo) -> some View {
-        HStack {
-            Image(systemName: "doc.badge.gearshape")
-                .foregroundColor(profile.status == .valid ? .green : .red)
+        cardContainer {
+            HStack(spacing: 12) {
+                Image(systemName: "doc.badge.gearshape")
+                    .font(.system(size: 20, weight: .medium))
+                    .foregroundColor(profile.status == .valid ? .blue : (profile.status == .expired ? .red : .secondary))
+                    .frame(width: 44, height: 44)
+                    .background(
+                        RoundedRectangle(cornerRadius: 11, style: .continuous)
+                            .fill((profile.status == .valid ? Color.blue : (profile.status == .expired ? Color.red : Color.secondary)).opacity(0.14))
+                    )
 
-            VStack(alignment: .leading, spacing: 4) {
-                Text(profile.name.isEmpty ? "未命名描述文件" : profile.name)
-                    .font(.headline)
-                Text("Bundle ID: \(profile.bundleID.isEmpty ? "未知" : profile.bundleID)")
-                    .font(.caption)
-                    .foregroundColor(.secondary)
-                Text("到期: \(profile.expireDateDescription)")
-                    .font(.caption)
-                    .foregroundColor(.secondary)
+                VStack(alignment: .leading, spacing: 5) {
+                    HStack(spacing: 6) {
+                        Text(profile.name.isEmpty ? "未命名描述文件" : profile.name)
+                            .font(.headline)
+                            .foregroundColor(.primary)
+                            .lineLimit(1)
+
+                        // 默认选中态标记
+                        if appState.selectedProfile?.uuid == profile.uuid {
+                            Image(systemName: "checkmark.circle.fill")
+                                .font(.caption)
+                                .foregroundColor(.accentColor)
+                        }
+                    }
+
+                    Label("Bundle ID：\(profile.bundleID.isEmpty ? "未知" : profile.bundleID)", systemImage: "app.badge")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                        .lineLimit(1)
+
+                    if !profile.teamID.isEmpty {
+                        Label("Team ID：\(profile.teamID)", systemImage: "number")
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                    }
+
+                    Label(deviceScopeText(profile), systemImage: "iphone")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+
+                    HStack(spacing: 6) {
+                        Label(dateSpanText(profile.createdAt, profile.expireDate), systemImage: "calendar")
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                        Spacer()
+                        statusChip(profile.statusDescription, isGood: profile.status != .expired, expired: profile.status == .expired)
+                    }
+                }
+
+                Spacer(minLength: 4)
             }
-
-            Spacer()
-
-            // 默认选中态标记
-            if appState.selectedProfile?.uuid == profile.uuid {
-                Image(systemName: "checkmark.circle.fill")
-                    .foregroundColor(.accentColor)
-            }
-
-            Text(profile.statusDescription)
-                .font(.caption)
-                .padding(.horizontal, 8)
-                .padding(.vertical, 4)
-                .background(profile.status == .valid ? Color.green.opacity(0.2) : Color.red.opacity(0.2))
-                .cornerRadius(6)
         }
         .contentShape(Rectangle())
         .onTapGesture {
             appState.selectedProfile = profile
         }
+    }
+
+    /// 有效期范围文案："yyyy-MM-dd ~ yyyy-MM-dd"，缺失端显示"未知"
+    private func dateSpanText(_ start: Date?, _ end: Date?) -> String {
+        let f = DateFormatter()
+        f.dateFormat = "yyyy-MM-dd"
+        let startText = start.map { f.string(from: $0) } ?? "未知"
+        let endText = end.map { f.string(from: $0) } ?? "未知"
+        return "\(startText) ~ \(endText)"
+    }
+
+    /// 描述文件的设备范围：非空为限定设备数量，否则为企业分发通配
+    private func deviceScopeText(_ profile: ProvisioningInfo) -> String {
+        if profile.provisionedDevices.isEmpty {
+            return "不限设备（企业 / 通配）"
+        }
+        return "限定 \(profile.provisionedDevices.count) 台设备"
+    }
+
+    /// 状态胶囊：有效/无效统一浅色圆角底，与下载页 statusChip 同款
+    private func statusChip(_ text: String, isGood: Bool, expired: Bool) -> some View {
+        Text(text)
+            .font(.caption2.weight(.semibold))
+            .foregroundColor(expired ? .red : (isGood ? .green : .secondary))
+            .padding(.horizontal, 8)
+            .padding(.vertical, 3)
+            .background(
+                Capsule().fill((expired ? Color.red : (isGood ? Color.green : Color.secondary)).opacity(0.12))
+            )
     }
 
     private func handleImportedFile(_ url: URL) {

@@ -14,41 +14,69 @@ struct SettingsView: View {
     var body: some View {
         NavigationView {
             List {
-                Section("使用说明") {
-                    Label("本工具全部在本地完成签名", systemImage: "lock.shield.fill")
-                    Label("证书与私钥保存在系统 Keychain", systemImage: "key.fill")
+                Section {
+                    aboutRow
+                        .rowCard()
+                    localSigningRow
+                        .rowCard()
+                } header: {
+                    sectionHeader(icon: "sparkles", title: "功能亮点")
                 }
 
-                Section("自动流程") {
-                    Toggle("导入/下载后自动签名并安装", isOn: $autoSignAndInstall)
-                    Toggle("签名完成后自动返回桌面", isOn: $autoReturnHomeAfterSigning)
+                Section {
+                    toggleRow(
+                        icon: "arrow.triangle.2.circlepath",
+                        tint: .accentColor,
+                        title: "导入后自动签名",
+                        subtitle: "导入 IPA / 下载完成后立即自动签名并安装",
+                        isOn: $autoSignAndInstall
+                    )
+                    .rowCard()
+                    toggleRow(
+                        icon: "house",
+                        tint: .blue,
+                        title: "签名后自动返回桌面",
+                        subtitle: "签名完成并安装后自动回到桌面",
+                        isOn: $autoReturnHomeAfterSigning
+                    )
+                    .rowCard()
+                } header: {
+                    sectionHeader(icon: "gearshape", title: "自动流程")
                 }
 
-                Section("诊断与反馈") {
+                Section {
                     Button {
                         prepareReportForSharing()
                     } label: {
-                        Label("收集全部错误并导出", systemImage: "ant.circle")
+                        actionRow(
+                            icon: "ant.circle",
+                            tint: .red,
+                            title: "收集全部错误并导出",
+                            subtitle: "导出 ZIP / 签名 / 安装等失败原因，直接发送给开发者"
+                        )
                     }
-                    Text("导出 ZIP/签名/安装等失败原因，直接发送给开发者")
-                        .font(.footnote)
-                        .foregroundColor(.secondary)
+                    .rowCard()
+                } header: {
+                    sectionHeader(icon: "wrench.and.screwdriver", title: "诊断与反馈")
                 }
 
-                Section("关于") {
+                Section {
                     Button {
                         showAbout = true
                     } label: {
-                        HStack {
-                            Label("关于 IPA Manager", systemImage: "info.circle")
-                            Spacer()
-                            Image(systemName: "chevron.right")
-                                .font(.caption)
-                                .foregroundColor(.secondary)
-                        }
+                        actionRow(
+                            icon: "info.circle",
+                            tint: .green,
+                            title: "关于 IPA Manager",
+                            subtitle: "版本 \(Self.currentVersion)"
+                        )
                     }
+                    .rowCard()
+                } header: {
+                    sectionHeader(icon: "info.circle", title: "关于")
                 }
             }
+            .listStyle(.plain)
             .scrollContentBackground(.hidden)
             .navigationTitle("设置")
             .alert("IPA Manager", isPresented: $showAbout) {
@@ -71,6 +99,111 @@ struct SettingsView: View {
         // 毛玻璃背景：置于 NavigationView 外层，列表/空态/导航栏区域统一一个底色，
         // 列表已用 scrollContentBackground(.hidden) 透出其上的玻璃质感
         .background(GlassBackground().ignoresSafeArea())
+    }
+
+    // MARK: - 行组件（图标 + 标题 + 副标题，统一精致风格）
+
+    /// Section 标题：小图标 + 文字，避免光秃秃一行字
+    private func sectionHeader(icon: String, title: String) -> some View {
+        HStack(spacing: 6) {
+            Image(systemName: icon)
+                .font(.caption)
+                .foregroundColor(.secondary)
+            Text(title)
+                .font(.subheadline.weight(.semibold))
+                .foregroundColor(.secondary)
+        }
+        .textCase(nil)
+    }
+
+    /// 带开关的行：图标瓦片 + 标题 + 副标题 + 开关
+    private func toggleRow(icon: String, tint: Color, title: String, subtitle: String, isOn: Binding<Bool>) -> some View {
+        HStack(spacing: 12) {
+            iconTile(icon: icon, tint: tint)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(title)
+                    .font(.subheadline)
+                    .foregroundColor(.primary)
+                Text(subtitle)
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+                    .lineLimit(1)
+            }
+            Spacer()
+            Toggle("", isOn: isOn)
+                .labelsHidden()
+        }
+        .padding(.vertical, 4)
+    }
+
+    /// 可点击的行：图标瓦片 + 标题 + 副标题
+    private func actionRow(icon: String, tint: Color, title: String, subtitle: String) -> some View {
+        HStack(spacing: 12) {
+            iconTile(icon: icon, tint: tint)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(title)
+                    .font(.subheadline)
+                    .foregroundColor(.primary)
+                Text(subtitle)
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+            }
+            Spacer()
+            Image(systemName: "chevron.right")
+                .font(.caption)
+                .foregroundColor(.secondary)
+        }
+        .padding(.vertical, 4)
+    }
+
+    /// 圆角浅色底图标瓦片
+    private func iconTile(icon: String, tint: Color) -> some View {
+        Image(systemName: icon)
+            .font(.system(size: 17, weight: .medium))
+            .foregroundColor(tint)
+            .frame(width: 36, height: 36)
+            .background(
+                RoundedRectangle(cornerRadius: 9, style: .continuous)
+                    .fill(tint.opacity(0.13))
+            )
+    }
+
+    private var aboutRow: some View {
+        HStack(spacing: 12) {
+            iconTile(icon: "iphone.gen3", tint: .accentColor)
+            VStack(alignment: .leading, spacing: 2) {
+                Text("IPA 本地签名工具")
+                    .font(.subheadline)
+                    .foregroundColor(.primary)
+                Text("全程在设备本地完成，不上传任何文件")
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+            }
+            Spacer()
+            Image(systemName: "checkmark.seal.fill")
+                .font(.caption)
+                .foregroundColor(.green)
+        }
+        .padding(.vertical, 4)
+    }
+
+    private var localSigningRow: some View {
+        HStack(spacing: 12) {
+            iconTile(icon: "lock.shield.fill", tint: .orange)
+            VStack(alignment: .leading, spacing: 2) {
+                Text("证书安全存储")
+                    .font(.subheadline)
+                    .foregroundColor(.primary)
+                Text("证书与私钥保存在系统 Keychain")
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+            }
+            Spacer()
+            Image(systemName: "key.fill")
+                .font(.caption)
+                .foregroundColor(.secondary)
+        }
+        .padding(.vertical, 4)
     }
 
     /// 当前安装包的真实版本号（读 Info.plist 的 CFBundleShortVersionString + CFBundleVersion，
@@ -102,4 +235,26 @@ struct SettingsView: View {
 private struct ShareItem: Identifiable {
     let id = UUID()
     let url: URL
+}
+
+/// 设置页行卡片容器：与其他页面统一——半透明圆角底 + 细描边 + 行间留白，
+/// 透出 GlassBackground 毛玻璃质感，不再是一格格系统默认圆角分组
+private extension View {
+    func rowCard() -> some View {
+        self
+            .padding(.horizontal, 12)
+            .padding(.vertical, 8)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(
+                RoundedRectangle(cornerRadius: 14, style: .continuous)
+                    .fill(Color(.secondarySystemGroupedBackground).opacity(0.85))
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: 14, style: .continuous)
+                    .stroke(Color.primary.opacity(0.06), lineWidth: 0.5)
+            )
+            .listRowInsets(EdgeInsets(top: 5, leading: 16, bottom: 5, trailing: 16))
+            .listRowSeparator(.hidden)
+            .listRowBackground(Color.clear)
+    }
 }
