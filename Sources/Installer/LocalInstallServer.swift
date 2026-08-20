@@ -76,15 +76,20 @@ final class LocalInstallServer {
 
     private func respond(request: String, connection: NWConnection) {
         let path = requestPath(from: request)
-        Logger.debug("本地服务器请求: \(path)")
+        // 用 INFO 级别记录请求路径：诊断报告只包含 ERROR/INFO，debug 级日志看不到，
+        // 无法判断 SpringBoard 是否真的连上了本地服务器、请求了哪个路径。
+        Logger.info("本地服务器收到请求: \(path) (来自 \(connection.endpoint.debugDescription))")
 
         if path == "/manifest.plist" {
             let manifest = manifestData ?? Data()
+            Logger.info("响应 manifest.plist: \(manifest.count) 字节")
             let response = httpResponse(status: 200, contentType: "application/xml", body: manifest)
             sendAndClose(response, connection: connection)
         } else if path.hasSuffix(".ipa") {
+            Logger.info("开始流式发送 IPA: \(servingIPA?.lastPathComponent ?? "unknown")")
             streamIPA(connection: connection)
         } else {
+            Logger.info("未知路径 404: \(path)")
             let response = httpResponse(status: 404, contentType: "text/plain", body: Data("Not found".utf8))
             sendAndClose(response, connection: connection)
         }
