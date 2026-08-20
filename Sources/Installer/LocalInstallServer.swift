@@ -13,24 +13,15 @@ final class LocalInstallServer {
         stop()
 
         let port = UInt16.random(in: 49152...65535)
-        // 用 HTTPS：Apple 企业部署文档要求 itms-services 的 manifest URL 必须是 HTTPS，
-        // iOS 27 系统安装器会直接拒绝 http://127.0.0.1 明文（1.0.50 日志显示请求根本没
-        // 到达服务器——不是响应问题，是 URL 协议被系统层拦截）。
-        // 本服务器使用 iPhone Distribution 证书的 TLS 身份（已由传统 p12 重打包修复，
-        // 证书由 Apple 根签发、系统信任），SpringBoard 可完成握手并下载 manifest/ipa。
-        // 传输全程在 127.0.0.1 回环内，数据不出设备。
-        let identityProvider = ServerIdentityProvider.shared
-        // currentCertKey 是 private(set)，读不到；统一用暴露的 tlsOptions() 判断——它内部
-        // 优先 currentIdentity、其次 currentCertKey，无身份时返回空 options（无证书）。
-        let tls = identityProvider.tlsOptions()
-        let hasTLSIdentity = tls.securityProtocolOptions != nil && identityProvider.hasIdentity
-        let parameters: NWParameters
-        if hasTLSIdentity {
-            parameters = NWParameters(tls: tls)
-        } else {
-            parameters = NWParameters.tcp
-            Logger.warning("TLS 身份不可用，回退明文 HTTP")
-        }
+        // 用明文 HTTP 回环：AltStore（开源、iOS 本地安装的业界标准）就是用
+        // http://127.0.0.1:端口/manifest.plist + itms-services 成功安装，整个
+        // iOS 版本线都可用，http 不会被系统拒绝（Apple 文档推荐 https 但不是强制）。
+        //
+        // 为什么不用 https：iPhone Distribution 证书的 Extended Key Usage 只有
+        // codeSigning、没有 serverAuth，系统安装进程验证服务器证书时直接拒绝，
+        // TLS 握手失败 → 连接看似"没到达"（1.0.52 实测：TLS=true 但无任何请求日志）。
+        // 127.0.0.1 回环流量不出设备，明文无泄露风险，且不依赖证书信任。
+        let parameters = NWParameters.tcp
         parameters.allowLocalEndpointReuse = true
         parameters.requiredInterfaceType = .loopback
 
@@ -63,11 +54,11 @@ final class LocalInstallServer {
         if waitResult != .success {
             Logger.error("本地服务器 5 秒内未就绪，安装可能失败")
         }
-        Logger.info("本地安装服务器已启动: 127.0.0.1:\(port) (TLS=\(hasTLSIdentity))")
+        Logger.info("本地安装服务器已启动: 127.0.0.1:\(port) (协议=HTTP明文)")
         // itms-services 打开后 App 将立即退到后台：启动静音音频保活，
         // 让进程不被挂起，SpringBoard 才能连上本地服务器下载 manifest/ipa 。
         BackgroundAudioKeepAlive.shared.start()
-        return URL(string: "https://127.0.0.1:\(port)")!
+        return URL(string: "http://127.0.0.1:\(port)")!
     }
 
     func cacheManifest(_ data: Data) {
@@ -91,6 +82,25 @@ final class LocalInstallServer {
 
     private func handleConnection(_ connection: NWConnection) {
         connections.append(connection)
+        // 关键诊断分界线：newConnectionHandler 在 TCP accept 时触发，此时 TLS 握手尚未开始。
+        // 加这条日志可以区分：TCP 连接到底到没到服务器——
+        // 有"收到新连接" → 说明网络可达，问题在 TLS 握手/证书；
+        // 没有 → 说明 SpringBoard 根本没连过来（URL 被系统拦截 / 后台监听被挂起）。
+        Logger.info("本地服务器收到新连接: \(connection.endpoint.debugDescription)")
+        connection.stateUpdateHandler = { [weak self] state in
+            guard let self = self else { return }
+            switch state {
+            case .ready:
+                Logger.info("本地服务器连接就绪 (.ready) — TLS 握手成功")
+            case .failed(let error):
+                Logger.error("本地服务器连接失败: \(error.localizedDescription)")
+                self.connections.removeAll { $0 === connection }
+            case .cancelled:
+                self.connections.removeAll { $0 === connection }
+            default:
+                break
+            }
+        }
         connection.start(queue: ServerQueue.shared.queue)
 
         connection.receive(minimumIncompleteLength: 1, maximumLength: 8192) { [weak self] data, _, isComplete, error in
