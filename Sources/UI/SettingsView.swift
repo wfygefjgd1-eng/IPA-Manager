@@ -2,8 +2,8 @@ import SwiftUI
 
 struct SettingsView: View {
     @State private var showAbout = false
-    @State private var reportFileURL: URL?
-    @State private var showShare = false
+    /// 诊断报告临时文件（写入成功后再赋值为非 nil，触发分享 sheet）
+    @State private var shareItem: ShareItem?
 
     var body: some View {
         NavigationView {
@@ -44,10 +44,10 @@ struct SettingsView: View {
             } message: {
                 Text("本地 IPA 签名与管理工具\n版本 1.0\n所有签名均在设备本地完成，不上传任何文件")
             }
-            .sheet(isPresented: $showShare) {
-                if let url = reportFileURL {
-                    ShareSheet(items: [url])
-                }
+            // 用 sheet(item:) 绑定 URL，避免旧实现“isPresented + sheet 内 if let”的时序问题：
+            // 之前表现为“第一次点击分享是空白的，要返回再点才弹出”。
+            .sheet(item: $shareItem) { item in
+                ShareSheet(items: [item.url])
             }
         }
     }
@@ -60,10 +60,16 @@ struct SettingsView: View {
             .appendingPathComponent("IPA-Manager-诊断报告-\(Int(Date().timeIntervalSince1970)).txt")
         do {
             try report.write(to: tempURL, atomically: true, encoding: .utf8)
-            reportFileURL = tempURL
-            showShare = true
+            // 写成功后赋值为非 nil 才弹 sheet，避免分享空内容
+            shareItem = ShareItem(url: tempURL)
         } catch {
             Logger.error("诊断报告写入失败: \(error.localizedDescription)")
         }
     }
+}
+
+/// 包装 URL 使其满足 Identifiable，供 .sheet(item:) 绑定。
+private struct ShareItem: Identifiable {
+    let id = UUID()
+    let url: URL
 }

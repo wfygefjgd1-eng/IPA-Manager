@@ -156,15 +156,33 @@ struct HomeView: View {
     }
 
     private func handleImportedFile(_ url: URL) {
+        let isZip = (url.pathExtension.lowercased() == "zip")
         appState.importFile(from: url) { importResult in
             switch importResult {
             case .success(let app):
-                self.alertMessage = "已导入: \(app.name) (\(app.version))"
+                // 导入成功且是应用（bundleID 非空）→ 自动打开签名详情页，不再弹“已导入”提示
+                guard !app.bundleID.isEmpty else {
+                    self.alertMessage = "导入成功，但无法识别该应用的 Bundle ID"
+                    self.showAlert = true
+                    return
+                }
+                self.selectedApp = app
             case .failure(let error):
-                self.alertMessage = error.localizedDescription
+                self.alertMessage = isZip
+                    ? self.zipImportFailureMessage(error.localizedDescription)
+                    : error.localizedDescription
+                self.showAlert = true
             }
-            self.showAlert = true
         }
+    }
+
+    /// zip 导入失败时给出更贴合用户的中文提示：含 .app/.ipa 才是应用包；
+    /// 否则（如证书包 zip）提示去证书页导入，而不是把底层解析错误直接抛给用户。
+    private func zipImportFailureMessage(_ detail: String) -> String {
+        if detail.contains("未找到 .app") {
+            return "该 ZIP 不含应用（无 .app/.ipa），可能是证书包，请到证书页导入。\n\(detail)"
+        }
+        return detail
     }
 }
 

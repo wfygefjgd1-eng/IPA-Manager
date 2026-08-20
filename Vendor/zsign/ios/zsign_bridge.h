@@ -46,6 +46,12 @@ int zsign_p12_export_identity(const char* p12Path, const char* password,
                               unsigned char** outKeyDER,  int* outKeyLen,
                               int* outIsRSA, int* outKeyFormat);
 
+// 把 p12 中的证书+私钥重新打包成"传统加密"的 p12（PBE-SHA1-3DES/RC2-40），
+// 供 iOS SecPKCS12Import 直接导入。成功返回 0，失败返回 -1（g_lastError 有详情）。
+// outLegacyPath 由调用方提供缓冲区（PATH_MAX），须先填入目标文件路径；
+// 内部按 outPathLen 用 snprintf 确保不越界；不分配长生命周期内存。
+int zsign_p12_recreate_legacy(const char* p12Path, const char* password, char* outLegacyPath, int outPathLen);
+
 const char* zsign_last_error(void);
 
 #ifdef __cplusplus

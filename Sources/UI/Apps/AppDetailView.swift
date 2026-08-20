@@ -146,6 +146,20 @@ struct AppDetailView: View {
 
     private var actionButtons: some View {
         VStack(spacing: 12) {
+            // 签名主操作：直接使用默认选中的有效证书 + 描述文件 + “签名后自动安装”开关一键签名并安装；
+            // 默认证书/描述文件缺失或无效时才退回可选面板（SignOptionsView）。
+            Button {
+                startSigningWithDefaults()
+            } label: {
+                Label(liveApp.isSigned ? "重新签名并安装" : "开始签名并安装", systemImage: "pencil.circle.fill")
+                    .frame(maxWidth: .infinity)
+            }
+            .buttonStyle(.borderedProminent)
+            .disabled(isSigning
+                      || appState.certificates.isEmpty
+                      || appState.profiles.isEmpty
+                      || !FileManager.default.fileExists(atPath: liveApp.path))
+
             if liveApp.isSigned {
                 Button {
                     showInstallCertificatePicker = true
@@ -153,18 +167,9 @@ struct AppDetailView: View {
                     Label("安装", systemImage: "arrow.down.circle.fill")
                         .frame(maxWidth: .infinity)
                 }
-                .buttonStyle(.borderedProminent)
+                .buttonStyle(.bordered)
                 .disabled(isSigning)
             }
-
-            Button {
-                showSignOptions = true
-            } label: {
-                Label(liveApp.isSigned ? "重新签名" : "签名", systemImage: "pencil.circle.fill")
-                    .frame(maxWidth: .infinity)
-            }
-            .buttonStyle(.bordered)
-            .disabled(isSigning || appState.certificates.isEmpty || appState.profiles.isEmpty)
 
             Button {
                 showShareSheet = true
@@ -185,6 +190,21 @@ struct AppDetailView: View {
             .buttonStyle(.bordered)
             .foregroundColor(.red)
             .disabled(isSigning)
+        }
+    }
+
+    /// 一键签名并安装：默认选中的有效证书 + 描述文件（且仍在证书/描述文件列表中）+ AppStorage
+    /// installAfterSigning（默认 true，未设置过时按 true 处理）直接签名并安装；
+    /// 默认证书/描述文件缺失或无效时退回 SignOptionsView 让用户手动选择。
+    private func startSigningWithDefaults() {
+        if let cert = appState.selectedCertificate, cert.status == .valid,
+           let profile = appState.selectedProfile, profile.status == .valid,
+           appState.certificates.contains(where: { $0.id == cert.id }),
+           appState.profiles.contains(where: { $0.id == profile.id }) {
+            let installAfter = (UserDefaults.standard.object(forKey: "installAfterSigning") as? Bool) ?? true
+            startSigning(certificate: cert, profile: profile, installAfter: installAfter)
+        } else {
+            showSignOptions = true   // fallback 让用户选
         }
     }
 

@@ -219,16 +219,28 @@ final class AppState: ObservableObject {
             }
         }
 
-        let destination = fileManager.directoryURL(.ipa).appendingPathComponent(url.lastPathComponent)
         DispatchQueue.global(qos: .userInitiated).async {
+            // destination 声明在 do 外，便于解析失败时清理可能残留的半成品文件
+            var destination = fileManager.directoryURL(.ipa).appendingPathComponent(url.lastPathComponent)
             do {
-                // 转换得到的 .ipa 已直接输出到 .ipa 目录（url 即 destination），跳过复制，避免删掉源文件
-                if url.path != destination.path {
+                // zip 输入先统一转换为标准 .ipa（含内嵌 .ipa 提取、.app 重打包为 Payload）：
+                // 入库后 app.path 一定指向可签名的 .ipa。不含 .app/.ipa 的 zip（如证书包）
+                // 会在转换时抛“未找到 .app 应用包”，由上层给用户明确提示，不会入库。
+                let importURL: URL
+                if url.pathExtension.lowercased() == "zip" {
+                    importURL = try self.parser.convertToIPAIfNeeded(fileURL: url)
+                } else {
+                    importURL = url
+                }
+                destination = fileManager.directoryURL(.ipa).appendingPathComponent(importURL.lastPathComponent)
+
+                // 转换得到的 .ipa 已直接输出到 .ipa 目录（importURL 即 destination），跳过复制，避免删掉源文件
+                if importURL.path != destination.path {
                     // 目标已存在（重复导入同名文件）时先移除，再用新文件覆盖
                     if FileManager.default.fileExists(atPath: destination.path) {
                         try FileManager.default.removeItem(at: destination)
                     }
-                    try self.fileManager.copyItem(from: url, to: destination)
+                    try self.fileManager.copyItem(from: importURL, to: destination)
                 }
                 var app = try self.parser.parseAppInfo(fileURL: destination)
                 app.path = destination.path
@@ -243,7 +255,7 @@ final class AppState: ObservableObject {
                 }
             } catch {
                 DispatchQueue.main.async {
-                    // 复制成功但解析失败时，清理可能残留的半成品文件
+                    // 复制/解析失败时，清理可能残留的半成品文件
                     if FileManager.default.fileExists(atPath: destination.path) {
                         try? FileManager.default.removeItem(at: destination)
                     }
@@ -517,22 +529,31 @@ final class AppState: ObservableObject {
         return fallback
     }
 
-    /// 把签名 IPA 解压出的图标复制到稳定位置 Extracted/<baseName>/<标识>-icon.<ext>，
+    /// 把签名 IPA 解压出的图标复制到稳定位置 Extracted/Icons/<baseName>/<标识>-icon.<ext>，
     /// 避免后续解析清理解压目录后图标路径失效。复制失败返回 nil（调用方保留原路径兜底）。
     private func persistInstalledAppIcon(from iconPath: String, baseName: String, app: AppInfo) -> String? {
         let source = URL(fileURLWithPath: iconPath)
         var label = app.bundleID.isEmpty ? app.name : app.bundleID
-        // 文件名安全化：bundleID 一般只含字母数字点横线；显示名可能含 / : 等非法字符
-        label = label.replacingOccurrences(of: "/", with: "-")
-            .replacingOccurrences(of: ":", with: "-")
+        // 文件名安全化：只保留字母数字与 ._-（bundleID/显示名里的 / : \ * ? 等全部替换），
+        // 避免 copyItem 因非法字符失败导致图标路径退回易失效的临时目录。
+        let allowed = CharacterSet.alphanumerics.union(CharacterSet(charactersIn: "._-"))
+        label = String(label.unicodeScalars.map { scalar -> Character in
+            allowed.contains(scalar) ? Character(scalar) : "-"
+        })
         if label.isEmpty { label = baseName }
         let fileName = "\(label)-icon.\(source.pathExtension.lowercased())"
+        // 注意：不能把图标写回 Extracted/<baseName>/ —— 这正是每次 parse 时
+        // ZipManager.unzip 会整体删除重建的目录（图标“稳定路径”必须位于其之外）。
+        // Extracted/Icons/<baseName>/ 不会被任何 unzip 清理，才是真正稳定。
         let target = fileManager.directoryURL(.extracted)
+            .appendingPathComponent("Icons", isDirectory: true)
             .appendingPathComponent(baseName, isDirectory: true)
             .appendingPathComponent(fileName)
         do {
-            // AppFileManager.copyItem 会先移除已存在的同名目标，重复刷新安全
+            // AppFileManager.copyItem 会先创建父目录（Extracted/Icons/<baseName>/）、
+            // 再移除已存在的同名目标，重复刷新安全
             try fileManager.copyItem(from: source, to: target)
+            Logger.info("已签名应用图标持久化成功: \(target.path)")
             return target.path
         } catch {
             Logger.warning("已签名应用图标持久化失败: \(fileName) - \(error.localizedDescription)")

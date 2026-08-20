@@ -49,11 +49,14 @@ final class ServerIdentityProvider {
         }
 
         // OpenSSL 3 的 PBES2/AES 新式 p12 系统导入器不支持（status != errSecSuccess），
-        // 改用 OpenSSL 直接导出证书/私钥 DER 构造 TLS 身份。
-        // 两条子路径（SecKeyCreateWithData 直连 / Keychain 兜底读回）都设置 currentCertKey，
-        // 并清除可能残留的 identity（身份只来自上面的系统导入器快路径）。
-        _ = try loadIdentityViaOpenSSL(p12URL: p12URL, password: password)
-        currentIdentity = nil
+        // 改用 OpenSSL 回退：三条子路径——SecKeyCreateWithData 直连 / Keychain 兜底
+        // （成功都设置 currentCertKey）、传统加密 p12 重打包后 SecPKCS12Import
+        // （成功设置 currentIdentity）。loadIdentityViaOpenSSL 返回 false 仅表示直连构造成功
+        // （currentCertKey 已设置），此时清除可能残留的 identity；Keychain / 传统 p12 路径
+        // 返回 true，内部已设置好各自的身份状态，不能在这里统一清掉。
+        if !loadIdentityViaOpenSSL(p12URL: p12URL, password: password) {
+            currentIdentity = nil
+        }
         Logger.info("已通过 OpenSSL 设置本地服务器 TLS 身份")
     }
 
@@ -74,7 +77,8 @@ final class ServerIdentityProvider {
     }
 
     /// OpenSSL 回退：从 p12 导出证书 DER + 私钥 DER，再交给 Security framework 构造 TLS 身份。
-    /// 成功时 currentCertKey 已设置（两条子路径都指向 cert + key 直连构造）。
+    /// 成功时 currentCertKey 或 currentIdentity 已设置（三条子路径：SecKeyCreateWithData 直连 /
+    /// Keychain 兜底 / 传统加密 p12 重打包后走 SecPKCS12Import）。
     @discardableResult
     private func loadIdentityViaOpenSSL(p12URL: URL, password: String) throws -> Bool {
         Logger.info("开始 OpenSSL 导出证书/私钥 DER")
@@ -148,15 +152,20 @@ final class ServerIdentityProvider {
         Logger.info("尝试 SecKeyCreateWithData 直连构造私钥 (isRSA=\(isRSA) keyLen=\(keyLen) keyFormat=\(formatDesc) keySizeInBits=\(keySizeInBitsApplied))")
         guard let key = SecKeyCreateWithData(keyData as CFData, keyAttributes as CFDictionary, nil) else {
             // 私钥直连构造失败（iOS 对非同构的 PKCS#8 或其他格式可能挑剔）：
-            // 先尝试 Keychain 兜底（证书+私钥配对成 SecIdentity），兜底也失败才抛错。
+            // 先尝试 Keychain 兜底（证书+私钥配对成 SecIdentity），兜底也失败则走最后一招：
+            // 用 OpenSSL 把原 p12 重打包成"传统加密" p12（PBE-SHA1-3DES/RC2-40，iOS 原生支持），
+            // 再交给 SecPKCS12Import 导入，得到真正配对的 SecIdentity。
             Logger.error("SecKeyCreateWithData 失败 (isRSA=\(isRSA) keyLen=\(keyLen) keyFormat=\(formatDesc) keySizeInBits=\(keySizeInBitsApplied))，尝试 Keychain 导入兜底")
             if loadIdentityViaKeychain(cert: cert, keyData: keyData, isRSA: isRSA != 0) {
                 return true
             }
-            // Keychain 兜底每一步的 status 与阶段已在上方 Logger 记录；最终抛出的文案面向用户，
+            if loadIdentityViaLegacyP12(p12URL: p12URL, password: password) {
+                return true
+            }
+            // 各条兜底路径的 status 与阶段已在上方 Logger 记录；最终抛出的文案面向用户，
             // 完整诊断以诊断报告中的日志为准。
-            Logger.error("SecKeyCreateWithData 与 Keychain 兜底均失败：无法加载私钥（详见上面各阶段 status 日志）")
-            throw AppError.installFailed("无法加载证书私钥（系统拒绝该私钥格式，Keychain 兜底亦失败，详见诊断日志）")
+            Logger.error("SecKeyCreateWithData、Keychain 兜底与传统 p12 重打包均失败：无法加载私钥（详见上面各阶段 status 日志）")
+            throw AppError.installFailed("无法加载证书私钥（系统拒绝该私钥格式，Keychain 兜底与传统 p12 重打包均失败，详见诊断日志）")
         }
 
         currentCertKey = (cert: cert, key: key)
@@ -242,6 +251,76 @@ final class ServerIdentityProvider {
         currentIdentity = nil
         ServerIdentityProvider.lastFallbackLabel = label
         Logger.info("Keychain 兜底成功：证书 + 私钥直连构造 TLS 身份（sec_identity_create_with_certificates）")
+        return true
+    }
+
+    /// 最后一招：用 OpenSSL 把原 p12 中的证书+私钥重打包成"传统加密" p12
+    /// （PBE-SHA1-3DES/RC2-40，iOS SecPKCS12Import 原生支持的格式），写临时文件后走与
+    /// 快路径完全相同的 SecPKCS12Import 导入，得到的 SecIdentity 证书与私钥天然配对。
+    /// 成功返回 true 并设置 currentIdentity；失败只记日志（含 zsign_last_error 与
+    /// SecPKCS12Import status），不抛错；临时文件无论成败都由 defer 删除。
+    private func loadIdentityViaLegacyP12(p12URL: URL, password: String) -> Bool {
+        let legacyPath = NSTemporaryDirectory() + "legacy-\(UUID().uuidString).p12"
+        var pathBuf = Array(legacyPath.utf8CString)
+
+        // 目标文件路径由调用方填入 pathBuf，C 侧还会按 outPathLen 用 snprintf 回写
+        // （保证缓冲区内以 \0 结尾、不越界）；defer 保证无论成败都删除临时文件。
+        var outURL: URL?
+        defer {
+            if let url = outURL {
+                try? FileManager.default.removeItem(at: url)
+            }
+        }
+
+        let result = p12URL.path.withCString { p12Path in
+            password.withCString { pwd in
+                zsign_p12_recreate_legacy(p12Path, pwd, &pathBuf, Int32(pathBuf.count))
+            }
+        }
+
+        var cError = ""
+        if let errPtr = zsign_last_error() {
+            cError = String(cString: errPtr)
+        }
+
+        guard result == 0 else {
+            Logger.error("传统 p12 重打包失败(result=\(result)): \(cError)")
+            return false
+        }
+
+        let outPath = String(cString: pathBuf)
+        guard FileManager.default.fileExists(atPath: outPath) else {
+            Logger.error("传统 p12 文件不存在: \(outPath) (\(cError))")
+            return false
+        }
+        outURL = URL(fileURLWithPath: outPath)
+
+        guard let data = try? Data(contentsOf: URL(fileURLWithPath: outPath)) else {
+            Logger.error("传统 p12 读取失败: \(outPath) (\(cError))")
+            return false
+        }
+
+        // 与 setIdentity 快路径完全一致的解析：SecPKCS12Import 成功即拿到真正配对的 SecIdentity
+        let options: [String: Any] = [
+            kSecImportExportPassphrase as String: password
+        ]
+        var items: CFArray?
+        let status = SecPKCS12Import(data as CFData, options as CFDictionary, &items)
+        guard status == errSecSuccess, let array = items as? [[String: Any]], let first = array.first else {
+            Logger.error("传统 p12 SecPKCS12Import 失败(status=\(status)): \(cError)")
+            return false
+        }
+        guard let rawIdentity = first[kSecImportItemIdentity as String],
+              CFGetTypeID(rawIdentity as CFTypeRef) == SecIdentityGetTypeID() else {
+            Logger.error("传统 p12 导入结果中未找到 SecIdentity 身份")
+            return false
+        }
+
+        let identity = rawIdentity as! SecIdentity
+        currentIdentity = identity
+        currentCertKey = nil
+        exportToKeychainOnce(identity: identity)
+        Logger.info("传统 p12 重打包成功：SecPKCS12Import 导入得到 SecIdentity（证书与私钥天然配对）")
         return true
     }
 
