@@ -42,7 +42,16 @@ final class DownloadManager: NSObject {
         }
     }
 
+    /// 无 Referer 版本（保持旧行为）：转发给带 referer 的重载，referer 传 nil，
+    /// 供非浏览器入口（外部链接/深链等）调用，不附加 Referer 头。
     func startDownload(urlString: String, completion: @escaping (DownloadTask) -> Void) {
+        startDownload(urlString: urlString, referer: nil, completion: completion)
+    }
+
+    /// 浏览器下载入口：可选携带 Referer（防盗链站点缺 Referer 会拒绝对接）。
+    /// 任务创建/持久化逻辑与旧版完全一致，仅把 downloadTask(with: URL)
+    /// 换成 downloadTask(with: URLRequest) 以便附加 Referer 头。
+    func startDownload(urlString: String, referer: String?, completion: @escaping (DownloadTask) -> Void) {
         var task = DownloadTask()
         task.url = urlString
 
@@ -58,7 +67,13 @@ final class DownloadManager: NSObject {
         task.fileName = Self.sanitizeFileName(url.lastPathComponent)
         task.status = .downloading
 
-        let sessionTask = session.downloadTask(with: url)
+        var request = URLRequest(url: url)
+        // 防盗链：请求携带来源页面 URL 作 Referer（浏览器入口传入当前页面地址）
+        if let referer = referer, !referer.isEmpty {
+            request.setValue(referer, forHTTPHeaderField: "Referer")
+        }
+
+        let sessionTask = session.downloadTask(with: request)
         // O(1) 回调查找：把任务 id 写入 taskDescription，避免进度回调线性扫描 tasks
         sessionTask.taskDescription = task.id.uuidString
         taskModels[task.id] = task
@@ -75,6 +90,14 @@ final class DownloadManager: NSObject {
     }
 
     func resumeDownload(id: UUID) {
+        // 无活跃 sessionTask（如“暂停后重启”恢复的任务只恢复了模型、未建 sessionTask）：
+        // 先按 rebuildTask 重建（有 resumeData 断点续传，否则整包重下），再恢复下载。
+        if tasks[id] == nil {
+            guard var model = taskModels[id] else { return }
+            rebuildTask(&model)
+            persistTasks()
+            return
+        }
         tasks[id]?.resume()
         taskModels[id]?.status = .downloading
         persistTasks()
@@ -107,8 +130,9 @@ final class DownloadManager: NSObject {
 
     /// 启动时从 UserDefaults 恢复上次保存的下载任务。
     /// - completed：校验 `destinationPath` 文件是否仍存在；不存在 → 标记 failed「文件已丢失」。
-    /// - downloading/paused：有 resumeData 则重建 sessionTask 续传；否则降级为 failed
-    ///   并提示“应用重启导致下载中断”的明确错误，避免任务在 UI 上永久“下载中」卡死。
+    /// - downloading：重建 sessionTask 续传（有 resumeData 断点续传，否则整包重下）。
+    /// - paused：暂停是用户显式意图——只恢复模型展示（status 保持 .paused、不建
+    ///   sessionTask），绝不悄悄恢复下载；用户点“继续”时由 resumeDownload 按需重建。
     /// - failed / 其它：原样恢复到 taskModels 展示。
     func restoreSavedTasks() {
         let saved = store.loadDownloadTasks()
@@ -126,9 +150,13 @@ final class DownloadManager: NSObject {
                     task.error = "文件已丢失"
                     taskModels[task.id] = task
                 }
-            case .downloading, .paused:
+            case .downloading:
                 // 重建活跃下载：默认会话优先级低，用后台 URLSession 续传或重新下载
                 rebuildTask(&task)
+            case .paused:
+                // 保持暂停：只恢复模型（tasks[id] 保持 nil），
+                // 用户点“继续”时 resumeDownload 会重建 sessionTask 再 resume。
+                taskModels[task.id] = task
             default:
                 // failed / waiting：原样恢复展示
                 taskModels[task.id] = task
@@ -225,15 +253,19 @@ final class DownloadManager: NSObject {
                     try? AppFileManager.shared.deleteItem(at: destination)
                     retryableFailure = true
                 case .other:
-                    updated.status = .failed
+                    // 非 zip 且非 HTML 的完整下载（.tar/.apk/.tar.gz 等）按 completed 收尾：
+                    // 任务显示完成，是否可导入交给自动导入环节给出中文原因——这里不应把
+                    // 完整下载误判为“损坏”。只有确证截断（已知总大小且实际收到更少）才判
+                    // failed 并自动重下；截断文件删掉，避免把坏文件留在下载目录。
                     if updated.totalBytes > 0 && updated.receivedBytes < updated.totalBytes {
+                        updated.status = .failed
                         updated.error = "下载不完整，文件可能损坏"
+                        Logger.error("下载校验失败: \(updated.error ?? "")")
+                        try? AppFileManager.shared.deleteItem(at: destination)
+                        retryableFailure = true
                     } else {
-                        updated.error = "下载的文件无法识别，可能已损坏"
+                        updated.status = .completed
                     }
-                    Logger.error("下载校验失败: \(updated.error ?? "")")
-                    try? AppFileManager.shared.deleteItem(at: destination)
-                    retryableFailure = true
                 }
             } catch {
                 updated.status = .failed
@@ -412,11 +444,32 @@ extension DownloadManager: URLSessionDownloadDelegate {
         // NSURLErrorCancelled 是 cancel() 的必然回调，模型不存在时直接丢弃。
         guard taskModels[id] != nil else { return }
 
-        // 保存断点续传数据：进程被杀/网络中断后，恢复时可用 resumeData 续传
+        let nsError = error as NSError
         var updated = taskModels[id] ?? DownloadTask()
-        if let resumeData = (error as NSError).userInfo[NSURLSessionDownloadTaskResumeData] as? Data {
+        if let resumeData = nsError.userInfo[NSURLSessionDownloadTaskResumeData] as? Data {
             updated.resumeData = resumeData
         }
+
+        // 断点续传失败整包兜底：续传最常见的失败是服务器不支持 Range / 会话失效 /
+        // resumeData 损坏，此时旧 resumeData 已“毒化”，恢复时必然再次失败。
+        // 未超重试上限时清空 resumeData 并整包重下（复用 retryDownload，内部
+        // retryCounts 计数），防止死循环；超限则按普通失败收尾。
+        let resumeRelatedCodes: [Int] = [
+            NSURLErrorCannotWriteToFile,      // -3000
+            NSURLErrorDataNotAllowed,
+            NSURLErrorCannotConnectToHost
+        ]
+        if let resumeData = updated.resumeData, !resumeData.isEmpty,
+           resumeRelatedCodes.contains(nsError.code),
+           (retryCounts[id] ?? 0) < maxRetryCount {
+            updated.resumeData = nil
+            Logger.warning("断点续传失败(\(nsError.code))，整包重新下载: \(updated.fileName)")
+            taskModels[id] = updated
+            tasks.removeValue(forKey: id)
+            retryDownload(id: id, model: updated)
+            return
+        }
+
         updated.status = .failed
         updated.error = error.localizedDescription
         Logger.error("下载失败: \(error.localizedDescription)")

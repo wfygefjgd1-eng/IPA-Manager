@@ -38,15 +38,37 @@ final class SigningEngine: SigningEngineProtocol {
             throw AppError.signFailed(reason)
         }
 
+        // 签名前置校验（在规范化之前）：证书/描述文件过期、Team ID 不匹配直接拒绝，
+        // 避免 SignOptionsView 允许选择过期证书/描述文件后签名到一半才失败。
+        // 过期字段以模型的计算属性 status 为准（expireDate 缺失时为 unknown，不判过期）。
+        if certificate.status == .expired {
+            let reason = "证书已过期，请更换证书"
+            Logger.error("签名失败: \(reason) (\(certificate.name))")
+            throw AppError.signFailed(reason)
+        }
+        if profile.status == .expired {
+            let reason = "描述文件已过期"
+            Logger.error("签名失败: \(reason) (\(profile.name))")
+            throw AppError.signFailed(reason)
+        }
+        if !certificate.teamID.isEmpty && !profile.teamID.isEmpty && certificate.teamID != profile.teamID {
+            let reason = "证书与描述文件的 Team ID 不匹配"
+            Logger.error("签名失败: \(reason)（证书 \(certificate.teamID) / 描述文件 \(profile.teamID)）")
+            throw AppError.signFailed(reason)
+        }
+
         // 源 IPA 结构规范化：标准 IPA 顶层必须是 Payload/<App>.app/。
         // 历史 CI 产物（ditto --keepParent 会把 .app 直接放压缩包根）和某些
         // 第三方来源的包不符合该结构，zsign 解压后报 "Can't find payload directory"。
         // 这里在签名前自动校验并修复：非标准结构解压 → 找 .app → 重打包为
         // Payload/ 标准结构再交给 zsign，任何来源的 IPA 都能签。
+        // 注意：规范化失败（非标准结构且修复失败）不再静默回退到原路径签名
+        // （那样会直接撞上 zsign 的英文报错），而是抛出中文错误直接终止签名；
+        // nil 返回值只表示"已是标准结构"（含 Payload/），直接使用源文件。
         let signingSourcePath: String
         var normalizedWorkDir: URL?
         var normalizedOutputURL: URL?
-        if let normalized = try? normalizeSourceIPAIfNeeded(sourcePath) {
+        if let normalized = try normalizeSourceIPAIfNeeded(sourcePath) {
             signingSourcePath = normalized.outputURL.path
             normalizedWorkDir = normalized.workRoot
             normalizedOutputURL = normalized.outputURL
@@ -93,8 +115,13 @@ final class SigningEngine: SigningEngineProtocol {
         let outputURL = fileManager.directoryURL(.signed)
             .appendingPathComponent("\(URL(fileURLWithPath: sourcePath).deletingPathExtension().lastPathComponent)-signed-\(UUID().uuidString.prefix(8)).ipa")
 
-        // Bridge progress callback: pass a non-capturing C closure + context
-        let box = ProgressBox(handler: progress)
+        // Bridge progress callback: pass a non-capturing C closure + context.
+        // 进度平滑：zsign 只回调 5/20/85/100 四档，85% 之后是"重新打包"阶段
+        // （Zip::Archive 压缩无进度回调），大 IPA 会长时间停在 85% 让用户误以为卡死。
+        // 平滑器把真实进度作为目标值，用主线程定时器让展示进度在 85% 后缓慢蠕动
+        // 逼近 98%（"仍在工作"的反馈），收到真实 100% 立即归正并停止。
+        let smoother = ProgressSmoother(rawHandler: progress)
+        let box = ProgressBox(handler: smoother.receive)
         let context = Unmanaged.passRetained(box).toOpaque()
         defer { Unmanaged<ProgressBox>.fromOpaque(context).release() }
 
@@ -114,7 +141,7 @@ final class SigningEngine: SigningEngineProtocol {
                                 options.provisionPath = provCStr
                                 options.password = pwdCStr
                                 options.tempFolder = tempDirCStr
-                                options.zipLevel = 6
+                                options.zipLevel = 1
                                 options.force = 1
                                 options.enableDocuments = 1
                                 options.context = context
@@ -128,9 +155,13 @@ final class SigningEngine: SigningEngineProtocol {
         }
 
         if result != 0 {
-            let message = CertificateManager.safeZSignError(limit: 512)
-            let userMessage = message.isEmpty ? "签名失败 (错误码 \(result))" : message
-            Logger.error("签名失败: \(sourcePath) - \(message)")
+            // 签名失败：先清理 Signed/ 下的半成品 .ipa，避免 refreshInstalledApps
+            // 全量扫描时把残缺文件当成"已签应用"。
+            try? fileManager.deleteItem(at: outputURL)
+
+            let rawMessage = CertificateManager.safeZSignError(limit: 512)
+            let userMessage = Self.localizedSignFailure(rawMessage, code: result)
+            Logger.error("签名失败: \(sourcePath) - \(rawMessage)")
             throw AppError.signFailed(userMessage)
         }
 
@@ -261,7 +292,9 @@ final class SigningEngine: SigningEngineProtocol {
     /// - Returns: 已是标准结构时 nil；否则返回 (workRoot, outputURL)——
     ///   workRoot 为规范化临时目录（调用方签名完成后统一删除），
     ///   outputURL 为修复后的标准结构 IPA，交给 zsign 签名。
-    private func normalizeSourceIPAIfNeeded(_ sourcePath: String) -> (workRoot: URL, outputURL: URL)? {
+    /// - Throws: 非标准结构且修复失败时抛出中文错误，调用方直接终止签名，
+    ///   不再静默回退到原路径（回退必然触发 zsign 的英文报错）。
+    private func normalizeSourceIPAIfNeeded(_ sourcePath: String) throws -> (workRoot: URL, outputURL: URL)? {
         let sourceURL = URL(fileURLWithPath: sourcePath)
 
         // 快速路径：直接读 zip 条目，检查顶层是否含 Payload/ 或 Payload 目录。
@@ -281,7 +314,7 @@ final class SigningEngine: SigningEngineProtocol {
             // 找到顶层 .app（兼容裸 .app 结构与极少数嵌套结构）
             guard let appURL = findAppBundle(in: extractDir) else {
                 Logger.error("源 IPA 结构修复失败：未找到 .app 应用包")
-                return nil
+                throw AppError.signFailed("应用包无法解析为可签名结构（未找到 .app 应用包）")
             }
 
             // 构造标准结构：workRoot/Payload/<App>.app
@@ -300,9 +333,12 @@ final class SigningEngine: SigningEngineProtocol {
 
             Logger.info("源 IPA 已规范化为标准结构（含 Payload/）: \(outputURL.path)")
             return (workRoot, outputURL)
+        } catch let error as AppError {
+            // AppError 已是面向用户的中文，直接透传
+            throw error
         } catch {
             Logger.error("源 IPA 结构修复失败: \(error.localizedDescription)")
-            return nil
+            throw AppError.signFailed("应用包无法解析为可签名结构（\(error.localizedDescription)）")
         }
     }
 
@@ -354,6 +390,37 @@ final class SigningEngine: SigningEngineProtocol {
         }
         return nil
     }
+
+    // MARK: - zsign 错误中文化
+
+    /// 把 zsign 桥接层的英文错误映射为中文提示（中文优先）：
+    /// 已知错误短语逐一映射；已是纯中文的桥接诊断原文透传；
+    /// 其余含英文字符的底层错误包一层"签名内部错误："前缀。
+    private static func localizedSignFailure(_ raw: String, code: Int32) -> String {
+        if raw.isEmpty {
+            return "签名失败 (错误码 \(code))"
+        }
+        if raw.contains("Can't find payload") {
+            return "应用包结构异常（缺少 Payload 目录），已尝试自动修复但未成功，请删除后重新导入该应用"
+        }
+        if raw.contains("Input file") {
+            return "源文件无法读取或不是有效的应用包"
+        }
+        if raw.contains("Failed to extract") {
+            return "应用包解压失败"
+        }
+        if raw.contains("Failed to archive") {
+            return "重新打包失败"
+        }
+        if raw.contains("Invalid temp folder") {
+            return "临时目录不可用"
+        }
+        // 其余情况：含英文字符的底层错误加中文前缀；纯中文直接透传
+        if raw.range(of: "[A-Za-z]", options: .regularExpression) != nil {
+            return "签名内部错误：\(raw)"
+        }
+        return raw
+    }
 }
 
 private final class ProgressBox {
@@ -361,6 +428,61 @@ private final class ProgressBox {
 
     init(handler: @escaping (Double) -> Void) {
         self.handler = handler
+    }
+}
+
+/// 签名进度平滑器：zsign 的真实进度只有 4~5 档（5/20/85/100），
+/// 中间大段时间（尤其 85% 起的"重新打包"阶段）无任何回调。
+/// 平滑器把真实进度作为"目标值"，用主线程定时器把展示值向目标逼近；
+/// 目标停在 85% 时继续以极慢速率蠕动到 98%（给用户"仍在工作"的反馈），
+/// 收到真实 100% 立即归正并停表。全部状态仅在主线程访问
+/// （progressCallbackFunc 已 DispatchQueue.main.async），无数据竞争。
+private final class ProgressSmoother {
+    private let rawHandler: (Double) -> Void
+    private var target: Double = 0
+    private var displayed: Double = 0
+    private var timer: Timer?
+
+    init(rawHandler: @escaping (Double) -> Void) {
+        self.rawHandler = rawHandler
+    }
+
+    /// 收到 zsign 真实进度（主线程调用）。只前进不回退；
+    /// 90% 定为"重打包阶段"开始——大 IPA 在此停留最久。
+    func receive(_ p: Double) {
+        guard p >= target else { return }
+        target = p
+        displayed = max(displayed, p)
+        if p >= 1.0 {
+            stopSlither()
+        } else if p >= 0.85 {
+            startSlitherIfNeeded()
+        }
+        rawHandler(displayed)
+    }
+
+    /// 85% 后启动蠕动定时器：每 0.5s 展示进度 +0.3%，最高逼近 98%。
+    /// 收到真实 100%（receive(1.0)）即停表并归正。
+    private func startSlitherIfNeeded() {
+        guard timer == nil else { return }
+        let t = Timer(timeInterval: 0.5, repeats: true) { [weak self] _ in
+            guard let self = self else { return }
+            guard self.target < 1.0 else {
+                self.stopSlither()
+                return
+            }
+            if self.displayed < 0.98 {
+                self.displayed = min(0.98, self.displayed + 0.003)
+                self.rawHandler(self.displayed)
+            }
+        }
+        timer = t
+        RunLoop.main.add(t, forMode: .common)
+    }
+
+    private func stopSlither() {
+        timer?.invalidate()
+        timer = nil
     }
 }
 

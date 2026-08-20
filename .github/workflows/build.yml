@@ -7,9 +7,17 @@ on:
     branches: [main]
   workflow_dispatch:
 
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   build:
     runs-on: macos-14
+    timeout-minutes: 60
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -69,10 +77,34 @@ jobs:
           cd build/staging
           zip -qr "../artifacts/IPA-Manager-v${MARKETING_VERSION}-unsigned.ipa" Payload
 
+      - name: Verify IPA structure
+        run: |
+          IPA="build/artifacts/IPA-Manager-v1.0.${{ github.run_number }}-unsigned.ipa"
+          # a) 产物存在且非空
+          test -s "$IPA" || { echo "IPA 结构或版本校验失败，终止发布"; exit 1; }
+          # b) 压缩包顶层第一项必须是 Payload/ 目录（历史上缺该层曾导致 zsign
+          #    签名报 "Can't find payload directory"）
+          FIRST_ENTRY="$(unzip -l "$IPA" | awk 'NR==4 {print $4}')"
+          [ "$FIRST_ENTRY" = "Payload/" ] || { echo "IPA 结构或版本校验失败，终止发布"; exit 1; }
+          # c) 必须存在 Payload/*.app/Info.plist
+          unzip -Z1 "$IPA" | grep -qE '^Payload/[^/]+\.app/Info\.plist$' \
+            || { echo "IPA 结构或版本校验失败，终止发布"; exit 1; }
+          # d) 提取 Info.plist 校验版本号（plutil 对二进制 plist 输出
+          #    "CFBundleShortVersionString" => "1.0.65" 格式）
+          PLIST_PATH="$(unzip -Z1 "$IPA" | grep -m1 '\.app/Info\.plist$' || true)"
+          test -n "$PLIST_PATH" || { echo "IPA 结构或版本校验失败，终止发布"; exit 1; }
+          unzip -p "$IPA" "$PLIST_PATH" | plutil -p - > /tmp/ipa-info.txt
+          grep -qE '"CFBundleShortVersionString" => "1\.0\.${{ github.run_number }}"' /tmp/ipa-info.txt \
+            || { echo "IPA 结构或版本校验失败，终止发布"; exit 1; }
+          grep -qE '"CFBundleVersion" => "${{ github.run_number }}"' /tmp/ipa-info.txt \
+            || { echo "IPA 结构或版本校验失败，终止发布"; exit 1; }
+          echo "IPA 校验通过：版本 1.0.${{ github.run_number }}（构建号 ${{ github.run_number }}）"
+
       - name: Upload Build Artifacts
         uses: actions/upload-artifact@v4
         with:
           name: IPA-Manager-Build
           path: |
             build/artifacts
-          if-no-files-found: warn
+          if-no-files-found: error
+          retention-days: 14

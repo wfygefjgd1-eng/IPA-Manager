@@ -125,6 +125,9 @@ struct AppDetailView: View {
                 }
                 Button("取消", role: .cancel) {}
             }
+            // 签名进行中禁止下滑手势关闭详情页：仅禁用 toolbar 关闭按钮时，
+            // 下滑手势仍可关页，签名完成/失败将无任何反馈
+            .interactiveDismissDisabled(isSigning)
         }
     }
 

@@ -40,21 +40,23 @@ struct CertificatesView: View {
                 }
             }
             .sheet(isPresented: $showPasswordSheet) {
-                PasswordPromptView(importURL: pendingImportURL) { cert in
-                    appState.addCertificate(cert)
-                    // 证书已导入 Keychain：删除 Documents 中的 P12 明文副本与解压目录，
-                    // 避免私钥材料明文常驻（iTunes 文件共享/备份可导出）
-                    let managed = managedPendingP12
-                    let extractDir = pendingExtractDir
-                    managedPendingP12 = nil
-                    pendingExtractDir = nil
-                    pendingImportURL = nil
-                    if let managed = managed {
-                        CertificateBundleImporter.shared.deleteManagedP12(managed)
+                PasswordPromptView(
+                    importURL: pendingImportURL,
+                    onImport: { cert in
+                        appState.addCertificate(cert)
+                        // 证书已导入 Keychain：删除 Documents 中的 P12 明文副本与解压目录，
+                        // 避免私钥材料明文常驻（iTunes 文件共享/备份可导出）
+                        cleanupPendingCertImport()
+                    },
+                    onCancel: {
+                        // 用户取消密码输入：同样清理托管 P12 与解压目录，避免明文私钥常驻
+                        cleanupPendingCertImport()
                     }
-                    if let extractDir = extractDir {
-                        CertificateBundleImporter.shared.cleanup(extractDir: extractDir)
-                    }
+                )
+                .onDismiss {
+                    // 兜底清理：下滑手势关闭等未走 onImport/onCancel 的关闭路径，
+                    // 托管 P12 与解压目录若仍在，必须清理（明文私钥不得常驻 Documents）
+                    cleanupPendingCertImport()
                 }
             }
             .alert("提示", isPresented: $showAlert) {
@@ -226,6 +228,23 @@ struct CertificatesView: View {
         case .failure(let error):
             alertMessage = error.localizedDescription
             showAlert = true
+        }
+    }
+
+    /// 清理当前待导入证书流程残留的敏感文件：托管 P12 明文副本（Certificates/cert-*.p12）
+    /// 与解压目录（bundle-extract-*）。onImport 成功 / onCancel / 下滑关闭兜底共用，
+    /// 内部幂等：状态已清空时不再重复清理。
+    private func cleanupPendingCertImport() {
+        let managed = managedPendingP12
+        let extractDir = pendingExtractDir
+        managedPendingP12 = nil
+        pendingExtractDir = nil
+        pendingImportURL = nil
+        if let managed = managed {
+            CertificateBundleImporter.shared.deleteManagedP12(managed)
+        }
+        if let extractDir = extractDir {
+            CertificateBundleImporter.shared.cleanup(extractDir: extractDir)
         }
     }
 

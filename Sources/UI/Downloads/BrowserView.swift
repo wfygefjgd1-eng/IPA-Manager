@@ -172,18 +172,39 @@ struct BrowserView: View {
             return
         }
         Logger.info("开始下载: \(url.absoluteString)")
-        DownloadManager.shared.startDownload(urlString: url.absoluteString) { _ in
-            Logger.info("下载任务已创建")
+
+        // 防盗链：下载请求携带当前页面 URL 作 Referer（点击下载时 urlString 即来源页地址）
+        let referer = urlString
+
+        // 登录态（Cookie）共享：WKWebView 用 WKWebsiteDataStore 的 cookie 存储，
+        // 而 URLSession 默认配置用 HTTPCookieStorage.shared，两者互相隔离——
+        // 浏览器里登录 GitHub/网盘后点下载，URLSession 不带登录 cookie 会 302 到登录页，
+        // 下载到的就是 HTML 错误页。这里先把浏览器会话的全部 cookie 同步进共享存储。
+        // getAllCookies 回调线程不定，同步完成后再回主线程发起下载
+        // （DownloadManager 的模型/持久化约定在主队列读写）。
+        WKWebsiteDataStore.default().httpCookieStore.getAllCookies { cookies in
+            let shared = HTTPCookieStorage.shared
+            for cookie in cookies {
+                shared.setCookie(cookie)
+            }
+            DispatchQueue.main.async {
+                DownloadManager.shared.startDownload(
+                    urlString: url.absoluteString,
+                    referer: referer
+                ) { _ in
+                    Logger.info("下载任务已创建")
+                }
+                // 轻提示（可选）：直接开始下载，不再弹任何确认框
+                self.toastMessage = "开始下载：\(url.lastPathComponent)"
+                self.showToast = true
+                DispatchQueue.main.asyncAfter(deadline: .now() + 2) {
+                    self.showToast = false
+                }
+                // 下载已加入队列：关闭浏览器并切到“下载”标签页
+                self.appState.selectedTab = 2
+                self.dismiss()
+            }
         }
-        // 轻提示（可选）：直接开始下载，不再弹任何确认框
-        toastMessage = "开始下载：\(url.lastPathComponent)"
-        showToast = true
-        DispatchQueue.main.asyncAfter(deadline: .now() + 2) {
-            showToast = false
-        }
-        // 下载已加入队列：关闭浏览器并切到“下载”标签页
-        appState.selectedTab = 2
-        dismiss()
     }
 
     /// 地址栏提交：规范化 URL 并导航（补全缺省 https:// 前缀；只接受 http/https）。
@@ -386,8 +407,10 @@ private struct WebView: UIViewRepresentable {
             }
         }
 
-        // 拦截下载：以扩展名命中为主；releases/download 仅在扩展名为空时兜底，
-        // 避免把 release 详情页跳转等普通导航误判为下载
+        // 拦截下载：只以 ipa/zip 扩展名命中（本应用要处理的格式）；releases/download
+        // 仅在扩展名为空时兜底，避免把 release 详情页跳转等普通导航误判为下载。
+        // .tar/.apk/.tar.gz 等不再在这里拦截——它们走 WebKit 导航/响应层下载，完成态
+        // 由 DownloadManager.classifyDownload 判定（完整下载按 completed 收尾）。
         func webView(
             _ webView: WKWebView,
             decidePolicyFor navigationAction: WKNavigationAction,
@@ -400,7 +423,7 @@ private struct WebView: UIViewRepresentable {
 
             let urlStr = url.absoluteString.lowercased()
             let ext = url.pathExtension.lowercased()
-            let isDownloadExt = ext == "ipa" || ext == "zip" || ext == "tar" || ext == "apk" || urlStr.hasSuffix(".tar.gz")
+            let isDownloadExt = ext == "ipa" || ext == "zip"
             // 兜底：releases/download 且无扩展名（GitHub 有时不带扩展名重定向）
             let isReleaseDownload = ext.isEmpty && urlStr.contains("releases/download")
             let isNewWindow = navigationAction.targetFrame == nil
@@ -443,7 +466,9 @@ private struct WebView: UIViewRepresentable {
             if let url = navigationAction.request.url {
                 let urlStr = url.absoluteString.lowercased()
                 let ext = url.pathExtension.lowercased()
-                let isDownload = ext == "ipa" || ext == "zip" || ext == "tar" || urlStr.hasSuffix(".tar.gz")
+                // 与 decidePolicyFor 保持一致：只拦截 ipa/zip + releases/download 无扩展名兜底
+                let isDownload = ext == "ipa" || ext == "zip"
+                    || (ext.isEmpty && urlStr.contains("releases/download"))
                 if isDownload {
                     parent.onDownloadDetected(url)
                     return nil

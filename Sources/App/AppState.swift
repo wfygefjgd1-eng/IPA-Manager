@@ -119,8 +119,17 @@ final class AppState: ObservableObject {
             return
         }
 
-        // 压缩包：后台先判断内容（证书包 / 应用包 / 未知），避免阻塞 UI
+        // 压缩包：后台先判断内容（证书包 / 应用包 / 未知），避免阻塞 UI。
+        // 安全作用域在后台流程入口持有、defer 在闭包内释放，覆盖 classifyArchivedContent
+        // 解压扫描与 convertToIPAIfNeeded 读取外部文件的全过程（文件 App 打开的
+        // in-place 安全作用域 URL 若未授权访问，解压会 EPERM）。
+        let accessed = url.startAccessingSecurityScopedResource()
         DispatchQueue.global(qos: .userInitiated).async {
+            defer {
+                if accessed {
+                    url.stopAccessingSecurityScopedResource()
+                }
+            }
             do {
                 let kind = try self.classifyArchivedContent(at: url)
                 switch kind {
@@ -227,8 +236,19 @@ final class AppState: ObservableObject {
                 // 临时目录会被本函数末尾的 defer 删除，因此必须立即复制到 Documents/IPA 持久位置，
                 // 否则返回的 URL 会在 defer 后失效。只记录第一个成功复制的副本。
                 guard embeddedIPAURL == nil else { continue }
-                let destURL = self.fileManager.directoryURL(.ipa)
+                // 数据安全：目标同名文件已存在时追加唯一后缀，绝不覆盖可能仍被其它记录
+                // 引用的旧文件（与 convertToIPAIfNeeded 的输出唯一化策略一致）。
+                let ipaBase = URL(fileURLWithPath: element.lastPathComponent).deletingPathExtension().lastPathComponent
+                var destURL = self.fileManager.directoryURL(.ipa)
                     .appendingPathComponent(element.lastPathComponent)
+                if FileManager.default.fileExists(atPath: destURL.path) {
+                    destURL = self.fileManager.directoryURL(.ipa)
+                        .appendingPathComponent("\(ipaBase)-\(UUID().uuidString.prefix(8)).ipa")
+                    while FileManager.default.fileExists(atPath: destURL.path) {
+                        destURL = self.fileManager.directoryURL(.ipa)
+                            .appendingPathComponent("\(ipaBase)-\(UUID().uuidString.prefix(8)).ipa")
+                    }
+                }
                 // copyItem 不返回 URL，复制成功后用目标路径构造并校验文件已存在
                 if (try? self.fileManager.copyItem(from: element, to: destURL)) != nil,
                    FileManager.default.fileExists(atPath: destURL.path) {
@@ -319,13 +339,6 @@ final class AppState: ObservableObject {
         progressContext: (index: Int, total: Int)? = nil,
         completion: @escaping (Result<AppInfo, Error>) -> Void
     ) {
-        let accessed = url.startAccessingSecurityScopedResource()
-        defer {
-            if accessed {
-                url.stopAccessingSecurityScopedResource()
-            }
-        }
-
         // 进度上下文：未传时按单文件处理（index/total = 1）
         let index = progressContext?.index ?? 1
         let total = progressContext?.total ?? 1
@@ -335,8 +348,22 @@ final class AppState: ObservableObject {
         updateImportProgress(fileName: fileName, index: index, total: total, phase: "准备导入…")
 
         DispatchQueue.global(qos: .userInitiated).async {
-            // destination 声明在 do 外，便于解析失败时清理可能残留的半成品文件
+            // 安全作用域必须在真正执行 I/O 的后台闭包内持有（defer 作用域 = 闭包）：
+            // 若在进入队列前就 start/stop，文件 App 外部打开（LSSupportsOpeningDocumentsInPlace
+            // 生效的 in-place 安全作用域 URL）的后台解压/复制/解析会处于未授权状态 → EPERM。
+            // 闭包开头 start、defer stop 覆盖 zip 转换到复制解析的全过程；闭包内所有
+            // 错误路径的 defer 都会执行，保证成对释放。
+            let accessed = url.startAccessingSecurityScopedResource()
+            defer {
+                if accessed {
+                    url.stopAccessingSecurityScopedResource()
+                }
+            }
+            // destination 声明在 do 外，便于解析失败时清理可能残留的半成品文件；
+            // destinationCreatedByThisImport 标记 destination 是否由本次导入写入：
+            // 同 bundleID 重导入覆盖时 destination 可能仍是旧文件，失败清理绝不能误删旧文件。
             var destination = self.fileManager.directoryURL(.ipa).appendingPathComponent(url.lastPathComponent)
+            var destinationCreatedByThisImport = false
             do {
                 // zip 输入先统一转换为标准 .ipa（含内嵌 .ipa 提取、.app 重打包为 Payload）：
                 // 入库后 app.path 一定指向可签名的 .ipa。不含 .app/.ipa 的 zip（如证书包）
@@ -354,16 +381,19 @@ final class AppState: ObservableObject {
                 }
                 destination = self.fileManager.directoryURL(.ipa).appendingPathComponent(importURL.lastPathComponent)
 
-                // 转换得到的 .ipa 已直接输出到 .ipa 目录（importURL 即 destination），跳过复制，避免删掉源文件
+                // 转换得到的 .ipa 已直接输出到 .ipa 目录（importURL 即 destination），
+                // 跳过复制，避免删掉源文件；此时 destination 是本次导入产生的产物
                 if importURL.path != destination.path {
                     // 同名冲突处理（数据安全）：目标已存在时——
                     // 1) 若已有记录正是同 bundleID（重复导入同一应用）：直接覆盖，记录同步更新；
                     // 2) 若已存在但归属其它 bundleID（或无可查记录）：改用唯一后缀名，
                     //    绝不覆盖可能仍被其它记录引用的旧文件（旧记录 path 会指向被替换文件，
                     //    出现“元数据与磁盘内容错配”）。
+                    var isSameApp = false
                     if FileManager.default.fileExists(atPath: destination.path) {
                         let existing = self.importedApps.first { $0.path == destination.path }
-                        let isSameApp = existing?.bundleID == (try? self.parser.parseAppInfo(fileURL: importURL).bundleID) && existing != nil
+                        isSameApp = existing != nil
+                            && existing?.bundleID == (try? self.parser.parseAppInfo(fileURL: importURL).bundleID)
                         if !isSameApp {
                             let base = destination.deletingPathExtension().lastPathComponent
                             var candidate = self.fileManager.directoryURL(.ipa)
@@ -374,17 +404,61 @@ final class AppState: ObservableObject {
                                     .appendingPathComponent("\(base)-\(UUID().uuidString.prefix(8)).ipa")
                             }
                             destination = candidate
-                        } else {
-                            try FileManager.default.removeItem(at: destination)
                         }
                     }
                     // 阶段：复制到 IPA 目录（权重 60~80%）
                     self.updateImportProgress(fileName: fileName, index: index, total: total, phase: "复制文件…", progress: 0.6)
-                    try self.fileManager.copyItem(from: importURL, to: destination)
+                    if isSameApp {
+                        // 同 bundleID 重复导入（数据安全）：绝不“先删旧文件再拷”——
+                        // 复制失败会让旧文件永久丢失、旧记录悬空。改为先复制新文件到
+                        // 临时名，完整成功后移除旧文件并换位；任何一步失败旧文件仍在。
+                        let tempURL = self.fileManager.directoryURL(.ipa)
+                            .appendingPathComponent(".tmp-\(UUID().uuidString)-\(destination.lastPathComponent)")
+                        do {
+                            try FileManager.default.copyItem(at: importURL, to: tempURL)
+                        } catch {
+                            // 复制失败：旧文件原封未动，删掉临时残留后抛错
+                            try? FileManager.default.removeItem(at: tempURL)
+                            throw error
+                        }
+                        // 新文件已完整落盘，此时才移除旧文件并换位
+                        try? FileManager.default.removeItem(at: destination)
+                        do {
+                            try FileManager.default.moveItem(at: tempURL, to: destination)
+                        } catch {
+                            // 极罕见：换位失败时旧文件已删，尽力把新文件恢复到目标位置
+                            try? FileManager.default.moveItem(at: tempURL, to: destination)
+                            throw error
+                        }
+                    } else {
+                        try self.fileManager.copyItem(from: importURL, to: destination)
+                    }
                 }
+                // 走到这里 destination 必为本次导入写入/产生的文件（复制分支成功后，
+                // 或 skip-copy 分支的转换产物），失败清理时才允许删除它
+                destinationCreatedByThisImport = true
                 // 阶段：解压 IPA 并解析 Info.plist / 提取图标（权重 80~95%）
                 self.updateImportProgress(fileName: fileName, index: index, total: total, phase: "解析中…", progress: 0.8)
                 var app = try self.parser.parseAppInfo(fileURL: destination)
+                // skip-copy 分支唯一后缀保护：转换产物已直接写入 destination，但该路径若
+                // 已被其它 bundleID 的记录引用（如旧记录指向已丢失的文件、或转换输出恰好
+                // 撞上残留同名文件），把产物改名到唯一后缀，杜绝新旧两条记录指向同一文件。
+                if importURL.path == destination.path {
+                    if let existing = self.importedApps.first(where: { $0.path == destination.path }),
+                       existing.bundleID != app.bundleID,
+                       FileManager.default.fileExists(atPath: destination.path) {
+                        let base = destination.deletingPathExtension().lastPathComponent
+                        var candidate = self.fileManager.directoryURL(.ipa)
+                            .appendingPathComponent("\(base)-\(UUID().uuidString.prefix(8)).ipa")
+                        while FileManager.default.fileExists(atPath: candidate.path) {
+                            candidate = self.fileManager.directoryURL(.ipa)
+                                .appendingPathComponent("\(base)-\(UUID().uuidString.prefix(8)).ipa")
+                        }
+                        try FileManager.default.moveItem(at: destination, to: candidate)
+                        destination = candidate
+                        Logger.info("转换产物与既有记录冲突，已改名: \(destination.lastPathComponent)")
+                    }
+                }
                 app.path = destination.path
                 // 待签名图标持久化：parseAppInfo 返回的 iconPath 是本次解压目录
                 // （Extracted/<baseName>/）内的 .app 内部路径，而每次解析都会解压并整体
@@ -415,8 +489,12 @@ final class AppState: ObservableObject {
                 }
             } catch {
                 DispatchQueue.main.async {
-                    // 复制/解析失败时，清理可能残留的半成品文件
-                    if FileManager.default.fileExists(atPath: destination.path) {
+                    // 复制/解析失败时，清理本次导入可能残留的半成品文件。
+                    // 仅删除由本次导入写入的文件（destinationCreatedByThisImport）：
+                    // 同 bundleID 覆盖场景失败时 destination 仍是旧文件，绝不能误删
+                    //（否则旧记录悬空、旧文件丢失）。
+                    if destinationCreatedByThisImport,
+                       FileManager.default.fileExists(atPath: destination.path) {
                         try? FileManager.default.removeItem(at: destination)
                     }
                     // 导入失败：同样清除进度，错误提示走既有逻辑
@@ -538,7 +616,20 @@ final class AppState: ObservableObject {
         try Installer.shared.install(ipaPath: ipaPath, certificate: certificate)
     }
 
+    /// 外部打开文件去重：SwiftUI 生命周期下 application(_:open:) 与 onOpenURL 可能
+    /// 对同一 URL 双触发（两个入口并存），短窗口内同一 URL 只处理一次，避免重复导入。
+    private var lastOpenedExternalURL: String = ""
+    private var lastOpenedExternalDate: Date = .distantPast
+
     func handleFileOpenedFromOutside(_ url: URL) {
+        let now = Date()
+        if url.absoluteString == lastOpenedExternalURL,
+           now.timeIntervalSince(lastOpenedExternalDate) < 2.0 {
+            Logger.info("外部打开文件去重跳过: \(url.lastPathComponent)")
+            return
+        }
+        lastOpenedExternalURL = url.absoluteString
+        lastOpenedExternalDate = now
         let ext = url.pathExtension.lowercased()
         Logger.info("外部打开文件: \(url.lastPathComponent)")
 
@@ -566,13 +657,122 @@ final class AppState: ObservableObject {
         }
     }
 
+    /// 单个证书相关文件（p12/pfx/mobileprovision）的外部导入反馈：
+    /// - p12/pfx：尝试常见密码 "1" 直接导入（与 zip 证书包路径一致）；成功给 toast，
+    ///   失败提示用户去证书页手动输入密码导入，并切到证书 Tab。
+    /// - mobileprovision：无需密码，直接导入描述文件；成功/失败均给 toast 反馈。
+    /// 注：CertificateManager / ProvisioningManager 在各自内部持有安全作用域，
+    /// 这里无需再 startAccessing。
+    private func handleSingleCertificateFile(_ url: URL) {
+        let ext = url.pathExtension.lowercased()
+        switch ext {
+        case "p12", "pfx":
+            CertificateManager.shared.importCertificate(from: url, password: "1") { result in
+                DispatchQueue.main.async {
+                    switch result {
+                    case .success(let cert):
+                        self.addCertificate(cert)
+                        self.showToast("已导入证书文件，请到证书页查看")
+                    case .failure:
+                        self.showToast("请在证书页手动导入该文件")
+                        self.selectedTab = 3
+                    }
+                }
+            }
+        case "mobileprovision":
+            // 描述文件解析/归档（读文件 + 复制）下沉到后台队列，避免阻塞主线程
+            DispatchQueue.global(qos: .userInitiated).async {
+                do {
+                    let profile = try ProvisioningManager.shared.importProfile(from: url)
+                    DispatchQueue.main.async {
+                        // 按 uuid 去重/更新（与证书页导入行为一致），避免重复添加
+                        if let index = self.profiles.firstIndex(where: { $0.uuid == profile.uuid }) {
+                            self.profiles[index].path = profile.path
+                            if self.selectedProfile?.uuid == profile.uuid {
+                                self.selectedProfile?.path = profile.path
+                            }
+                            self.saveState()
+                        } else {
+                            self.addProfile(profile)
+                        }
+                        self.showToast("已导入描述文件，请到证书页查看")
+                    }
+                } catch {
+                    DispatchQueue.main.async {
+                        self.showToast("描述文件导入失败，请在证书页手动导入该文件")
+                        self.selectedTab = 3
+                    }
+                }
+            }
+        default:
+            break
+        }
+    }
+
+    /// 从解压产物 URL 向上回溯到 bundle-extract-<uuid> 解压目录根：
+    /// findFile 支持一层子目录，p12/profile 可能位于 bundle-extract-* 的深层。
+    private func bundleExtractRoot(from fileURL: URL?) -> URL? {
+        guard var current = fileURL?.deletingLastPathComponent() else { return nil }
+        let certDirPath = fileManager.directoryURL(.certificates).path
+        while current.path.hasPrefix(certDirPath) {
+            if current.lastPathComponent.hasPrefix("bundle-extract-") {
+                return current
+            }
+            current = current.deletingLastPathComponent()
+        }
+        return nil
+    }
+
+    /// 兜底清理：删除 Certificates/ 下所有 bundle-extract-* 解压目录。
+    /// 仅在 extract 抛错（拿不到确切解压目录 URL）时使用；正常路径一律用精确 URL 清理。
+    private func sweepBundleExtractDirs() {
+        let certDir = fileManager.directoryURL(.certificates)
+        guard let entries = try? FileManager.default.contentsOfDirectory(
+            at: certDir, includingPropertiesForKeys: [.isDirectoryKey]
+        ) else { return }
+        for entry in entries {
+            let isDirectory = (try? entry.resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory ?? false
+            if isDirectory, entry.lastPathComponent.hasPrefix("bundle-extract-") {
+                try? fileManager.deleteItem(at: entry)
+            }
+        }
+    }
+
+    /// zip 证书包导入收尾：删除托管 P12 明文副本（Certificates/cert-*.p12）与解压目录
+    /// （bundle-extract-*），避免私钥材料明文常驻 Documents（文件 App/备份可导出）。
+    /// 证书导入成功后私钥已进 Keychain，明文 P12 不再需要；失败同样清理。
+    private func cleanupManagedCertBundle(
+        importer: CertificateBundleImporter,
+        moved: (p12URL: URL?, profileURL: URL?)?,
+        extractDir: URL?
+    ) {
+        if let moved = moved {
+            importer.deleteManagedP12(moved.p12URL)
+        }
+        if let extractDir = extractDir {
+            importer.cleanup(extractDir: extractDir)
+        }
+    }
+
     private func importCertificateBundleOrFile(_ url: URL) {
         switch url.pathExtension.lowercased() {
         case "zip":
             let importer = CertificateBundleImporter.shared
+            // 安全作用域：zip 证书包的后台解压/复制/清理全程必须处于授权状态，
+            // start/stop 需成对；defer 在后台闭包内释放，覆盖所有错误路径。
+            let accessed = url.startAccessingSecurityScopedResource()
             DispatchQueue.global(qos: .userInitiated).async {
+                defer {
+                    if accessed {
+                        url.stopAccessingSecurityScopedResource()
+                    }
+                }
+                // 解压目录：无论成功失败都必须清理（内含明文 P12 材料）
+                var extractDir: URL? = nil
                 do {
                     let content = try importer.extract(from: url)
+                    extractDir = self.bundleExtractRoot(from: content.p12URL)
+                        ?? self.bundleExtractRoot(from: content.profileURL)
                     let moved = try importer.moveToManagedLocation(
                         p12URL: content.p12URL,
                         profileURL: content.profileURL
@@ -595,18 +795,31 @@ final class AppState: ObservableObject {
                                     case .failure(let error):
                                         Logger.warning("zip 证书包证书需手动导入: \(error.localizedDescription)")
                                     }
+                                    // 证书导入处理完毕（无论成败）后清理托管 P12 与解压目录
+                                    self.cleanupManagedCertBundle(importer: importer, moved: moved, extractDir: extractDir)
                                 }
                             }
+                        } else {
+                            // 无证书：描述文件已归档到 Profiles，直接清理
+                            self.cleanupManagedCertBundle(importer: importer, moved: moved, extractDir: extractDir)
                         }
                         Logger.info("zip 证书包导入完成")
                     }
                 } catch {
+                    // 解压/移动失败：同样清理。extract 抛错时拿不到确切解压目录
+                    // （unzip 可能已创建 bundle-extract-* 且残留部分内容），按前缀兜底清扫；
+                    // moveToManagedLocation 抛错时按已确知的解压目录清理。
+                    if let extractDir = extractDir {
+                        importer.cleanup(extractDir: extractDir)
+                    } else {
+                        self.sweepBundleExtractDirs()
+                    }
                     Logger.error("zip 证书包导入失败: \(error)")
                 }
             }
         default:
-            // p12/mobileprovision need UI flow; route to certificates tab later
-            Logger.info("单个证书文件需通过证书页导入: \(url.lastPathComponent)")
+            // 单个 p12/pfx/mobileprovision：直接尝试导入并给用户反馈
+            handleSingleCertificateFile(url)
         }
     }
 

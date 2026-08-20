@@ -15,7 +15,7 @@
 ## 安装方式（网络要求）
 
 - 支持任意网络环境：蜂窝网络、Wi-Fi、VPN（如 Loon/Shadowrocket 等）均可用，**无需关闭 VPN、无需连接 Wi-Fi**。
-- 安装通道：签名完成后生成**公网 HTTPS manifest**（api.palera.in 托管）+ 本机 HTTP 服务器提供 IPA；设备点击“安装”后系统加载 manifest，网络路径为公网 HTTPS，任何网络下均可成功下载并安装。
+- 安装通道（manifest 与载荷分离，Feather 同款方案）：签名完成后生成**公网 HTTPS manifest**（api.palera.in/genPlist，仅描述应用元数据与下载地址），IPA 本体由本机回环 `http://127.0.0.1:<随机端口>` 以明文 HTTP 提供，数据不出设备；回环地址在任何网络（蜂窝/VPN）下对本机始终可达，因此**无需关闭 VPN、无需连接 Wi-Fi**，任何网络下均可成功下载并安装。
 - 注：安装时系统会弹出“某某想要安装”的确认提示，这是 iOS 系统级安全确认（通用签名工具均无法绕过），点击“安装”后系统自动回到桌面并完成安装。
 
 ## 使用流程
@@ -62,14 +62,28 @@ xcodebuild -project "IPA Manager.xcodeproj" \
 - 固定 OpenSSL 3.3.2，静态库（`no-shared`）；
 - **不启用 legacy provider、不 install providers.h**（本工程不 include 它，避免链接触发缺失头文件）；
 - 仅 iOS 真机 arm64（`ios64-xcrun`）；测试/示例/应用禁用（`no-tests no-apps`）。
-- 构建脚本 `scripts/build-openssl.sh` 为本地与 CI 共用入口，修改 OpenSSL 相关配置请同步更新该脚本与 `.github/workflows/build.yml` 的缓存 key（`hashFiles('scripts/build-openssl.sh')`）。
+- 构建脚本 `scripts/build-openssl.sh` 为本地与 CI 共用入口；CI 的 OpenSSL 缓存 key 由 `hashFiles('scripts/build-openssl.sh')` 随脚本内容自动失效（脚本内容变化即自动换 key 重建），仅当脚本内容未变而需要强制重建时才手动修改 key 后的 `-v1` 后缀。
 
 ## 持续集成（CI）
 
-- 推送 `main` 分支自动触发 GitHub Actions（`.github/workflows/build.yml`）：macos-14 + Xcode 15.2 构建未签名 IPA，产物上传为 Actions Artifact（`IPA-Manager-Build`）。
+- 推送 `main` 分支自动触发 GitHub Actions（`.github/workflows/build.yml`）：macos-14 + Xcode 15.2 构建未签名 IPA，产物上传为 Actions Artifact（`IPA-Manager-Build`，保留 14 天）。
 - 版本号自动跟随运行号：`1.0.<run_number>`（构建号 = run number）。
 - OpenSSL 产物按脚本哈希缓存（key `openssl-ios-*`），命中时跳过重新编译，显著缩短构建时间。
 - 产物需自行签名后在设备安装（App 不支持自签安装流程，供应链上保持旁路）。
+
+### 发布流程
+
+- 构建成功后，未签名 IPA 作为 Actions Artifact 上传（保留 14 天；Artifact 页面入口在 Actions 运行记录页底部）。
+- 正式发布由人工完成：在 Actions 运行记录页底部打开 Artifact 页面，下载 `IPA-Manager-v1.0.<run_number>-unsigned.ipa`，然后用 `gh release create` 创建 Release 并上传 IPA：
+
+    ```bash
+    gh release create v1.0.<run_number> \
+      IPA-Manager-v1.0.<run_number>-unsigned.ipa \
+      --title "v1.0.<run_number>" \
+      --notes "未签名 IPA：请用 IPA Manager 导入自有证书签名后安装"
+    ```
+
+- Release 版本号固定为 `v1.0.<run_number>`（与构建号一一对应）；发布物为未签名 IPA，需导入 IPA Manager 用自有证书签名后安装到设备。
 
 ## 目录结构
 

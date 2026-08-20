@@ -17,3 +17,14 @@ xcuserdata/
 .idea/
 .vscode/
 *.swp
+
+# 构建产物与证书敏感文件（README 承诺不入库）
+Vendor/openssl/
+.zsign_cache/
+*.p12
+*.pfx
+*.mobileprovision
+*.cer
+*.pem
+*.key
+*.ipa

@@ -4,6 +4,9 @@ struct PasswordPromptView: View {
     @Environment(\.dismiss) private var dismiss
     let importURL: URL?
     let onImport: (CertificateInfo) -> Void
+    /// 用户取消/关闭密码框时通知父级：清理托管 P12 明文副本与解压目录
+    /// （私钥材料不常驻 Documents），dismiss 前调用。
+    var onCancel: (() -> Void)?
 
     @State private var password = ""
     @State private var showError = false
@@ -58,6 +61,9 @@ struct PasswordPromptView: View {
             .toolbar {
                 ToolbarItem(placement: .navigationBarLeading) {
                     Button("取消") {
+                        // 取消前通知父级清理托管 P12 明文副本与解压目录，
+                        // 不留私钥材料常驻 Documents；父级另有 onDismiss 兜底
+                        onCancel?()
                         dismiss()
                     }
                 }

@@ -138,6 +138,60 @@ final class CertificateManager {
         return status == errSecSuccess || status == errSecItemNotFound
     }
 
+    // MARK: - 本地服务器 TLS 身份遗留条目清理
+
+    /// 清理本地服务器 TLS 身份写入钥匙串的孤儿条目（服务器已改明文 HTTP，不再使用这些身份）：
+    /// - label 恰为 "IPA Manager Server Cert" 的证书条目（exportToKeychainOnce 写入）；
+    /// - 所有 label 以 "IPA Manager Server Identity" 开头的证书/私钥/通用密码/身份条目
+    ///   （loadIdentityViaKeychain 兜底路径写入，含 UUID 后缀）。
+    /// App 卸载不会自动清除钥匙串条目，必须在启动时统一清理，避免长期累积。
+    /// 全部为尽力而为：条目不存在视为成功，失败只记 warning。
+    static func cleanupServerIdentityKeychainItems() {
+        // 1) 固定 label 的服务器证书
+        _ = deleteKeychainItem(class: kSecClassCertificate, label: "IPA Manager Server Cert")
+        // 2) 前缀匹配的孤儿条目（证书/私钥/通用密码/身份）
+        for itemClass in [kSecClassCertificate, kSecClassKey, kSecClassGenericPassword, kSecClassIdentity] {
+            deleteKeychainItems(class: itemClass, labelPrefix: "IPA Manager Server Identity")
+        }
+    }
+
+    /// 按 class + 精确 label 删除单个钥匙串条目（errSecItemNotFound 视为成功）。
+    private static func deleteKeychainItem(class itemClass: CFString, label: String) -> OSStatus {
+        let deleteQuery: [String: Any] = [
+            kSecClass as String: itemClass,
+            kSecAttrLabel as String: label
+        ]
+        let status = SecItemDelete(deleteQuery as CFDictionary)
+        if status != errSecSuccess && status != errSecItemNotFound {
+            Logger.warning("钥匙串条目删除失败 (class=\(itemClass), label=\(label), status=\(status))")
+        }
+        return status
+    }
+
+    /// 按 class + label 前缀查询后逐个清理（SecItemCopyMatching 拿全量属性，
+    /// 再按 label 过滤出前缀匹配的条目逐个 SecItemDelete）。
+    private static func deleteKeychainItems(class itemClass: CFString, labelPrefix: String) {
+        let query: [String: Any] = [
+            kSecClass as String: itemClass,
+            kSecAttrLabel as String: labelPrefix,
+            kSecMatchLimit as String: kSecMatchLimitAll,
+            kSecReturnAttributes as String: true
+        ]
+        var result: AnyObject?
+        let status = SecItemCopyMatching(query as CFDictionary, &result)
+        guard status == errSecSuccess, let items = result as? [[String: Any]] else {
+            if status != errSecItemNotFound {
+                Logger.warning("钥匙串条目查询失败 (status=\(status), class=\(itemClass), labelPrefix=\(labelPrefix))")
+            }
+            return
+        }
+        for item in items {
+            guard let label = item[kSecAttrLabel as String] as? String,
+                  label.hasPrefix(labelPrefix) else { continue }
+            _ = deleteKeychainItem(class: itemClass, label: label)
+        }
+    }
+
     private func readCertificate(from url: URL, password: String) throws -> CertificateInfo {
         let accessed = url.startAccessingSecurityScopedResource()
         defer {

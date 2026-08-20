@@ -97,12 +97,21 @@ final class LocalInstallServer {
         // start 是异步的：listener 需要进入 .ready 状态才会接受连接。
         // 若不等待就立刻打开 itms-services，SpringBoard 的连接请求会落在
         // 未就绪的监听器上被丢弃（日志表现为"没有收到任何请求"）。
+        // 同时记录实际 listener 状态用于失败判定：.failed（端口被占用/权限不足）
+        // 与 .waiting（网络路径不可用）都会造成"安装假成功"。
         let readyGroup = DispatchGroup()
+        var becameReady = false
+        var listenerState: NWListener.State?
         readyGroup.enter()
-        listener.stateUpdateHandler = { [weak self] state in
+        listener.stateUpdateHandler = { state in
+            listenerState = state
             switch state {
             case .ready:
+                becameReady = true
                 readyGroup.leave()
+            case .waiting(let error):
+                // .waiting 单独提示：等待网络路径（通常会自动转为 .ready，仅记日志）
+                Logger.warning("本地服务器等待网络路径…: \(error.localizedDescription)")
             case .failed(let error):
                 Logger.error("本地服务器监听失败: \(error)")
                 readyGroup.leave()
@@ -112,8 +121,23 @@ final class LocalInstallServer {
         }
         listener.start(queue: ServerQueue.shared.queue)
         let waitResult = readyGroup.wait(timeout: .now() + 5)
-        if waitResult != .success {
-            Logger.error("本地服务器 5 秒内未就绪，安装可能失败")
+        // 等待超时或最终状态非 .ready（端口占用 / 权限问题 / 一直等待网络路径）：
+        // 一律视为启动失败并抛中文错误，绝不继续走"安装假成功"流程。
+        guard waitResult == .success, becameReady else {
+            let detail: String
+            switch listenerState {
+            case .some(.waiting(let error)):
+                detail = "正在等待网络路径…（\(error.localizedDescription)）"
+            case .some(.failed(let error)):
+                detail = "监听器启动失败（\(error.localizedDescription)）"
+            case .some(.ready):
+                detail = "监听器未能在 5 秒内进入就绪状态"
+            default:
+                detail = "监听器未进入就绪状态"
+            }
+            stop()
+            Logger.error("本地安装服务器启动失败: \(detail)")
+            throw AppError.installFailed("本地安装服务器启动失败：\(detail)")
         }
 
         // 候选地址：回环优先，然后是所有接口 IP（Wi-Fi/蜂窝/热点）。
@@ -171,22 +195,18 @@ final class LocalInstallServer {
         Logger.info("本地安装服务器已停止")
     }
 
-    private static func tlsOptions() -> NWProtocolTLS.Options {
-        ServerIdentityProvider.shared.tlsOptions()
-    }
-
     private func handleConnection(_ connection: NWConnection) {
         connections.append(connection)
-        // 关键诊断分界线：newConnectionHandler 在 TCP accept 时触发，此时 TLS 握手尚未开始。
+        // 关键诊断分界线：newConnectionHandler 在 TCP accept 时触发。
         // 加这条日志可以区分：TCP 连接到底到没到服务器——
-        // 有"收到新连接" → 说明网络可达，问题在 TLS 握手/证书；
+        // 有"收到新连接" → 说明网络可达，问题在后继的 HTTP 请求/安装进程；
         // 没有 → 说明 SpringBoard 根本没连过来（URL 被系统拦截 / 后台监听被挂起）。
         Logger.info("本地服务器收到新连接: \(connection.endpoint.debugDescription)")
         connection.stateUpdateHandler = { [weak self] state in
             guard let self = self else { return }
             switch state {
             case .ready:
-                Logger.info("本地服务器连接就绪 (.ready) — TLS 握手成功")
+                Logger.info("本地服务器连接就绪 (.ready)")
             case .failed(let error):
                 Logger.error("本地服务器连接失败: \(error.localizedDescription)")
                 self.connections.removeAll { $0 === connection }

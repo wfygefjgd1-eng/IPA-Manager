@@ -13,12 +13,24 @@ final class BackgroundAudioKeepAlive {
     private var player: AVAudioPlayer?
     private var isActive = false
     private var heartbeatTimer: Timer?
+    /// 最长保活时限任务：本地安装通常在几十秒内完成，超过该时限自动停止，
+    /// 避免安装链路异常卡住时静音播放 + 心跳日志永久运行（耗电 + 刷屏）。
+    private var autoStopWorkItem: DispatchWorkItem?
+    private let autoStopInterval: TimeInterval = 5 * 60
 
     private init() {}
 
     /// 开始保活：激活 playback AudioSession 并无限循环播放 1 秒静音 WAV。
-    /// 幂等：已在保活时直接返回。
+    /// 幂等：已在保活时直接返回。本地服务器可能在后台队列启动（安装重活已移出
+    /// 主线程），AVAudioSession/AVAudioPlayer 的设置统一切回主线程执行。
     func start() {
+        guard !isActive else { return }
+        DispatchQueue.main.async { [weak self] in
+            self?.startOnMainThread()
+        }
+    }
+
+    private func startOnMainThread() {
         guard !isActive else { return }
         do {
             let session = AVAudioSession.sharedInstance()
@@ -39,7 +51,9 @@ final class BackgroundAudioKeepAlive {
             // 后台心跳：每 5 秒记录一次，证明退后台后进程仍未被挂起。
             // 若心跳日志中断/消失 → 进程被系统挂起，NWListener 停止接受连接，
             // 这才能解释"SpringBoard 从未收到连接"的根本原因。
+            // 心跳用 debug 级别：不进诊断报告的失败专区，也不在正常日志里刷屏。
             startHeartbeat()
+            scheduleAutoStop()
         } catch {
             Logger.warning("后台音频保活启动失败: \(error.localizedDescription)")
         }
@@ -48,15 +62,33 @@ final class BackgroundAudioKeepAlive {
     private func startHeartbeat() {
         let t = Timer(timeInterval: 5.0, repeats: true) { _ in
             let playing = BackgroundAudioKeepAlive.shared.player?.isPlaying ?? false
-            Logger.info("后台音频保活心跳: 进程存活, player.isPlaying=\(playing)")
+            Logger.debug("后台音频保活心跳: 进程存活, player.isPlaying=\(playing)")
         }
         RunLoop.main.add(t, forMode: .common)
         heartbeatTimer = t
     }
 
+    /// 启动最长时限自动停止（默认 5 分钟）：安装链路异常卡住时兜底停止保活，
+    /// stop() 触发时会一并取消该定时任务；重复 start() 会重置计时。
+    private func scheduleAutoStop() {
+        autoStopWorkItem?.cancel()
+        let work = DispatchWorkItem { [weak self] in
+            // stop() 会 invalidate 主 RunLoop 上的 Timer / 停播放器 / 释放 AudioSession，
+            // 统一切回主线程执行
+            DispatchQueue.main.async {
+                self?.stop()
+            }
+        }
+        autoStopWorkItem = work
+        DispatchQueue.global(qos: .utility)
+            .asyncAfter(deadline: .now() + autoStopInterval, execute: work)
+    }
+
     /// 停止保活：停掉静音播放并释放 AudioSession。幂等。
     func stop() {
         guard isActive else { return }
+        autoStopWorkItem?.cancel()
+        autoStopWorkItem = nil
         heartbeatTimer?.invalidate()
         heartbeatTimer = nil
         player?.stop()

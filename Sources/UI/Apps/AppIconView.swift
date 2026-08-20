@@ -31,7 +31,10 @@ struct AppIconView: View {
     /// 用 ImageIO 降采样加载：图标常为 512~1024px，按目标渲染尺寸解码小图，
     /// 避免在内存中保留全分辨率位图。解码失败回退 nil（调用方显示占位图）。
     static func loadIcon(at path: String, targetSize: CGFloat) -> UIImage? {
-        let cacheKey = NSString(string: "\(path)#\(Int(targetSize * UIScreen.main.scale))")
+        // 缓存键含文件修改时间：重导入覆盖同名图标文件后内容变化，mtime 变化 → 新键
+        // → 强制重新解码，避免 NSCache 一直命中旧图（NSCache 不感知文件内容变化）。
+        let mtime = Self.modificationTime(of: path)
+        let cacheKey = NSString(string: "\(path)#\(Int(targetSize * UIScreen.main.scale))#\(mtime)")
         if let cached = cache.object(forKey: cacheKey) {
             return cached
         }
@@ -52,5 +55,12 @@ struct AppIconView: View {
         let image = UIImage(cgImage: cgImage)
         cache.setObject(image, forKey: cacheKey)
         return image
+    }
+
+    /// 文件修改时间戳（秒）：随缓存键参与比较；文件缺失时返回 0（loadIcon 会因
+    /// 打不开文件源返回 nil，占位图兜底），保证键值稳定。
+    private static func modificationTime(of path: String) -> TimeInterval {
+        let attributes = try? FileManager.default.attributesOfItem(atPath: path)
+        return (attributes?[.modificationDate] as? Date)?.timeIntervalSince1970 ?? 0
     }
 }

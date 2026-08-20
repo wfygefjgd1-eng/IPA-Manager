@@ -175,9 +175,19 @@ final class IPAParser {
             to: payloadDir.appendingPathComponent(package.appURL.lastPathComponent)
         )
 
-        // 输出到 .ipa 目录；同名文件已存在时 ZipManager.zip 会先移除再覆盖
-        let outputURL = AppFileManager.shared.directoryURL(.ipa)
-            .appendingPathComponent(fileURL.deletingPathExtension().lastPathComponent + ".ipa")
+        // 输出到 .ipa 目录。目标已存在时追加唯一后缀（-<UUID 8位>），绝不覆盖可能仍被
+        // 其它记录引用的旧文件——同名不同 bundleID 的 zip 二次导入若复用固定输出名，
+        // 会静默覆盖旧 IPA，且旧记录 path 会指向被替换的文件（元数据与磁盘内容错配）。
+        let baseName = fileURL.deletingPathExtension().lastPathComponent
+        let ipaDir = AppFileManager.shared.directoryURL(.ipa)
+        var outputURL = ipaDir.appendingPathComponent("\(baseName).ipa")
+        if FileManager.default.fileExists(atPath: outputURL.path) {
+            outputURL = ipaDir.appendingPathComponent("\(baseName)-\(UUID().uuidString.prefix(8)).ipa")
+            // 二次保险：唯一后缀仍可能碰撞（理论上不可能），存在则继续加随机
+            while FileManager.default.fileExists(atPath: outputURL.path) {
+                outputURL = ipaDir.appendingPathComponent("\(baseName)-\(UUID().uuidString.prefix(8)).ipa")
+            }
+        }
         try zipManager.zip(folderURL: stagingRoot, outputURL: outputURL)
         return outputURL
     }
