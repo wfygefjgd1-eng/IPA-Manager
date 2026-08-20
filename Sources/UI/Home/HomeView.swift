@@ -12,6 +12,12 @@ struct HomeView: View {
     @State private var importSuccessCount = 0
     @State private var importFailureCount = 0
     @State private var pendingImportCount = 0
+    /// 多选导入且自动签名开启时的前置确认（"顺序自动签名并安装 / 仅导入"），
+    /// 避免一连串系统安装确认弹窗措手不及
+    @State private var showBatchModeConfirm = false
+    @State private var pendingBatchURLs: [URL] = []
+    /// 本次批量是否允许自动签名并安装：仅导入时为 false，导入完成后重置为 true
+    @State private var batchAutoSignAllowed = true
 
     var body: some View {
         NavigationView {
@@ -32,10 +38,29 @@ struct HomeView: View {
                         importSuccessCount = 0
                         importFailureCount = 0
                         pendingImportCount = urls.count
-                        importRemaining(urls, startIndex: 0)
+                        // 多选 + 自动签名开关开启：先问一句，让用户决定是否一条龙
+                        if urls.count > 1, appState.autoSignAndInstallEnabled() {
+                            pendingBatchURLs = urls
+                            showBatchModeConfirm = true
+                        } else {
+                            batchAutoSignAllowed = true
+                            importRemaining(urls, startIndex: 0)
+                        }
                     },
                     allowsMultiple: true
                 )
+            }
+            .alert("批量导入 \(pendingImportCount) 个应用", isPresented: $showBatchModeConfirm) {
+                Button("顺序自动签名并安装") {
+                    batchAutoSignAllowed = true
+                    importRemaining(pendingBatchURLs, startIndex: 0)
+                }
+                Button("仅导入，不自动安装", role: .cancel) {
+                    batchAutoSignAllowed = false
+                    importRemaining(pendingBatchURLs, startIndex: 0)
+                }
+            } message: {
+                Text("每个应用将按顺序自动签名并发起安装，iOS 会逐个弹出安装确认。\n若想先导入、之后手动签名，请选择「仅导入」。")
             }
             .alert("提示", isPresented: $showAlert) {
                 Button("确定", role: .cancel) {}
@@ -44,6 +69,13 @@ struct HomeView: View {
             }
             .sheet(item: $selectedApp) { app in
                 AppDetailView(app: app)
+            }
+            // 批量导入全部结束后重置允许标记，避免影响下次导入
+            .onChange(of: importFailureCount + importSuccessCount) { _ in
+                if pendingImportCount > 1,
+                   importFailureCount + importSuccessCount >= pendingImportCount {
+                    batchAutoSignAllowed = true
+                }
             }
         }
         // 全局毛玻璃背景层：渐变 + 半透明材质，ScrollView 内容透出其上的玻璃质感。
@@ -211,9 +243,10 @@ struct HomeView: View {
                     showAlert = true
                     return
                 }
-                // 自动签名接管（设置开启 + 默认证书有效）：不再打开签名详情页，
+                // 自动签名接管（设置开启 + 默认证书有效 + 本次批量允许）：不再打开签名详情页，
                 // 直接后台签名并安装，完成后自动回桌面等 iOS 弹安装提示。
-                if appState.enqueueAutoSignAndInstall(app) {
+                // 批量选「仅导入」时 batchAutoSignAllowed=false，跳过自动签名，仅入未签名列表。
+                if batchAutoSignAllowed, appState.enqueueAutoSignAndInstall(app) {
                     appState.showToast("「\(app.name)」已导入，正在自动签名并安装…")
                     // 多选：全部完成时仍显示汇总（不逐个打开详情页打断）
                     if pendingImportCount > 1, importSuccessCount + importFailureCount >= pendingImportCount {
@@ -290,7 +323,8 @@ struct HomeView: View {
         .padding(.bottom, 12)
     }
 
-    /// 多选导入结束后的汇总提示（成功/失败个数）
+    /// 多选导入结束后的汇总提示（成功/失败个数）；批量选「仅导入」时附加说明，
+    /// 提示用户去首页/已签应用页手动签名
     private func showImportSummary() {
         let total = importSuccessCount + importFailureCount
         guard total > 1 else { return }
@@ -300,7 +334,11 @@ struct HomeView: View {
         } else {
             summary = "已成功导入 \(importSuccessCount) 个应用。"
         }
-        alertMessage = summary
+        if !batchAutoSignAllowed {
+            alertMessage = summary + " 本次未自动签名，可到首页点开对应应用手动签名。"
+        } else {
+            alertMessage = summary
+        }
         showAlert = true
     }
 

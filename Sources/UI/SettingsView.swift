@@ -15,12 +15,12 @@ struct SettingsView: View {
         NavigationView {
             List {
                 Section {
-                    aboutRow
-                        .rowCard()
-                    localSigningRow
-                        .rowCard()
+                    announcementCard
+                        .listRowInsets(EdgeInsets(top: 5, leading: 16, bottom: 5, trailing: 16))
+                        .listRowSeparator(.hidden)
+                        .listRowBackground(Color.clear)
                 } header: {
-                    sectionHeader(icon: "sparkles", title: "功能亮点")
+                    sectionHeader(icon: "megaphone.fill", title: "功能亮点")
                 }
 
                 Section {
@@ -168,42 +168,80 @@ struct SettingsView: View {
             )
     }
 
-    private var aboutRow: some View {
-        HStack(spacing: 12) {
-            iconTile(icon: "iphone.gen3", tint: .accentColor)
-            VStack(alignment: .leading, spacing: 2) {
-                Text("IPA 本地签名工具")
-                    .font(.subheadline)
-                    .foregroundColor(.primary)
-                Text("全程在设备本地完成，不上传任何文件")
-                    .font(.caption)
-                    .foregroundColor(.secondary)
+    /// 功能亮点公告卡：虚线边框 + 浅品牌色底，明显与下方可点的操作卡片区分，
+    /// 用户一眼知道这是"纯展示信息"而不是可点击的按钮
+    private var announcementCard: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(spacing: 10) {
+                Image(systemName: "sparkles")
+                    .font(.system(size: 18, weight: .semibold))
+                    .foregroundColor(.accentColor)
+                    .frame(width: 36, height: 36)
+                    .background(
+                        RoundedRectangle(cornerRadius: 9, style: .continuous)
+                            .fill(Color.accentColor.opacity(0.12))
+                    )
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("本地签名，数据不出设备")
+                        .font(.subheadline.weight(.semibold))
+                        .foregroundColor(.primary)
+                    Text("所有签名均在设备本地完成，不上传任何文件")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                }
             }
-            Spacer()
-            Image(systemName: "checkmark.seal.fill")
-                .font(.caption)
-                .foregroundColor(.green)
-        }
-        .padding(.vertical, 4)
-    }
 
-    private var localSigningRow: some View {
-        HStack(spacing: 12) {
-            iconTile(icon: "lock.shield.fill", tint: .orange)
-            VStack(alignment: .leading, spacing: 2) {
-                Text("证书安全存储")
-                    .font(.subheadline)
-                    .foregroundColor(.primary)
-                Text("证书与私钥保存在系统 Keychain")
-                    .font(.caption)
-                    .foregroundColor(.secondary)
+            Divider()
+                .overlay(Color.secondary.opacity(0.3))
+
+            HStack(spacing: 10) {
+                Image(systemName: "lock.shield.fill")
+                    .font(.system(size: 18, weight: .semibold))
+                    .foregroundColor(.green)
+                    .frame(width: 36, height: 36)
+                    .background(
+                        RoundedRectangle(cornerRadius: 9, style: .continuous)
+                            .fill(Color.green.opacity(0.12))
+                    )
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("证书安全存储")
+                        .font(.subheadline.weight(.medium))
+                        .foregroundColor(.primary)
+                    Text("证书与私钥保存在系统 Keychain")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                }
             }
-            Spacer()
-            Image(systemName: "key.fill")
-                .font(.caption)
-                .foregroundColor(.secondary)
+
+            HStack(spacing: 10) {
+                Image(systemName: "arrow.triangle.2.circlepath")
+                    .font(.system(size: 18, weight: .semibold))
+                    .foregroundColor(.orange)
+                    .frame(width: 36, height: 36)
+                    .background(
+                        RoundedRectangle(cornerRadius: 9, style: .continuous)
+                            .fill(Color.orange.opacity(0.12))
+                    )
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("自动流程可选")
+                        .font(.subheadline.weight(.medium))
+                        .foregroundColor(.primary)
+                    Text("导入后自动签名、签名后自动回桌面，可在下方开关")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                }
+            }
         }
-        .padding(.vertical, 4)
+        .padding(14)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(
+            RoundedRectangle(cornerRadius: 16, style: .continuous)
+                .fill(Color.accentColor.opacity(0.05))
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 16, style: .continuous)
+                .stroke(Color.accentColor.opacity(0.2), style: StrokeStyle(lineWidth: 1, dash: [6]))
+        )
     }
 
     /// 当前安装包的真实版本号（读 Info.plist 的 CFBundleShortVersionString + CFBundleVersion，

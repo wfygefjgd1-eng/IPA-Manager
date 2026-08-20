@@ -151,8 +151,27 @@ final class DownloadManager: NSObject {
                     taskModels[task.id] = task
                 }
             case .downloading:
-                // 重建活跃下载：默认会话优先级低，用后台 URLSession 续传或重新下载
-                rebuildTask(&task)
+                // 上次会话下载可能已完成并落盘，但中断/重试路径把状态残留成 downloading
+                // （retryDownload / rebuildTask 都写 .downloading 并持久化）。
+                // 若 Downloads 目录已存在该任务的完成产物（同名或唯一化后缀），
+                // 直接按「已完成」恢复：不重建下载，否则启动后会整包重新下载，
+                // 又触发「下载完成后自动签名并安装」，导致重复签名、已签应用堆重复。
+                if let existing = existingCompletedFile(for: task) {
+                    var done = task
+                    done.status = .completed
+                    done.destinationPath = existing.path
+                    done.resumeData = nil
+                    if let attrs = try? FileManager.default.attributesOfItem(atPath: existing.path),
+                       let size = attrs[.size] as? Int64 {
+                        done.totalBytes = size
+                        done.receivedBytes = size
+                    }
+                    taskModels[task.id] = done
+                    Logger.info("下载任务已有完成产物，按已完成恢复: \(task.fileName)")
+                } else {
+                    // 无产物：确实未完成，正常重建续传/重下
+                    rebuildTask(&task)
+                }
             case .paused:
                 // 保持暂停：只恢复模型（tasks[id] 保持 nil），
                 // 用户点“继续”时 resumeDownload 会重建 sessionTask 再 resume。
@@ -164,6 +183,34 @@ final class DownloadManager: NSObject {
         }
         persistTasks()
         Logger.info("恢复下载任务 \(taskModels.count) 个")
+    }
+
+    /// 在 Downloads 目录查找该任务的已完成产物。
+    /// 命中条件：同名文件，或「基础名-8位十六进制.扩展名」（finishDownload 的同名唯一化产物）。
+    /// 用于还原被中断/重试残留成 .downloading 但其实已下载完成的任务。
+    private func existingCompletedFile(for task: DownloadTask) -> URL? {
+        guard !task.fileName.isEmpty else { return nil }
+        let dir = AppFileManager.shared.directoryURL(.downloads)
+        guard let files = try? FileManager.default.contentsOfDirectory(
+            at: dir, includingPropertiesForKeys: nil
+        ) else { return nil }
+        for file in files {
+            let name = file.lastPathComponent
+            if name == task.fileName {
+                return file
+            }
+            let base = (task.fileName as NSString).deletingPathExtension
+            let ext = (task.fileName as NSString).pathExtension
+            // unique 后缀为 UUID().uuidString.prefix(8)（8 位 hex）
+            let prefix = "\(base)-"
+            if name.hasPrefix(prefix) && name.hasSuffix(".\(ext)") {
+                let mid = name.dropFirst(prefix.count).dropLast(ext.count + 1)
+                if mid.count == 8, mid.allSatisfy({ $0.isHexDigit }) {
+                    return file
+                }
+            }
+        }
+        return nil
     }
 
     /// 为恢复的 downloading/paused 任务重建真实 sessionTask：

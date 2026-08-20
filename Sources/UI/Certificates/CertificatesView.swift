@@ -11,6 +11,8 @@ struct CertificatesView: View {
     @State private var showAlert = false
     @State private var alertMessage = ""
     @State private var isImporting = false
+    /// 一键卸载全部证书的确认弹窗
+    @State private var showUninstallAllAlert = false
 
     var body: some View {
         NavigationView {
@@ -22,6 +24,16 @@ struct CertificatesView: View {
             .scrollContentBackground(.hidden)
             .navigationTitle("证书管理")
             .toolbar {
+                // 左上角：一键卸载证书（删除语义明确，配合右滑单删全部具备）
+                ToolbarItem(placement: .navigationBarLeading) {
+                    Button {
+                        showUninstallAllAlert = true
+                    } label: {
+                        Label("卸载证书", systemImage: "trash")
+                            .font(.subheadline.weight(.medium))
+                    }
+                    .disabled(appState.certificates.isEmpty)
+                }
                 ToolbarItem(placement: .navigationBarTrailing) {
                     // 一键导入：支持 zip（含 p12 + mobileprovision）/ 单独 p12 / mobileprovision；
                     // 原先的“+”与一键导入完全相同（打开同一个文件选择器），已合并为一个按钮
@@ -61,6 +73,19 @@ struct CertificatesView: View {
                 Button("确定", role: .cancel) {}
             } message: {
                 Text(alertMessage)
+            }
+            // 卸载全部证书：确认后逐个走 removeCertificate（同步清理 Keychain 私钥/密码条目），
+            // 右滑单删功能不受影响
+            .alert("一键卸载全部证书？", isPresented: $showUninstallAllAlert) {
+                Button("卸载", role: .destructive) {
+                    let all = appState.certificates
+                    for certificate in all {
+                        appState.removeCertificate(certificate)
+                    }
+                }
+                Button("取消", role: .cancel) {}
+            } message: {
+                Text("将卸载全部 \(appState.certificates.count) 张证书及对应 Keychain 私钥，此操作不可撤销。")
             }
             .overlay {
                 if isImporting {
@@ -213,12 +238,15 @@ struct CertificatesView: View {
                             .foregroundColor(.primary)
                             .lineLimit(1)
 
-                        // 默认选中态标记：与 SignOptionsView 的选中样式一致，
-                        // 让用户明确知道「一键签名」默认使用哪张证书
+                        // 「默认」徽章：自动签名默认使用的证书，
+                        // 用安静的胶囊徽章而非可点的勾选圈，突出“展示、不可操作”
                         if appState.selectedCertificate?.id == certificate.id {
-                            Image(systemName: "checkmark.circle.fill")
-                                .font(.caption)
+                            Text("默认")
+                                .font(.caption2.weight(.semibold))
                                 .foregroundColor(.accentColor)
+                                .padding(.horizontal, 7)
+                                .padding(.vertical, 2)
+                                .background(Capsule().fill(Color.accentColor.opacity(0.14)))
                         }
                     }
 
@@ -248,10 +276,7 @@ struct CertificatesView: View {
                 Spacer(minLength: 4)
             }
         }
-        .contentShape(Rectangle())
-        .onTapGesture {
-            appState.selectedCertificate = certificate
-        }
+        // 纯展示卡片：不设点击手势，证书页供查看，不承担默认选择等交互
     }
 
     private func profileRow(_ profile: ProvisioningInfo) -> some View {
@@ -273,11 +298,14 @@ struct CertificatesView: View {
                             .foregroundColor(.primary)
                             .lineLimit(1)
 
-                        // 默认选中态标记
+                        // 「默认」徽章：自动签名默认使用的描述文件
                         if appState.selectedProfile?.uuid == profile.uuid {
-                            Image(systemName: "checkmark.circle.fill")
-                                .font(.caption)
+                            Text("默认")
+                                .font(.caption2.weight(.semibold))
                                 .foregroundColor(.accentColor)
+                                .padding(.horizontal, 7)
+                                .padding(.vertical, 2)
+                                .background(Capsule().fill(Color.accentColor.opacity(0.14)))
                         }
                     }
 
@@ -308,10 +336,7 @@ struct CertificatesView: View {
                 Spacer(minLength: 4)
             }
         }
-        .contentShape(Rectangle())
-        .onTapGesture {
-            appState.selectedProfile = profile
-        }
+        // 纯展示卡片：不设点击手势，证书页供查看，不承担默认选择等交互
     }
 
     /// 有效期范围文案："yyyy-MM-dd ~ yyyy-MM-dd"，缺失端显示"未知"
