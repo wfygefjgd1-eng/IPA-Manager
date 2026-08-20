@@ -208,11 +208,13 @@ struct AppDetailView: View {
             if signProgress >= 1.0 {
                 Text("总用时 \(elapsedSeconds) 秒")
                     .font(.caption2)
-                    .foregroundColor(.tertiary)
+                    .foregroundColor(.secondary)
+                    .opacity(0.7)
             } else {
                 Text("已用 \(elapsedSeconds) 秒 · 预计剩余 \(etaSeconds) 秒")
                     .font(.caption2)
-                    .foregroundColor(.tertiary)
+                    .foregroundColor(.secondary)
+                    .opacity(0.7)
             }
         }
         .padding(.horizontal)
