@@ -156,7 +156,20 @@ final class ZipManager {
             }
             var processed: UInt64 = 0
             for entry in archive {
-                try archive.extract(entry, to: destinationURL)
+                // 关键：ZIPFoundation 的 extract(entry, to:) 中 to 是"条目自身的完整
+                // 目标路径"（FileManager.unzipItem 内部就是 destination + entry.path），
+                // 不是解压根目录！若直接把根目录传给 extract，第一个文件条目会在
+                // "已存在的目录路径"上 createFile → NSFileWriteFileExistsError（516）
+                // → 被误判为"ZIP 文件已损坏或下载不完整"。
+                let targetURL = destinationURL.appendingPathComponent(entry.path)
+                do {
+                    try archive.extract(entry, to: targetURL)
+                } catch let error as CocoaError where error.code == .fileWriteFileExists {
+                    // 条目目标已存在（重复条目/目录与文件同名）：unzipItem 内部
+                    // createFile 对已存在文件是覆盖、createDirectory 幂等，不会抛；
+                    // 这里显式跳过兜底，不视为归档损坏。
+                    Logger.debug("跳过已存在条目（不视为损坏）: \(entry.path)")
+                }
                 processed += entry.uncompressedSize
                 progress(Double(processed) / Double(totalBytes))
             }
