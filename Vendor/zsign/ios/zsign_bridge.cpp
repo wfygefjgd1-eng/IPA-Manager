@@ -8,6 +8,7 @@
 
 #include <openssl/pem.h>
 #include <openssl/objects.h>
+#include <openssl/obj_mac.h>
 #include <openssl/pkcs12.h>
 #include <openssl/x509.h>
 #include <openssl/x509v3.h>
