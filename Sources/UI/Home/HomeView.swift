@@ -112,8 +112,21 @@ struct HomeView: View {
                 Image(systemName: app.isSigned ? "checkmark.seal.fill" : "exclamationmark.circle")
                     .foregroundColor(app.isSigned ? .green : .orange)
             }
-            .padding(.vertical, 6)
+            .padding(12)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            // 卡片形式：与已签应用页/下载页一致的圆角浅色底 + 细描边，
+            // 每个应用整体一块、行间留空，不再是无分隔的"一溜"
+            .background(
+                RoundedRectangle(cornerRadius: 14, style: .continuous)
+                    .fill(Color(.secondarySystemGroupedBackground).opacity(0.85))
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: 14, style: .continuous)
+                    .stroke(Color.primary.opacity(0.06), lineWidth: 0.5)
+            )
         }
+        // 卡片与卡片之间的间距
+        .padding(.bottom, 10)
     }
 
     // 首页功能入口：仅保留可用的「导入文件」，显示为整条可点的长条卡片
@@ -143,8 +156,15 @@ struct HomeView: View {
             }
             .padding()
             .frame(maxWidth: .infinity, alignment: .leading)
-            .background(Color(.secondarySystemBackground))
-            .cornerRadius(12)
+            // 与列表卡片同款：圆角浅色底 + 细描边，深浅色自适应
+            .background(
+                RoundedRectangle(cornerRadius: 14, style: .continuous)
+                    .fill(Color(.secondarySystemGroupedBackground).opacity(0.85))
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: 14, style: .continuous)
+                    .stroke(Color.primary.opacity(0.06), lineWidth: 0.5)
+            )
         }
     }
 

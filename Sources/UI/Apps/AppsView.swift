@@ -37,8 +37,23 @@ struct AppsView: View {
                                     }
                                     appRow(app)
                                 }
+                                .padding(12)
                                 .frame(maxWidth: .infinity, alignment: .leading)
+                                // 卡片形式：浅色圆角底 + 细描边，图标/文字整体一块，
+                                // 行与行之间有明确间隔，不再是无界线的"一溜"
+                                .background(
+                                    RoundedRectangle(cornerRadius: 14, style: .continuous)
+                                        .fill(Color(.secondarySystemGroupedBackground).opacity(0.85))
+                                )
+                                .overlay(
+                                    RoundedRectangle(cornerRadius: 14, style: .continuous)
+                                        .stroke(Color.primary.opacity(0.06), lineWidth: 0.5)
+                                )
                             }
+                            // 卡片之间的间隔：行上下各留 5pt，行与行即 10pt 空隙
+                            .listRowInsets(EdgeInsets(top: 5, leading: 16, bottom: 5, trailing: 16))
+                            .listRowSeparator(.hidden)
+                            .listRowBackground(Color.clear)
                         }
                         .onDelete { offsets in
                             if isSelecting {
@@ -49,6 +64,7 @@ struct AppsView: View {
                             }
                         }
                     }
+                    .listStyle(.plain)
                     // 毛玻璃背景：隐藏 List 默认不透明底色，透出下方的 GlassBackground
                     .scrollContentBackground(.hidden)
                     .safeAreaInset(edge: .bottom, spacing: 0) {
@@ -58,9 +74,6 @@ struct AppsView: View {
                 }
             }
             .navigationTitle("已签应用")
-            // 毛玻璃背景：List 已透明化（scrollContentBackground(.hidden)），
-            // 这里在导航容器外层铺渐变 + 半透明材质，列表内容透出玻璃质感
-            .background(GlassBackground().ignoresSafeArea())
             .sheet(item: $selectedApp) { app in
                 AppDetailView(app: app)
             }
@@ -73,6 +86,9 @@ struct AppsView: View {
                 Text("将删除全部 \(appState.installedApps.count) 个已签应用及对应文件，此操作不可撤销。")
             }
         }
+        // 毛玻璃背景：置于 NavigationView 外层，列表/空态/导航栏区域统一一个底色，
+        // 列表已用 scrollContentBackground(.hidden) 透出其上的玻璃质感
+        .background(GlassBackground().ignoresSafeArea())
     }
 
     /// 底部悬浮操作条：非选择模式展示「全部清除 / 选择」；
@@ -159,7 +175,7 @@ struct AppsView: View {
                 .font(.caption)
                 .foregroundColor(.secondary)
         }
-        .padding(.vertical, 4)
+        // 卡片背景已由行容器统一绘制（HStack 外层），这里不再加自身 padding
     }
 
     /// 滑动删除：移除指定索引的已签应用（批量删除只触发一次全量重扫）

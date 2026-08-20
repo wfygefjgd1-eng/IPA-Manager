@@ -48,9 +48,6 @@ struct DownloadsView: View {
                     }
                     .listStyle(.plain)
                     .scrollContentBackground(.hidden)
-                    // 毛玻璃背景：隐藏 List 默认底色，铺 GlassBackground 渐变 + 半透明材质，
-                    // 下载任务卡片（半透明圆角底）透出其上的玻璃质感
-                    .background(GlassBackground().ignoresSafeArea())
                     .safeAreaInset(edge: .bottom, spacing: 0) {
                         // 底部悬浮操作条：位于 Tab 栏上方，拇指可及；半透明材质不突兀
                         floatingActionBar
@@ -123,6 +120,9 @@ struct DownloadsView: View {
                 refreshTasks()
             }
         }
+        // 毛玻璃背景：置于 NavigationView 外层，列表/空态/导航栏区域统一一个底色，
+        // 列表已用 scrollContentBackground(.hidden) 透出其上的玻璃质感
+        .background(GlassBackground().ignoresSafeArea())
     }
 
     /// 底部悬浮操作条：非选择模式展示「全部清除 / 选择」；
@@ -282,7 +282,7 @@ struct DownloadsView: View {
         .padding(.vertical, 10)
         .background(
             RoundedRectangle(cornerRadius: 14, style: .continuous)
-                .fill(Color(.secondarySystemGroupedBackground))
+                .fill(Color(.secondarySystemGroupedBackground).opacity(0.85))
         )
         .overlay(
             RoundedRectangle(cornerRadius: 14, style: .continuous)

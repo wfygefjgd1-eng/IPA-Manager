@@ -74,8 +74,10 @@ struct CertificatesView: View {
                         .cornerRadius(12)
                 }
             }
-            .background(GlassBackground().ignoresSafeArea())
         }
+        // 毛玻璃背景：置于 NavigationView 外层，列表/空态/导航栏区域统一一个底色，
+        // 列表已用 scrollContentBackground(.hidden) 透出其上的玻璃质感
+        .background(GlassBackground().ignoresSafeArea())
     }
 
     private var certificatesSection: some View {

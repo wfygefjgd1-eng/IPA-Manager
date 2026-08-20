@@ -50,10 +50,7 @@ struct SettingsView: View {
                 }
             }
             .scrollContentBackground(.hidden)
-            // 毛玻璃背景：List 已透明化（scrollContentBackground(.hidden)），
-            // 这里在导航容器外层铺渐变 + 半透明材质，列表内容透出玻璃质感
             .navigationTitle("设置")
-            .background(GlassBackground().ignoresSafeArea())
             .alert("IPA Manager", isPresented: $showAbout) {
                 Button("确定", role: .cancel) {}
             } message: {
@@ -71,6 +68,9 @@ struct SettingsView: View {
                 ShareSheet(items: [item.url])
             }
         }
+        // 毛玻璃背景：置于 NavigationView 外层，列表/空态/导航栏区域统一一个底色，
+        // 列表已用 scrollContentBackground(.hidden) 透出其上的玻璃质感
+        .background(GlassBackground().ignoresSafeArea())
     }
 
     /// 当前安装包的真实版本号（读 Info.plist 的 CFBundleShortVersionString + CFBundleVersion，
