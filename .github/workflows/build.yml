@@ -90,8 +90,11 @@ jobs:
           unzip -Z1 "$IPA" | grep -qE '^Payload/[^/]+\.app/Info\.plist$' \
             || { echo "IPA 结构或版本校验失败，终止发布"; exit 1; }
           # d) 提取 Info.plist 校验版本号（plutil 对二进制 plist 输出
-          #    "CFBundleShortVersionString" => "1.0.65" 格式）
-          PLIST_PATH="$(unzip -Z1 "$IPA" | grep -m1 '\.app/Info\.plist$' || true)"
+          #    "CFBundleShortVersionString" => "1.0.65" 格式）。
+          #    只匹配 Payload/ 顶层 App 的 plist（^Payload/[^/]+.app/Info.plist），
+          #    排除嵌套 .bundle/.appex 内的 Info.plist（其 CFBundleIdentifier 是
+          #    资源包而非主 App，版本号可能不同导致误判）。
+          PLIST_PATH="$(unzip -Z1 "$IPA" | grep -E '^Payload/[^/]+\.app/Info\.plist$' | head -1 || true)"
           test -n "$PLIST_PATH" || { echo "IPA 结构或版本校验失败，终止发布"; exit 1; }
           unzip -p "$IPA" "$PLIST_PATH" | plutil -p - > /tmp/ipa-info.txt
           grep -qE '"CFBundleShortVersionString" => "1\.0\.${{ github.run_number }}"' /tmp/ipa-info.txt \
