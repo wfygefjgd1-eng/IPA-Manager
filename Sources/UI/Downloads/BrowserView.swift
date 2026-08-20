@@ -24,118 +24,169 @@ struct BrowserView: View {
     var body: some View {
         NavigationView {
             VStack(spacing: 0) {
-                // 地址栏：显示/输入 URL，回车导航；加载失败时有页内回调提示（见 Coordinator）
-                VStack(spacing: 0) {
-                    HStack(spacing: 8) {
-                        if isLoading {
-                            ProgressView()
-                                .scaleEffect(0.8)
-                        }
-                        TextField("输入网址", text: $urlString)
-                            .keyboardType(.URL)
-                            .textInputAutocapitalization(.never)
-                            .autocorrectionDisabled()
-                            .submitLabel(.go)
-                            .onSubmit {
-                                navigate(to: urlString)
-                            }
-                            .font(.footnote)
-                            .padding(.horizontal, 12)
-                            .padding(.vertical, 7)
-                            .background(Color(.secondarySystemBackground))
-                            .cornerRadius(10)
-                    }
-                    .padding(.horizontal, 12)
-                    .padding(.top, 8)
-                    .padding(.bottom, 4)
-                }
-
-                WebView(
-                    url: $urlString,
-                    isLoading: $isLoading,
-                    canGoBack: $canGoBack,
-                    canGoForward: $canGoForward,
-                    onDownloadDetected: { url in
-                        // 命中下载链接：不再弹确认框，直接开始下载并切到“下载”标签页
-                        startDownload(url)
-                    },
-                    onLoadFailed: { message in
-                        toastMessage = message
-                        showToast = true
-                        DispatchQueue.main.asyncAfter(deadline: .now() + 3) {
-                            showToast = false
-                        }
-                    }
-                )
-                .ignoresSafeArea(edges: .bottom)
-
-                Divider()
-
-                toolbar
-            }
-            .navigationTitle("浏览器")
-            .navigationBarTitleDisplayMode(.inline)
-            .toolbar {
-                ToolbarItem(placement: .navigationBarLeading) {
-                    Button("关闭") {
-                        dismiss()
+                // Safari 风格地址栏：大号圆角胶囊 + 锁标识 + 加载指示，浅色底融入导航栏
+            HStack(spacing: 8) {
+                // 安全状态：https 显示锁，http 显示警示，加载中显示进度
+                Group {
+                    if isLoading {
+                        ProgressView()
+                            .scaleEffect(0.8)
+                    } else if urlString.lowercased().hasPrefix("https://") {
+                        Image(systemName: "lock.fill")
+                            .font(.caption2.weight(.semibold))
+                            .foregroundColor(.secondary)
+                    } else {
+                        Image(systemName: "lock.open")
+                            .font(.caption2.weight(.semibold))
+                            .foregroundColor(.orange)
                     }
                 }
-                ToolbarItem(placement: .navigationBarTrailing) {
+                .frame(width: 16)
+
+                TextField("搜索或输入网址", text: $urlString)
+                    .keyboardType(.URL)
+                    .textInputAutocapitalization(.never)
+                    .autocorrectionDisabled()
+                    .submitLabel(.go)
+                    .onSubmit {
+                        navigate(to: urlString)
+                    }
+                    .font(.footnote)
+                    .foregroundColor(.primary)
+
+                // 无内容时显示站点图标占位；有内容时显示清除按钮（Safari 同款）
+                if urlString.isEmpty {
+                    Image(systemName: "safari")
+                        .font(.caption2)
+                        .foregroundColor(.secondary)
+                } else {
                     Button {
-                        addCurrentPageToBookmarks()
+                        urlString = ""
                     } label: {
-                        Image(systemName: "plus")
+                        Image(systemName: "xmark.circle.fill")
+                            .font(.caption)
+                            .foregroundColor(.secondary.opacity(0.5))
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+            .padding(.horizontal, 12)
+            .frame(height: 38)
+            .background {
+                Capsule()
+                    .fill(Color(.systemGray5).opacity(0.85))
+            }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 8)
+
+            WebView(
+                url: $urlString,
+                isLoading: $isLoading,
+                canGoBack: $canGoBack,
+                canGoForward: $canGoForward,
+                onDownloadDetected: { url in
+                    // 命中下载链接：不再弹确认框，直接开始下载并切到“下载”标签页
+                    startDownload(url)
+                },
+                onLoadFailed: { message in
+                    toastMessage = message
+                    showToast = true
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 3) {
+                        showToast = false
                     }
                 }
-            }
-            .sheet(isPresented: $showBookmarks) {
-                BookmarkView { url in
-                    urlString = url.absoluteString
-                    showBookmarks = false
+            )
+            .ignoresSafeArea(edges: .bottom)
+
+            Divider()
+
+            toolbar
+        }
+        .navigationTitle("浏览器")
+        .navigationBarTitleDisplayMode(.inline)
+        .toolbar {
+            ToolbarItem(placement: .navigationBarLeading) {
+                Button("关闭") {
+                    dismiss()
                 }
             }
-            // 轻提示：收藏当前页面等操作结果
-            .overlay(alignment: .bottom) {
-                if showToast {
-                    Text(toastMessage)
-                        .font(.footnote)
-                        .padding(.horizontal, 16)
-                        .padding(.vertical, 8)
-                        .background(Capsule().fill(Color.black.opacity(0.75)))
-                        .foregroundColor(.white)
-                        .padding(.bottom, 20)
-                        .transition(.opacity)
+            ToolbarItem(placement: .navigationBarTrailing) {
+                Button {
+                    addCurrentPageToBookmarks()
+                } label: {
+                    Image(systemName: "plus")
                 }
-            }
-            .animation(.easeInOut(duration: 0.25), value: showToast)
-            .onAppear {
-                showToast = false
             }
         }
+        .sheet(isPresented: $showBookmarks) {
+            BookmarkView { url in
+                urlString = url.absoluteString
+                showBookmarks = false
+            }
+        }
+        // 轻提示：收藏当前页面等操作结果
+        .overlay(alignment: .bottom) {
+            if showToast {
+                Text(toastMessage)
+                    .font(.footnote)
+                    .padding(.horizontal, 16)
+                    .padding(.vertical, 8)
+                    .background(Capsule().fill(Color.black.opacity(0.75)))
+                    .foregroundColor(.white)
+                    .padding(.bottom, 20)
+                    .transition(.opacity)
+            }
+        }
+        .animation(.easeInOut(duration: 0.25), value: showToast)
+        .onAppear {
+            showToast = false
+        }
+        } // NavigationView
     }
 
     private var toolbar: some View {
-        HStack(spacing: 16) {
+        HStack(spacing: 14) {
+            // 后退/前进：Safari 风格小圆点按钮，禁用时更淡
             Button {
                 NotificationCenter.default.post(name: .browserGoBack, object: nil)
             } label: {
                 Image(systemName: "chevron.left")
+                    .font(.system(size: 15, weight: .semibold))
+                    .frame(width: 34, height: 34)
+                    .background(Circle().fill(Color.primary.opacity(0.06)))
             }
             .disabled(!canGoBack)
+            .opacity(canGoBack ? 1 : 0.35)
+            .buttonStyle(.plain)
 
             Button {
                 NotificationCenter.default.post(name: .browserGoForward, object: nil)
             } label: {
                 Image(systemName: "chevron.right")
+                    .font(.system(size: 15, weight: .semibold))
+                    .frame(width: 34, height: 34)
+                    .background(Circle().fill(Color.primary.opacity(0.06)))
             }
             .disabled(!canGoForward)
+            .opacity(canGoForward ? 1 : 0.35)
+            .buttonStyle(.plain)
 
             Spacer()
 
-            if isLoading {
-                ProgressView()
+            // 重新加载/停止：与 Safari 加载指示一致（加载中显示停止，否则显示刷新）
+            Button {
+                if isLoading {
+                    NotificationCenter.default.post(name: .browserStopLoading, object: nil)
+                } else {
+                    NotificationCenter.default.post(name: .browserReload, object: nil)
+                }
+            } label: {
+                Image(systemName: isLoading ? "xmark" : "arrow.clockwise")
+                    .font(.system(size: 14, weight: .medium))
+                    .frame(width: 34, height: 34)
+                    .background(Circle().fill(Color.primary.opacity(0.06)))
             }
+            .buttonStyle(.plain)
 
             Spacer()
 
@@ -143,22 +194,36 @@ struct BrowserView: View {
                 NotificationCenter.default.post(name: .browserOpenBrowser, object: nil)
             } label: {
                 Image(systemName: "safari")
+                    .font(.system(size: 15, weight: .medium))
+                    .frame(width: 34, height: 34)
+                    .background(Circle().fill(Color.primary.opacity(0.06)))
             }
+            .buttonStyle(.plain)
 
             Button {
                 showBookmarks = true
             } label: {
                 Image(systemName: "bookmark")
+                    .font(.system(size: 15, weight: .medium))
+                    .frame(width: 34, height: 34)
+                    .background(Circle().fill(Color.primary.opacity(0.06)))
             }
+            .buttonStyle(.plain)
 
             Button {
                 dismiss()
             } label: {
                 Image(systemName: "xmark")
+                    .font(.system(size: 15, weight: .semibold))
+                    .frame(width: 34, height: 34)
+                    .background(Circle().fill(Color.primary.opacity(0.06)))
             }
+            .buttonStyle(.plain)
         }
         .padding(.horizontal, 16)
-        .padding(.vertical, 10)
+        .padding(.top, 8)
+        .padding(.bottom, 6)
+        .background(.ultraThinMaterial)
     }
 
     private func startDownload(_ url: URL) {
@@ -246,6 +311,8 @@ extension Notification.Name {
     static let browserGoBack = Notification.Name("browserGoBack")
     static let browserGoForward = Notification.Name("browserGoForward")
     static let browserOpenBrowser = Notification.Name("browserOpenBrowser")
+    static let browserReload = Notification.Name("browserReload")
+    static let browserStopLoading = Notification.Name("browserStopLoading")
 }
 
 private struct WebView: UIViewRepresentable {
@@ -333,6 +400,24 @@ private struct WebView: UIViewRepresentable {
             )
             notificationTokens.append(
                 NotificationCenter.default.addObserver(
+                    forName: .browserReload,
+                    object: nil,
+                    queue: .main
+                ) { [weak self] _ in
+                    self?.reload()
+                }
+            )
+            notificationTokens.append(
+                NotificationCenter.default.addObserver(
+                    forName: .browserStopLoading,
+                    object: nil,
+                    queue: .main
+                ) { [weak self] _ in
+                    self?.stopLoading()
+                }
+            )
+            notificationTokens.append(
+                NotificationCenter.default.addObserver(
                     forName: .browserOpenBrowser,
                     object: nil,
                     queue: .main
@@ -348,6 +433,14 @@ private struct WebView: UIViewRepresentable {
 
         func goForward() {
             webView?.goForward()
+        }
+
+        func reload() {
+            webView?.reload()
+        }
+
+        func stopLoading() {
+            webView?.stopLoading()
         }
 
         func openInBrowser() {

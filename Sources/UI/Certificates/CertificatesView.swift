@@ -11,8 +11,14 @@ struct CertificatesView: View {
     @State private var showAlert = false
     @State private var alertMessage = ""
     @State private var isImporting = false
-    /// 一键卸载全部证书的确认弹窗
-    @State private var showUninstallAllAlert = false
+    /// 导入目标：nil = 底部「一键导入证书」全类型；.certificate / .profile = 对应空态框点击直达
+    @State private var importTarget: ImportTarget?
+
+    /// 空态点击要打开的文档类型范围（证书/描述文件可区分直达）
+    enum ImportTarget {
+        case certificate
+        case profile
+    }
 
     var body: some View {
         NavigationView {
@@ -23,32 +29,18 @@ struct CertificatesView: View {
             .listStyle(.plain)
             .scrollContentBackground(.hidden)
             .navigationTitle("证书管理")
-            .toolbar {
-                // 左上角：一键卸载证书（删除语义明确，配合右滑单删全部具备）
-                ToolbarItem(placement: .navigationBarLeading) {
-                    Button {
-                        showUninstallAllAlert = true
-                    } label: {
-                        Label("卸载证书", systemImage: "trash")
-                            .font(.subheadline.weight(.medium))
-                    }
-                    .disabled(appState.certificates.isEmpty)
-                }
-                ToolbarItem(placement: .navigationBarTrailing) {
-                    // 一键导入：支持 zip（含 p12 + mobileprovision）/ 单独 p12 / mobileprovision；
-                    // 原先的“+”与一键导入完全相同（打开同一个文件选择器），已合并为一个按钮
-                    Button {
-                        showImporter = true
-                    } label: {
-                        Label("一键导入", systemImage: "square.and.arrow.down")
-                            .font(.subheadline.weight(.medium))
-                    }
-                }
+            .safeAreaInset(edge: .bottom, spacing: 0) {
+                importFloatingBar
             }
             .sheet(isPresented: $showImporter) {
-                DocumentPicker { url in
-                    handleImportedFile(url)
-                }
+                // 按导入目标限定文件类型：证书空态只选 p12/pfx/zip，描述文件空态只选 mobileprovision/zip；
+                // 底部「一键导入证书」全类型（zip/p12/pfx/mobileprovision）
+                DocumentPicker(
+                    onPick: { url in
+                        handleImportedFile(url)
+                    },
+                    contentTypes: pickerContentTypes(for: importTarget)
+                )
             }
             .sheet(isPresented: $showPasswordSheet, onDismiss: {
                 // 兜底清理：下滑手势关闭等未走 onImport/onCancel 的关闭路径，
@@ -74,19 +66,6 @@ struct CertificatesView: View {
             } message: {
                 Text(alertMessage)
             }
-            // 卸载全部证书：确认后逐个走 removeCertificate（同步清理 Keychain 私钥/密码条目），
-            // 右滑单删功能不受影响
-            .alert("一键卸载全部证书？", isPresented: $showUninstallAllAlert) {
-                Button("卸载", role: .destructive) {
-                    let all = appState.certificates
-                    for certificate in all {
-                        appState.removeCertificate(certificate)
-                    }
-                }
-                Button("取消", role: .cancel) {}
-            } message: {
-                Text("将卸载全部 \(appState.certificates.count) 张证书及对应 Keychain 私钥，此操作不可撤销。")
-            }
             .overlay {
                 if isImporting {
                     ProgressView("正在导入...")
@@ -107,8 +86,12 @@ struct CertificatesView: View {
                 emptyCard(
                     icon: "key.fill",
                     title: "暂无企业证书",
-                    subtitle: "点击右上角「一键导入」\n支持 P12 / PFX 或 zip 一键导入"
-                )
+                    subtitle: "点击此处导入证书\n支持 P12 / PFX 或 zip 一键导入"
+                ) {
+                    // 无证书：点击空态框直达「选择企业证书」
+                    importTarget = .certificate
+                    showImporter = true
+                }
             } else {
                 ForEach(appState.certificates) { certificate in
                     certificateRow(certificate)
@@ -138,8 +121,12 @@ struct CertificatesView: View {
                 emptyCard(
                     icon: "doc.badge.gearshape",
                     title: "暂无描述文件",
-                    subtitle: "点击右上角「一键导入」\n支持 zip 或单独 mobileprovision"
-                )
+                    subtitle: "点击此处导入描述文件\n支持 zip 或单独 mobileprovision"
+                ) {
+                    // 无描述文件：点击空态框直达「选择描述文件」
+                    importTarget = .profile
+                    showImporter = true
+                }
             } else {
                 ForEach(appState.profiles) { profile in
                     profileRow(profile)
@@ -163,6 +150,46 @@ struct CertificatesView: View {
         }
     }
 
+    /// 底部悬浮「一键导入证书」：大号半透明胶囊 + 阴影，悬浮在内容底部（类似已签应用/下载页的操作条），
+    /// 替代原右上角小按钮，改成页面底部的醒目入口。
+    private var importFloatingBar: some View {
+        FloatingActionBar {
+            Button {
+                // 全类型导入（zip/p12/pfx/mobileprovision）
+                importTarget = nil
+                showImporter = true
+            } label: {
+                HStack(spacing: 8) {
+                    Image(systemName: "square.and.arrow.down")
+                        .font(.system(size: 17, weight: .semibold))
+                    Text("一键导入证书")
+                        .font(.headline.weight(.semibold))
+                }
+                .foregroundColor(.white)
+                .frame(maxWidth: .infinity)
+                .padding(.vertical, 12)
+                .background(
+                    Capsule()
+                        .fill(Color.accentColor.gradient)
+                )
+                .shadow(color: .accentColor.opacity(0.35), radius: 8, x: 0, y: 4)
+            }
+            .buttonStyle(.plain)
+        }
+    }
+
+    /// 文档选择器按导入目标限定类型：证书 → p12/pfx/zip；描述文件 → mobileprovision/zip；全类型 → 所有
+    private func pickerContentTypes(for target: ImportTarget?) -> [UTType]? {
+        switch target {
+        case .certificate:
+            return [.p12Type, .zip]
+        case .profile:
+            return [.mobileprovisionType, .zip]
+        case nil:
+            return nil
+        }
+    }
+
     /// Section 标题：左侧小图标 + 文字，与卡片化布局呼应，不再光秃秃一行字
     private func sectionHeader(icon: String, title: String) -> some View {
         HStack(spacing: 6) {
@@ -177,27 +204,42 @@ struct CertificatesView: View {
         .padding(.vertical, 2)
     }
 
-    /// 空态卡片：虚线圆角框，图标 + 主标题 + 引导文字，比单行灰字完整
-    private func emptyCard(icon: String, title: String, subtitle: String) -> some View {
-        VStack(spacing: 8) {
-            Image(systemName: icon)
-                .font(.system(size: 30))
-                .foregroundColor(.secondary.opacity(0.7))
-            Text(title)
-                .font(.subheadline.weight(.medium))
-                .foregroundColor(.secondary)
-            Text(subtitle)
-                .font(.caption)
-                .foregroundColor(.secondary.opacity(0.8))
-                .multilineTextAlignment(.center)
+    /// 空态卡片：虚线圆角框，图标 + 主标题 + 引导文字，比单行灰字完整。
+    /// 可点击直达对应类型的导入（无证书/描述文件时引导用户导入）。
+    private func emptyCard(
+        icon: String,
+        title: String,
+        subtitle: String,
+        action: @escaping () -> Void
+    ) -> some View {
+        Button(action: action) {
+            VStack(spacing: 8) {
+                Image(systemName: icon)
+                    .font(.system(size: 30))
+                    .foregroundColor(.secondary.opacity(0.7))
+                Text(title)
+                    .font(.subheadline.weight(.medium))
+                    .foregroundColor(.secondary)
+                Text(subtitle)
+                    .font(.caption)
+                    .foregroundColor(.secondary.opacity(0.8))
+                    .multilineTextAlignment(.center)
+                // 明确的导入引导：让用户知道这个框可以点
+                Label("点击导入", systemImage: "arrow.up.doc")
+                    .font(.caption.weight(.semibold))
+                    .foregroundColor(.accentColor)
+                    .padding(.top, 4)
+            }
+            .frame(maxWidth: .infinity)
+            .padding(.vertical, 22)
+            .padding(.horizontal, 12)
+            .background(
+                RoundedRectangle(cornerRadius: 14, style: .continuous)
+                    .stroke(Color.secondary.opacity(0.18), lineWidth: 0.8)
+            )
         }
-        .frame(maxWidth: .infinity)
-        .padding(.vertical, 28)
-        .padding(.horizontal, 12)
-        .background(
-            RoundedRectangle(cornerRadius: 14, style: .continuous)
-                .stroke(Color.secondary.opacity(0.18), lineWidth: 0.8)
-        )
+        .buttonStyle(.plain)
+        .contentShape(Rectangle())
         .listRowInsets(EdgeInsets(top: 5, leading: 16, bottom: 5, trailing: 16))
         .listRowSeparator(.hidden)
         .listRowBackground(Color.clear)
@@ -390,20 +432,6 @@ struct CertificatesView: View {
         }
     }
 
-    private func handleImport(_ result: Result<[URL], Error>) {
-        switch result {
-        case .success(let urls):
-            guard let url = urls.first else { return }
-            handleImportedFile(url)
-        case .failure(let error):
-            alertMessage = error.localizedDescription
-            showAlert = true
-        }
-    }
-
-    /// 清理当前待导入证书流程残留的敏感文件：托管 P12 明文副本（Certificates/cert-*.p12）
-    /// 与解压目录（bundle-extract-*）。onImport 成功 / onCancel / 下滑关闭兜底共用，
-    /// 内部幂等：状态已清空时不再重复清理。
     private func cleanupPendingCertImport() {
         let managed = managedPendingP12
         let extractDir = pendingExtractDir
