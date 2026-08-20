@@ -20,13 +20,31 @@ struct DownloadsView: View {
                     emptyView
                 } else {
                     List {
-                        ForEach(tasks) { task in
-                            downloadRow(task)
-                        }
-                        .onDelete { offsets in
-                            deleteTasks(at: offsets)
+                        Section {
+                            ForEach(tasks) { task in
+                                downloadRow(task)
+                                    .listRowInsets(EdgeInsets(top: 5, leading: 16, bottom: 5, trailing: 16))
+                                    .listRowSeparator(.hidden)
+                                    .listSectionSeparator(.hidden)
+                                    .listRowBackground(Color.clear)
+                            }
+                            .onDelete { offsets in
+                                deleteTasks(at: offsets)
+                            }
+                        } header: {
+                            HStack {
+                                Text("下载任务")
+                                Spacer()
+                                Text("\(tasks.count) 个")
+                            }
+                            .font(.footnote)
+                            .foregroundColor(.secondary)
+                            .textCase(nil)
                         }
                     }
+                    .listStyle(.plain)
+                    .scrollContentBackground(.hidden)
+                    .background(Color(.systemGroupedBackground))
                 }
             }
             .navigationTitle("下载")
@@ -116,55 +134,95 @@ struct DownloadsView: View {
         }
     }
 
+    /// 下载任务卡片：紧凑单行图标 + 文件名（中间截断）+ 状态胶囊 / 暂停按钮 + 细分进度条。
+    /// 仅做视觉呈现；点击、contextMenu（重试/删除）、暂停恢复等业务行为保持原样。
     private func downloadRow(_ task: DownloadTask) -> some View {
-        VStack(alignment: .leading, spacing: 8) {
-            HStack {
-                VStack(alignment: .leading) {
-                    Text(task.fileName.isEmpty ? "未知文件" : task.fileName)
-                        .font(.headline)
-                    Text(task.statusDescription)
-                        .font(.caption)
-                        .foregroundColor(statusColor(task.status))
+        HStack(alignment: .center, spacing: 12) {
+            // 文件类型图标 + 按状态的浅色圆角底
+            ZStack(alignment: .bottomTrailing) {
+                RoundedRectangle(cornerRadius: 10, style: .continuous)
+                    .fill(tileBackground(for: task.status))
+                Image(systemName: fileIconName(for: task))
+                    .font(.system(size: 17, weight: .medium))
+                    .foregroundColor(tileForeground(for: task.status))
+                if task.status == .completed {
+                    Image(systemName: "checkmark.circle.fill")
+                        .font(.system(size: 12))
+                        .foregroundColor(.green)
+                        .padding(2)
+                        .background(Circle().fill(Color(.systemBackground)))
                 }
-                Spacer()
+            }
+            .frame(width: 42, height: 42)
+
+            VStack(alignment: .leading, spacing: 4) {
+                Text(task.fileName.isEmpty ? "未知文件" : task.fileName)
+                    .font(.subheadline.weight(.medium))
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+
+                if task.status == .downloading || task.status == .paused || task.status == .waiting {
+                    VStack(alignment: .leading, spacing: 4) {
+                        progressCapsule(value: task.progress, tint: statusColor(task.status))
+                        HStack(spacing: 6) {
+                            Text(sizeSummary(for: task))
+                                .font(.caption2)
+                                .foregroundColor(.secondary)
+                                .lineLimit(1)
+                                .truncationMode(.middle)
+                            Spacer()
+                            Text(String(format: "%.0f%%", task.progress * 100))
+                                .font(.caption2.monospacedDigit())
+                                .foregroundColor(.secondary)
+                        }
+                    }
+                } else if task.status == .completed {
+                    Text("点击进入签名")
+                        .font(.caption2)
+                        .foregroundColor(.secondary)
+                } else if task.status == .failed {
+                    if let error = task.error, !error.isEmpty {
+                        Text(error)
+                            .font(.caption2)
+                            .foregroundColor(.red)
+                            .lineLimit(1)
+                            .truncationMode(.middle)
+                    } else {
+                        Text("下载失败")
+                            .font(.caption2)
+                            .foregroundColor(.red)
+                    }
+                }
+            }
+
+            Spacer(minLength: 8)
+
+            if task.status == .downloading || task.status == .paused {
                 Button {
                     togglePause(task)
                 } label: {
-                    Image(systemName: task.status == .paused ? "play.circle.fill" : "pause.circle.fill")
+                    Image(systemName: task.status == .paused ? "play.fill" : "pause.fill")
+                        .font(.system(size: 13, weight: .semibold))
                         .foregroundColor(.accentColor)
+                        .frame(width: 30, height: 30)
+                        .background(Circle().fill(Color.accentColor.opacity(0.12)))
                 }
+                .buttonStyle(.borderless)
                 .disabled(task.status != .downloading && task.status != .paused)
-            }
-
-            ProgressView(value: task.progress)
-                .progressViewStyle(.linear)
-
-            HStack {
-                Text("\(ByteCountFormatter.string(fromByteCount: task.receivedBytes, countStyle: .file)) / \(ByteCountFormatter.string(fromByteCount: task.totalBytes, countStyle: .file))")
-                    .font(.caption)
-                    .foregroundColor(.secondary)
-                Spacer()
-                Text(String(format: "%.0f%%", task.progress * 100))
-                    .font(.caption)
-                    .foregroundColor(.secondary)
-            }
-
-            if task.status == .failed, let error = task.error, !error.isEmpty {
-                Text(error)
-                    .font(.caption)
-                    .foregroundColor(.secondary)
-            }
-
-            if task.status == .completed {
-                HStack(spacing: 4) {
-                    Image(systemName: "checkmark.circle.fill")
-                    Text("已完成·点击签名")
-                }
-                .font(.caption)
-                .foregroundColor(.green)
+            } else {
+                statusChip(text: task.statusDescription, color: statusColor(task.status))
             }
         }
-        .padding(.vertical, 4)
+        .padding(.horizontal, 12)
+        .padding(.vertical, 10)
+        .background(
+            RoundedRectangle(cornerRadius: 14, style: .continuous)
+                .fill(Color(.secondarySystemGroupedBackground))
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 14, style: .continuous)
+                .stroke(Color.primary.opacity(0.05), lineWidth: 0.5)
+        )
         .contentShape(Rectangle())
         .onTapGesture {
             guard task.status == .completed else { return }
@@ -189,6 +247,65 @@ struct DownloadsView: View {
                 Label("删除", systemImage: "trash")
             }
         }
+    }
+
+    /// 任务行内状态使用的浅色底（图标方形底）。
+    private func tileBackground(for status: DownloadTask.Status) -> Color {
+        switch status {
+        case .completed: return Color.green.opacity(0.14)
+        case .failed: return Color.red.opacity(0.14)
+        case .downloading: return Color.blue.opacity(0.14)
+        case .paused: return Color.orange.opacity(0.14)
+        case .waiting: return Color.secondary.opacity(0.12)
+        }
+    }
+
+    /// 任务行内状态使用的前景（图标 / 状态文字）。
+    private func tileForeground(for status: DownloadTask.Status) -> Color {
+        switch status {
+        case .completed: return .green
+        case .failed: return .red
+        case .downloading: return .blue
+        case .paused: return .orange
+        case .waiting: return .secondary
+        }
+    }
+
+    /// 按扩展名选择文件类型图标：zip→doc.zipper，ipa→app.badge，其余→doc.fill。
+    private func fileIconName(for task: DownloadTask) -> String {
+        switch (task.fileName as NSString).pathExtension.lowercased() {
+        case "zip": return "doc.zipper"
+        case "ipa": return "app.badge"
+        default: return "doc.fill"
+        }
+    }
+
+    /// 紧凑的状态胶囊：浅色底 + 同色系小字。
+    private func statusChip(text: String, color: Color) -> some View {
+        Text(text)
+            .font(.caption2.weight(.semibold))
+            .foregroundColor(color)
+            .padding(.horizontal, 8)
+            .padding(.vertical, 3)
+            .background(Capsule().fill(color.opacity(0.12)))
+    }
+
+    /// 细胶囊进度条（高 4pt），下载中更精致不占空间。
+    private func progressCapsule(value: Double, tint: Color) -> some View {
+        GeometryReader { geo in
+            ZStack(alignment: .leading) {
+                Capsule().fill(Color(.systemFill))
+                Capsule()
+                    .fill(tint)
+                    .frame(width: geo.size.width * value)
+            }
+        }
+        .frame(height: 4)
+    }
+
+    /// 已下载 / 总大小的紧凑文案。
+    private func sizeSummary(for task: DownloadTask) -> String {
+        "\(ByteCountFormatter.string(fromByteCount: task.receivedBytes, countStyle: .file)) / \(ByteCountFormatter.string(fromByteCount: task.totalBytes, countStyle: .file))"
     }
 
     private func matchedApp(for task: DownloadTask) -> AppInfo? {
@@ -408,6 +525,7 @@ struct DownloadsView: View {
         case .completed: return .green
         case .failed: return .red
         case .downloading: return .blue
+        case .paused: return .orange
         default: return .secondary
         }
     }

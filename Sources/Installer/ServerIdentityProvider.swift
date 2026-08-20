@@ -50,11 +50,10 @@ final class ServerIdentityProvider {
 
         // OpenSSL 3 的 PBES2/AES 新式 p12 系统导入器不支持（status != errSecSuccess），
         // 改用 OpenSSL 直接导出证书/私钥 DER 构造 TLS 身份。
-        let usedKeychainIdentity = try loadIdentityViaOpenSSL(p12URL: p12URL, password: password)
-        if !usedKeychainIdentity {
-            // OpenSSL 直连构造路径（身份存于 currentCertKey）；若上一轮残留了 Keychain 身份则清除。
-            currentIdentity = nil
-        }
+        // 两条子路径（SecKeyCreateWithData 直连 / Keychain 兜底读回）都设置 currentCertKey，
+        // 并清除可能残留的 identity（身份只来自上面的系统导入器快路径）。
+        _ = try loadIdentityViaOpenSSL(p12URL: p12URL, password: password)
+        currentIdentity = nil
         Logger.info("已通过 OpenSSL 设置本地服务器 TLS 身份")
     }
 
@@ -75,8 +74,7 @@ final class ServerIdentityProvider {
     }
 
     /// OpenSSL 回退：从 p12 导出证书 DER + 私钥 DER，再交给 Security framework 构造 TLS 身份。
-    /// 返回 true 表示成功且身份来自 Keychain 兜底（currentIdentity 已设置）；
-    /// 返回 false 表示成功且使用 SecKeyCreateWithData 直连构造（currentCertKey 已设置）。
+    /// 成功时 currentCertKey 已设置（两条子路径都指向 cert + key 直连构造）。
     @discardableResult
     private func loadIdentityViaOpenSSL(p12URL: URL, password: String) throws -> Bool {
         Logger.info("开始 OpenSSL 导出证书/私钥 DER")
@@ -217,80 +215,37 @@ final class ServerIdentityProvider {
             }
         }
 
-        // 3. 两段式 SecIdentity 配对：先按 label 精确查；查不到（-25300）再列出全部
-        //    identities 按证书 DER 匹配（见 findKeychainIdentity）。
-        let (identity, matchStatus) = findKeychainIdentity(label: label, cert: cert)
-        guard let identity = identity else {
-            Logger.error("SecIdentity 配对未找到 (status=\(matchStatus))，Keychain 兜底失败，已清理本次条目")
+        // 3. 从 Keychain 按 label 读回刚写入的私钥 SecKey，与证书一起用
+        //    sec_identity_create_with_certificates（iOS 15+，IPMSetTLSIdentityFromCertKey）
+        //    直接构造 TLS 身份。这是关键修复：用原始 DER 添加的私钥在 Keychain 里
+        //    不会自动与证书配对成 SecIdentity（kSecClassIdentity 查询返回 -25300），
+        //    但证书 + 私钥直连构造不依赖配对，两条独立条目就能用。
+        var keyRef: CFTypeRef?
+        let readKeyQuery: [String: Any] = [
+            kSecClass as String: kSecClassKey,
+            kSecAttrLabel as String: label,
+            kSecReturnRef as String: true,
+            kSecMatchLimit as String: kSecMatchLimitOne
+        ]
+        let readStatus = SecItemCopyMatching(readKeyQuery as CFDictionary, &keyRef)
+        Logger.info("Keychain 兜底：读回私钥 SecKey (status=\(readStatus))")
+        guard readStatus == errSecSuccess, let ref = keyRef,
+              CFGetTypeID(ref) == SecKeyGetTypeID() else {
+            Logger.error("Keychain 兜底：读回私钥失败 (status=\(readStatus))，已清理本次条目")
             removeKeychainIdentity(label: label)
             return false
         }
+        let key = unsafeBitCast(ref, to: SecKey.self)
 
-        currentIdentity = identity
-        currentCertKey = nil
+        // 直连构造路径（cert + key）：tlsOptions() 会走 IPMSetTLSIdentityFromCertKey。
+        currentCertKey = (cert: cert, key: key)
+        currentIdentity = nil
         ServerIdentityProvider.lastFallbackLabel = label
-        Logger.info("Keychain 兜底成功：已通过 SecIdentity 设置 TLS 身份")
+        Logger.info("Keychain 兜底成功：证书 + 私钥直连构造 TLS 身份（sec_identity_create_with_certificates）")
         return true
     }
 
-    /// 两段式 SecIdentity 配对查询：
-    /// 阶段 A：按 label 精确查询（cert 与 key 同 label 时系统通常已完成配对）；
-    /// 阶段 B：阶段 A 失败（常见 -25300 errSecItemNotFound，个别 iOS 版本上 SecIdentity 的
-    ///         label 与写入条目不一致）时，用 kSecMatchLimitAll 列出全部 identities，再按证书
-    ///         DER 与本次 cert 逐条匹配，挑出属于本次安装的 identity。
-    /// 返回 (identity, status)：status 为查询阶段的最后状态码，供日志/诊断使用。
-    private func findKeychainIdentity(label: String, cert: SecCertificate) -> (identity: SecIdentity?, status: OSStatus) {
-        // 阶段 A：按 label 精确查询
-        var identityRef: CFTypeRef?
-        let labelQuery: [String: Any] = [
-            kSecClass as String: kSecClassIdentity,
-            kSecAttrLabel as String: label,
-            kSecReturnRef as String: true
-        ]
-        let labelStatus = SecItemCopyMatching(labelQuery as CFDictionary, &identityRef)
-        Logger.info("Keychain 兜底：按 label 查询 SecIdentity (status=\(labelStatus))")
-        // SecIdentity 是 CoreFoundation 类型，成功后应直接强转（as? 条件转换会被编译器
-        // 以 "conditional downcast to CoreFoundation type will always succeed" 拒绝）
-        if labelStatus == errSecSuccess, let ref = identityRef {
-            return (ref as! SecIdentity, labelStatus)
-        }
-
-        // 阶段 B：列出全部 identities，按证书 DER 匹配本次证书
-        var allRefs: CFTypeRef?
-        let listQuery: [String: Any] = [
-            kSecClass as String: kSecClassIdentity,
-            kSecReturnRef as String: true,
-            kSecMatchLimit as String: kSecMatchLimitAll
-        ]
-        let listStatus = SecItemCopyMatching(listQuery as CFDictionary, &allRefs)
-        Logger.info("Keychain 兜底：列出全部 identities (status=\(listStatus))")
-        guard listStatus == errSecSuccess else {
-            Logger.error("Keychain 兜底：列出全部 identities 失败 (status=\(listStatus))")
-            return (nil, listStatus)
-        }
-        // CFArray 桥接成的 [Any]：逐条按类型 ID 校验后强转成 SecIdentity 再匹配。
-        // 注意：对 CoreFoundation 类型不能用 as? 条件转换（编译器报
-        // "conditional downcast ... will always succeed"），必须 CFGetTypeID + unsafeBitCast。
-        let identities: [SecIdentity] = (allRefs as? [Any])?.compactMap { ref in
-            guard CFGetTypeID(unsafeBitCast(ref, to: CFTypeRef.self)) == SecIdentityGetTypeID() else { return nil }
-            return unsafeBitCast(ref, to: SecIdentity.self)
-        } ?? []
-
-        let ourCertData = SecCertificateCopyData(cert) as Data
-        for identity in identities {
-            var candidateCert: SecCertificate?
-            guard SecIdentityCopyCertificate(identity, &candidateCert) == errSecSuccess,
-                  let candidate = candidateCert else { continue }
-            if SecCertificateCopyData(candidate) as Data == ourCertData {
-                Logger.info("Keychain 兜底：在全部 identities 中找到匹配本次证书的 SecIdentity")
-                return (identity, errSecSuccess)
-            }
-        }
-        Logger.error("Keychain 兜底：全部 identities 中未找到匹配本次证书的条目 (count=\(identities.count))")
-        return (nil, labelStatus)
-    }
-
-    /// 按 label 删除兜底写入的证书/私钥/身份条目（幂等，条目不存在视为成功）。
+    /// 按 label 删除兜底写入的证书/私钥条目（幂等，条目不存在视为成功）。
     private func removeKeychainIdentity(label: String) {
         for itemClass in [kSecClassCertificate, kSecClassKey, kSecClassIdentity] {
             let deleteQuery: [String: Any] = [
