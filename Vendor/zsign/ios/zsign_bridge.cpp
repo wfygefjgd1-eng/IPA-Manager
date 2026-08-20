@@ -15,14 +15,6 @@
 #include <openssl/err.h>
 #include <openssl/provider.h>
 
-// 静态链接的 libcrypto.a 里内嵌 legacy provider，其入口符号 legacy_provider 在
-// <openssl/providers.h> 声明——但该头文件未进入 OpenSSL 的公开安装目录（CI 报
-// "openssl/providers.h: file not found"），因此这里按 OpenSSL 3 的 ABI 自行 extern
-// 声明该符号（类型 OSSL_provider_init_fn，符号名与 providers 模块一致，不会 name-mangle）。
-extern "C" {
-    extern OSSL_provider_init_fn legacy_provider;
-}
-
 #include "common.h"
 #include "openssl.h"
 #include "bundle.h"
@@ -511,26 +503,6 @@ int zsign_p12_recreate_legacy(const char* p12Path, const char* password,
         return -1;
     }
 
-    // 与 zsign_p12_info / zsign_p12_export_identity 一致：加载 legacy + default provider。
-    // 解析旧式加密的输入 p12 需要 legacy；重打包用的 RC2-40-CBC 也只由 legacy provider 提供。
-    //
-    // 本工程构建参数为 ios64-xcrun no-shared（静态链接 libcrypto.a，见 .github/workflows/build.yml），
-    // 静态链接下 OSSL_PROVIDER_load 只能尝试通过 DSO 动态加载共享库里的 provider，必然失败并报
-    // "DSO support routines::could not load the shared library"，导致 legacy provider 不可用，
-    // RC2/3DES 等传统算法随后报 "unsupported"、PKCS12_create 加密失败。
-    // 因此先 OSSL_PROVIDER_add_builtin 把编译进 libcrypto.a 的内嵌 legacy provider
-    // （符号 legacy_provider，声明于 <openssl/providers.h>，类型 OSSL_provider_init_fn*，
-    // 默认构建含 legacy provider，OPENSSL_NO_LEGACY 未定义）注册进当前进程，
-    // 随后的 OSSL_PROVIDER_load 直接命中内置实现，无需任何共享库。
-    // 加载后清一次错误队列：重复调用时 add_builtin 会因 provider 已存在而压入
-    // CRYPTO_R_PROVIDER_ALREADY_EXISTS 之类的错误，不清除会污染后面的 GetOpenSSLErrors 诊断。
-#ifndef OPENSSL_NO_LEGACY
-    OSSL_PROVIDER_add_builtin(NULL, "legacy", legacy_provider);
-#endif
-    OSSL_PROVIDER_load(NULL, "legacy");
-    OSSL_PROVIDER_load(NULL, "default");
-    ERR_clear_error();
-
     PKCS12* p12 = d2i_PKCS12_bio(bio, NULL);
     BIO_free(bio);
     if (!p12) {
@@ -560,19 +532,24 @@ int zsign_p12_recreate_legacy(const char* p12Path, const char* password,
         return -1;
     }
 
-    // 重打包为"传统加密" p12：私钥用 PBE-SHA1-3DES、证书用 PBE-SHA1-40bit-RC2，
+    // 重打包为"传统加密" p12：私钥与证书都用 PBE-SHA1-3DES（NID 36）。
     // 这是 iOS SecPKCS12Import（CDSA 解码器）原生支持的格式——OpenSSL 3 默认的
     // PBES2/PBKDF2+AES 新式加密 iOS 无法导入，而传统 PBE 一定可以。
+    // 不用 RC2/RC4 等 legacy provider 算法：本工程静态链接的 OpenSSL 未启用 legacy
+    // provider（CI 参数 ios64-xcrun no-shared 无 enable-legacy，_legacy_provider 符号
+    // 不存在，链接会失败；OSSL_PROVIDER_load("legacy") 在静态下也无法 DSO 加载）。
+    // 3DES 由 default provider 提供，无需 legacy 即可成功加密，同样生成 iOS 可导入的
+    // 传统加密 p12。
     // iter/mac_iter 用 2048：满足 iOS 对 MAC 迭代次数的要求（太低会被拒），也不会太慢。
-    // NID 用 OBJ_txt2nid 运行时查询（不依赖 obj_mac.h 的宏，跨构建环境最稳），
-    // 查询失败时回退到 objects.txt 里的固定数值：PBE-SHA1-3DES=36、PBE-SHA1-RC2-40=39。
-    int nidKey = OBJ_txt2nid("PBE-SHA1-3DES");
-    int nidCert = OBJ_txt2nid("PBE-SHA1-RC2-40");
-    if (nidKey == NID_undef) { nidKey = 36; }
-    if (nidCert == NID_undef) { nidCert = 39; }
+    // NID 用 OBJ_txt2nid 运行时查询（跨构建环境最稳），失败回退到 objects.txt 里的
+    // 固定数值 36（NID_pbe_WithSHA1And3_KeyTripleDES_CBC）。
+    int nid3des = OBJ_txt2nid("PBE-SHA1-3DES");
+    if (nid3des == NID_undef) { nid3des = 36; }
+    OSSL_PROVIDER_load(NULL, "default");
+    ERR_clear_error();
     PKCS12* legacy = PKCS12_create("IPA Manager Server Identity", "IPA Manager Server Identity",
                                    pkey, cert, ca,
-                                   nidKey, nidCert,
+                                   nid3des, nid3des,
                                    2048, 2048, 0);
     if (!legacy) {
         g_lastError = GetOpenSSLErrors("传统 p12 重打包失败（PKCS12_create）");
