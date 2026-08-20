@@ -20,10 +20,13 @@ final class LocalInstallServer {
         // 证书由 Apple 根签发、系统信任），SpringBoard 可完成握手并下载 manifest/ipa。
         // 传输全程在 127.0.0.1 回环内，数据不出设备。
         let identityProvider = ServerIdentityProvider.shared
-        let hasTLSIdentity = identityProvider.currentIdentity != nil || identityProvider.currentCertKey != nil
+        // currentCertKey 是 private(set)，读不到；统一用暴露的 tlsOptions() 判断——它内部
+        // 优先 currentIdentity、其次 currentCertKey，无身份时返回空 options（无证书）。
+        let tls = identityProvider.tlsOptions()
+        let hasTLSIdentity = tls.securityProtocolOptions != nil && identityProvider.hasIdentity
         let parameters: NWParameters
         if hasTLSIdentity {
-            parameters = NWParameters(tls: identityProvider.tlsOptions())
+            parameters = NWParameters(tls: tls)
         } else {
             parameters = NWParameters.tcp
             Logger.warning("TLS 身份不可用，回退明文 HTTP")
@@ -60,7 +63,7 @@ final class LocalInstallServer {
         if waitResult != .success {
             Logger.error("本地服务器 5 秒内未就绪，安装可能失败")
         }
-        Logger.info("本地安装服务器已启动: 127.0.0.1:\(port) (TLS=\(parameters.tls != nil))")
+        Logger.info("本地安装服务器已启动: 127.0.0.1:\(port) (TLS=\(hasTLSIdentity))")
         // itms-services 打开后 App 将立即退到后台：启动静音音频保活，
         // 让进程不被挂起，SpringBoard 才能连上本地服务器下载 manifest/ipa 。
         BackgroundAudioKeepAlive.shared.start()

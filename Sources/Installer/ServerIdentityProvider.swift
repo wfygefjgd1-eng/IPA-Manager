@@ -11,6 +11,12 @@ final class ServerIdentityProvider {
     /// 上一次 Keychain 兜底成功写入的条目 label；下次兜底前先清理，避免 Keychain 累积。
     private static var lastFallbackLabel: String?
 
+    /// 是否已有可用的 TLS 身份（SecIdentity 直连构造成功 或 证书+私钥兜底成功）。
+    /// 供 LocalInstallServer 决定用 HTTPS 还是回退明文 HTTP。
+    var hasIdentity: Bool {
+        currentIdentity != nil || currentCertKey != nil
+    }
+
     func setIdentity(from p12URL: URL, password: String) throws {
         // 先用 OpenSSL 解析做个无害的预检查（拿不到信息不阻塞，仅作日志）
         var info = ZSignP12Info()
