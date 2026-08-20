@@ -4,8 +4,10 @@ final class DownloadManager: NSObject {
     static let shared = DownloadManager()
 
     // 线程约定：`tasks` / `taskModels` 仅在主队列读写（delegateQueue 为 .main，
-    // 且 startDownload/pause/resume/cancel/snapshotTasks 均由 UI 主线程调用）；
-    // 文件系统操作（移动大文件）放到后台队列执行，完成后回到主队列更新模型。
+    // 且 startDownload/pause/resume/cancel/snapshotTasks 均由 UI 主线程调用）。
+    // 注意：didFinishDownloadingTo 的临时文件移动**必须同步**（URLSession 在回调
+    // 返回后删除临时文件），同卷 rename 瞬时完成；移动完成后的文件分类/校验
+    // （读文件头、可能触发自动重下）放到后台队列执行，完成后回到主队列更新模型。
     // 本文件新增的只读文件头（<4KB）、UserDefaults 持久化均为小 IO，主队列执行即可。
     private var session: URLSession!
     private var tasks: [UUID: URLSessionDownloadTask] = [:]
@@ -172,12 +174,30 @@ final class DownloadManager: NSObject {
 
     /// 下载完成的收尾：移动到持久位置 → 校验内容真实性 → 更新模型并持久化。
     /// 校验失败且属于“网络类”问题（HTML 错误页 / 截断损坏）时自动重试一次。
-    /// 大文件移动放到后台队列执行（跨卷复制几百 MB 的 IPA 不能卡主线程），
-    /// 完成后回到主队列更新模型。
+    ///
+    /// 关键时序约束：URLSession 的 didFinishDownloadingTo 给出的临时文件
+    /// （CFNetworkDownload_xxx.tmp）只在回调执行期间有效，**回调返回后系统立即删除**。
+    /// 因此 moveItem 必须在回调内同步完成（临时目录与 Documents 同在 App 容器卷内，
+    /// moveItem 是同卷 rename，瞬时完成，不会卡主线程）；文件安全落盘后的
+    /// 分类/校验/模型更新再放后台队列执行。
     private func finishDownload(id: UUID, model: DownloadTask, location: URL) {
         var updated = model
         let destination = AppFileManager.shared.directoryURL(.downloads)
             .appendingPathComponent(Self.sanitizeFileName(updated.fileName.isEmpty ? "download" : updated.fileName))
+
+        // 同步移动（URLSession 临时文件生命周期约束，见上方注释）
+        do {
+            try AppFileManager.shared.moveItem(from: location, to: destination)
+            updated.destinationPath = destination.path
+        } catch {
+            updated.status = .failed
+            updated.error = error.localizedDescription
+            Logger.error("下载文件移动失败: \(error.localizedDescription)")
+            tasks.removeValue(forKey: id)
+            taskModels[id] = updated
+            persistTasks()
+            return
+        }
 
         // 校验失败且可重试（HTML / 截断）时自动重下；本地移动失败等不重试。
         var retryableFailure = false
@@ -185,9 +205,6 @@ final class DownloadManager: NSObject {
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             guard let self = self else { return }
             do {
-                try AppFileManager.shared.moveItem(from: location, to: destination)
-                updated.destinationPath = destination.path
-
                 switch self.classifyDownload(at: destination.path) {
                 case .zip:
                     updated.status = .completed
@@ -211,7 +228,7 @@ final class DownloadManager: NSObject {
             } catch {
                 updated.status = .failed
                 updated.error = error.localizedDescription
-                Logger.error("下载文件移动失败: \(error.localizedDescription)")
+                Logger.error("下载校验失败: \(error.localizedDescription)")
             }
 
             DispatchQueue.main.async {

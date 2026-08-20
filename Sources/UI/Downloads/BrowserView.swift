@@ -371,8 +371,13 @@ private struct WebView: UIViewRepresentable {
                 self.parent.canGoBack = webView.canGoBack
                 self.parent.canGoForward = webView.canGoForward
             }
-            // 下载被 cancel 属于预期路径，不必记为错误
-            if (error as NSError).code != NSURLErrorCancelled {
+            // 下载被 cancel（NSURLErrorCancelled）属于预期路径，不必记为错误。
+            // WebKitErrorDomain Code=102（帧框加载已中断）也是下载导航被拦截后
+            // WKWebView 的预期报错（下载任务已创建成功），同样不弹用户提示。
+            let nsError = error as NSError
+            let isExpected = nsError.code == NSURLErrorCancelled
+                || (nsError.domain == "WebKitErrorDomain" && nsError.code == 102)
+            if !isExpected {
                 // 用户可见提示：证书错误/断网等失败场景给明确反馈
                 DispatchQueue.main.async {
                     self.parent.onLoadFailed("加载失败：\(error.localizedDescription)")
