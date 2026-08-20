@@ -52,6 +52,13 @@ final class AppState: ObservableObject {
     @Published var toastMessage: String?
     private var toastWorkItem: DispatchWorkItem?
 
+    /// 自动签名队列中（含正在签名）的应用 id：详情页据此禁用"开始签名"按钮并显示
+    /// "正在自动签名"，避免用户手动点击与自动签名并发（zsign 并发不安全）。
+    /// 导入/下载成功后进入队列，签名完成即移除（无论成败）。
+    @Published var autoSigningAppIDs: Set<UUID> = []
+    private var autoSignQueue: [AppInfo] = []
+    private var isAutoSigning = false
+
     /// 在任意线程设置全局轻提示（内部切回主线程并安排自动清除；重复设置会重置计时）。
     func showToast(_ message: String) {
         DispatchQueue.main.async {
@@ -506,6 +513,9 @@ final class AppState: ObservableObject {
                     // 导入成功：清除进度
                     self.clearImportProgress()
                     completion(.success(app))
+                    // 导入/下载/外部打开统一出口：一条龙自动签名并安装
+                    // （开关默认开；默认证书/描述文件无效时自动跳过，不打扰用户）
+                    self.enqueueAutoSignAndInstall(app)
                 }
             } catch {
                 DispatchQueue.main.async {
@@ -638,6 +648,95 @@ final class AppState: ObservableObject {
 
     func installSignedPath(_ ipaPath: String, certificate: CertificateInfo) throws {
         try Installer.shared.install(ipaPath: ipaPath, certificate: certificate)
+    }
+
+    /// 签名完成后是否自动返回桌面（设置开关，默认开）。
+    func autoReturnHomeAfterSigningEnabled() -> Bool {
+        store.autoReturnHomeAfterSigningEnabled()
+    }
+
+    /// 导入/下载完成后是否自动签名并安装（设置开关，默认开）。
+    func autoSignAndInstallEnabled() -> Bool {
+        store.autoSignAndInstallEnabled()
+    }
+
+    // MARK: - 自动签名并安装（导入/下载完成后一条龙）
+
+    /// 导入/下载/外部打开导入成功后调用：若设置开启且存在有效默认证书/描述文件，
+    /// 自动签名并自动安装（一条龙），满足"下载完/导入完直接签名安装"的需求。
+    /// 串行队列逐条处理（zsign 并发不安全）；失败时 toast 具体中文原因，不静默。
+    /// 可被多次调用（多文件导入/下载完成），自动去重排队。
+    /// 返回 true 表示本次自动签名已接管（调用方可据此跳过"打开签名详情页"等手动引导）。
+    @discardableResult
+    func enqueueAutoSignAndInstall(_ app: AppInfo) -> Bool {
+        // 开关默认开启
+        guard store.autoSignAndInstallEnabled() else { return false }
+        // 拒绝对已签名应用重复自动签名（用户重签走手动流程）
+        guard !app.isSigned else { return false }
+        // 默认证书/描述文件必须有效且在列表中（用户可能已删掉该证书）
+        guard let cert = selectedCertificate, cert.status == .valid,
+              certificates.contains(where: { $0.id == cert.id }) else {
+            Logger.warning("自动签名跳过：无有效默认证书（\(app.name)）")
+            return false
+        }
+        guard let profile = selectedProfile, profile.status == .valid,
+              profiles.contains(where: { $0.id == profile.id }) else {
+            Logger.warning("自动签名跳过：无有效默认描述文件（\(app.name)）")
+            return false
+        }
+        // 已入队/正在签名的跳过（防重复入队）
+        guard !autoSigningAppIDs.contains(app.id) else { return false }
+        autoSignQueue.append(app)
+        autoSigningAppIDs.insert(app.id)
+        pumpAutoSignQueue()
+        return true
+    }
+
+    /// 串行出队执行自动签名+安装；队空或已有任务在跑则直接返回。
+    private func pumpAutoSignQueue() {
+        guard !isAutoSigning, !autoSignQueue.isEmpty else { return }
+        let app = autoSignQueue.removeFirst()
+        isAutoSigning = true
+        guard let cert = selectedCertificate,
+              let profile = selectedProfile else {
+            // 证书被并发删除等竞态：移除标记，继续处理下一个
+            autoSigningAppIDs.remove(app.id)
+            isAutoSigning = false
+            pumpAutoSignQueue()
+            return
+        }
+        Logger.info("自动签名开始: \(app.name)")
+        signApp(app, certificate: cert, profile: profile, progress: { _, _ in }) { [weak self] result in
+            guard let self = self else { return }
+            self.isAutoSigning = false
+            self.autoSigningAppIDs.remove(app.id)
+            switch result {
+            case .success(let signedPath):
+                self.autoSignAndInstallSucceeded(app: app, signedPath: signedPath, certificate: cert)
+            case .failure(let error):
+                Logger.error("自动签名失败: \(app.name) - \(error.localizedDescription)")
+                self.showToast("自动签名失败：\(error.localizedDescription)")
+            }
+            self.pumpAutoSignQueue()
+        }
+    }
+
+    /// 自动签名成功后：发起安装；若设置开启"签名完成自动返回桌面"，延迟回桌面
+    /// （iOS 随即弹出"是否安装"确认，省去手动点"返回"）。
+    private func autoSignAndInstallSucceeded(app: AppInfo, signedPath: String, certificate: CertificateInfo) {
+        do {
+            try installSignedPath(signedPath, certificate: certificate)
+            Logger.info("自动签名并安装已发起: \(app.name)")
+            if store.autoReturnHomeAfterSigningEnabled() {
+                DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) { [weak self] in
+                    // 延迟让用户看到"签名完成"的过渡，再回桌面等 iOS 弹安装提示
+                    self?.minimizeToHomeScreen()
+                }
+            }
+        } catch {
+            Logger.error("自动签名完成但安装失败: \(app.name) - \(error.localizedDescription)")
+            showToast("自动签名完成，安装失败：\(error.localizedDescription)")
+        }
     }
 
     /// 外部打开文件去重：SwiftUI 生命周期下 application(_:open:) 与 onOpenURL 可能

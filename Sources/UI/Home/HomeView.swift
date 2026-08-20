@@ -188,6 +188,16 @@ struct HomeView: View {
                     showAlert = true
                     return
                 }
+                // 自动签名接管（设置开启 + 默认证书有效）：不再打开签名详情页，
+                // 直接后台签名并安装，完成后自动回桌面等 iOS 弹安装提示。
+                if appState.enqueueAutoSignAndInstall(app) {
+                    appState.showToast("「\(app.name)」已导入，正在自动签名并安装…")
+                    // 多选：全部完成时仍显示汇总（不逐个打开详情页打断）
+                    if pendingImportCount > 1, importSuccessCount + importFailureCount >= pendingImportCount {
+                        showImportSummary()
+                    }
+                    return
+                }
                 // 单个导入：立即打开签名详情页；多选：全部完成后弹汇总
                 if pendingImportCount <= 1 {
                     selectedApp = app

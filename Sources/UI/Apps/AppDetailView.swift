@@ -113,15 +113,17 @@ struct AppDetailView: View {
             } message: {
                 Text(alertMessage)
             }
-            // 签名完成弹窗：内容“签名完成，已发起安装”，旁边“确定”和“返回”两个按钮。
+            /// 签名完成弹窗：内容“签名完成，已发起安装”，旁边“确定”和“返回”两个按钮。
             // “返回”：关闭当前详情界面、切回首页 Tab，并挂起 App 直接回到 iOS 桌面（主屏幕）。
+            // 若设置“签名完成自动返回桌面”开启（默认开），弹窗出现约 1.5 秒后自动执行
+            // “返回”动作；用户在此期间手动点了“确定”或“返回”则取消自动返回。
             .alert("签名完成", isPresented: $showSignedAlert) {
-                Button("确定", role: .cancel) {}
+                Button("确定", role: .cancel) {
+                    cancelAutoReturnIfNeeded()
+                }
                 Button("返回") {
-                    dismiss()
-                    appState.selectedTab = 0
-                    // 挂起 App 回到 iOS 桌面（主屏幕）；App 保留在后台，点图标可恢复
-                    appState.minimizeToHomeScreen()
+                    cancelAutoReturnIfNeeded()
+                    performReturnHome()
                 }
             } message: {
                 Text(signedDidInstall ? "签名完成，已发起安装" : "签名完成，未自动安装")
@@ -143,6 +145,7 @@ struct AppDetailView: View {
             // 视图消失时停止签名时间显示定时器（切页/关闭后不得残留空转）
             .onDisappear {
                 stopSignTimer()
+                cancelAutoReturnIfNeeded()
             }
         }
     }
@@ -223,50 +226,68 @@ struct AppDetailView: View {
 
     private var actionButtons: some View {
         VStack(spacing: 12) {
-            // 签名主操作：直接使用默认选中的有效证书 + 描述文件 + “签名后自动安装”开关一键签名并安装；
-            // 默认证书/描述文件缺失或无效时才退回可选面板（SignOptionsView）。
-            Button {
-                startSigningWithDefaults()
-            } label: {
-                Label(liveApp.isSigned ? "重新签名并安装" : "开始签名并安装", systemImage: "pencil.circle.fill")
-                    .frame(maxWidth: .infinity)
-            }
-            .buttonStyle(.borderedProminent)
-            .disabled(isSigning
-                      || appState.certificates.isEmpty
-                      || appState.profiles.isEmpty
-                      || !FileManager.default.fileExists(atPath: liveApp.path))
-
-            if liveApp.isSigned {
+            // 该应用正在自动签名队列中（导入/下载完成的一条龙）：显示状态并禁用所有操作，
+            // 避免用户手动点击与后台自动签名并发（zsign 并发不安全）。
+            if appState.autoSigningAppIDs.contains(liveApp.id) {
+                HStack(spacing: 8) {
+                    ProgressView()
+                        .controlSize(.small)
+                    Text("正在自动签名并安装，请稍候…")
+                        .font(.subheadline)
+                        .foregroundColor(.secondary)
+                }
+                .frame(maxWidth: .infinity)
+                .padding(.vertical, 12)
+                .background(
+                    RoundedRectangle(cornerRadius: 10, style: .continuous)
+                        .fill(Color.accentColor.opacity(0.1))
+                )
+            } else {
+                // 签名主操作：直接使用默认选中的有效证书 + 描述文件 + “签名后自动安装”开关一键签名并安装；
+                // 默认证书/描述文件缺失或无效时才退回可选面板（SignOptionsView）。
                 Button {
-                    showInstallCertificatePicker = true
+                    startSigningWithDefaults()
                 } label: {
-                    Label("安装", systemImage: "arrow.down.circle.fill")
+                    Label(liveApp.isSigned ? "重新签名并安装" : "开始签名并安装", systemImage: "pencil.circle.fill")
+                        .frame(maxWidth: .infinity)
+                }
+                .buttonStyle(.borderedProminent)
+                .disabled(isSigning
+                          || appState.certificates.isEmpty
+                          || appState.profiles.isEmpty
+                          || !FileManager.default.fileExists(atPath: liveApp.path))
+
+                if liveApp.isSigned {
+                    Button {
+                        showInstallCertificatePicker = true
+                    } label: {
+                        Label("安装", systemImage: "arrow.down.circle.fill")
+                            .frame(maxWidth: .infinity)
+                    }
+                    .buttonStyle(.bordered)
+                    .disabled(isSigning)
+                }
+
+                Button {
+                    showShareSheet = true
+                } label: {
+                    Label("分享", systemImage: "square.and.arrow.up")
                         .frame(maxWidth: .infinity)
                 }
                 .buttonStyle(.bordered)
                 .disabled(isSigning)
-            }
 
-            Button {
-                showShareSheet = true
-            } label: {
-                Label("分享", systemImage: "square.and.arrow.up")
-                    .frame(maxWidth: .infinity)
+                Button(role: .destructive) {
+                    // 删除是永久性磁盘操作，加二次确认，与全部清除一致的交互风格
+                    showDeleteConfirm = true
+                } label: {
+                    Label("删除", systemImage: "trash")
+                        .frame(maxWidth: .infinity)
+                }
+                .buttonStyle(.bordered)
+                .foregroundColor(.red)
+                .disabled(isSigning)
             }
-            .buttonStyle(.bordered)
-            .disabled(isSigning)
-
-            Button(role: .destructive) {
-                // 删除是永久性磁盘操作，加二次确认，与全部清除一致的交互风格
-                showDeleteConfirm = true
-            } label: {
-                Label("删除", systemImage: "trash")
-                    .frame(maxWidth: .infinity)
-            }
-            .buttonStyle(.bordered)
-            .foregroundColor(.red)
-            .disabled(isSigning)
         }
     }
 
@@ -338,6 +359,9 @@ struct AppDetailView: View {
                         try appState.installSignedPath(signedPath, certificate: certificate)
                         // 弹窗内容：签名完成，已发起安装（旁边有“确定”与“返回”）
                         showSignedAlert = true
+                        // 设置开启时自动返回桌面（默认开）：约 1.5s 后自动执行“返回”
+                        //（用户手动点“确定/返回”会取消该自动动作）
+                        scheduleAutoReturnIfNeeded()
                     } catch {
                         alertMessage = "签名完成，安装失败: \(error.localizedDescription)"
                         showAlert = true
@@ -345,6 +369,8 @@ struct AppDetailView: View {
                 } else {
                     // 未自动安装也给出明确反馈（否则静默成功用户不确定是否完成）
                     showSignedAlert = true
+                    // 未发起安装时也遵守开关：返回桌面让用户看到已完成的结果
+                    scheduleAutoReturnIfNeeded()
                 }
             case .failure(let error):
                 isSigning = false
@@ -376,6 +402,43 @@ struct AppDetailView: View {
     private func stopSignTimer() {
         signTimer?.invalidate()
         signTimer = nil
+    }
+
+    // MARK: - 签名完成自动返回桌面（设置开关，默认开）
+
+    /// 签名完成弹窗出现后自动执行“返回”的延迟任务；用户手动点了“确定/返回”即取消。
+    /// 防止自动返回与用户手动操作重复触发（返回动作里会重新触发 dismiss，重复执行无害
+    /// 但会闪跳，因此用标志位保证只执行一次）。
+    @State private var autoReturnWorkItem: DispatchWorkItem?
+
+    private func scheduleAutoReturnIfNeeded() {
+        guard appState.autoReturnHomeAfterSigningEnabled() else { return }
+        cancelAutoReturnIfNeeded()
+        let work = DispatchWorkItem { [weak self] in
+            guard let self = self else { return }
+            // 弹窗仍在展示且用户未手动操作时自动“返回”
+            if self.showSignedAlert {
+                self.performReturnHome()
+            }
+        }
+        autoReturnWorkItem = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5, execute: work)
+    }
+
+    /// 用户手动点了“确定/返回”（含弹窗消失），取消待执行的自动返回。
+    private func cancelAutoReturnIfNeeded() {
+        autoReturnWorkItem?.cancel()
+        autoReturnWorkItem = nil
+    }
+
+    /// 统一“返回”动作：关闭详情页、切回首页 Tab、挂起 App 回桌面（iOS 弹安装确认）。
+    private func performReturnHome() {
+        cancelAutoReturnIfNeeded()
+        showSignedAlert = false
+        dismiss()
+        appState.selectedTab = 0
+        // 挂起 App 回到 iOS 桌面（主屏幕）；App 保留在后台，点图标可恢复
+        appState.minimizeToHomeScreen()
     }
 
     /// 当失败原因是“源文件丢失”时，在错误信息后附加一行恢复指引，

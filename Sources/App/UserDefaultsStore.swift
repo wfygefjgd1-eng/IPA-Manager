@@ -10,6 +10,10 @@ final class UserDefaultsStore {
         static let downloadTasks = "stored_download_tasks"
         static let importedApps = "stored_imported_apps"
         static let schemaVersion = "storage_schema_version"
+        /// 导入/下载完成后自动签名并安装（默认开）
+        static let autoSignAndInstall = "setting_auto_sign_and_install"
+        /// 签名完成后自动返回桌面（默认开）
+        static let autoReturnHomeAfterSigning = "setting_auto_return_home"
         /// 解码失败时备份原始数据的键（<key>_backup），避免迁移/排查时永久丢失
         static func backupKey(for key: String) -> String { "\(key)_backup" }
     }
@@ -73,6 +77,26 @@ final class UserDefaultsStore {
 
     func saveDownloadTasks(_ items: [DownloadTask]) {
         save(items, key: Keys.downloadTasks)
+    }
+
+    // MARK: - 自动流程开关（默认开启）
+
+    /// 导入/下载完成后是否自动签名并安装（默认 true）。
+    func autoSignAndInstallEnabled() -> Bool {
+        defaults.object(forKey: Keys.autoSignAndInstall) as? Bool ?? true
+    }
+
+    func setAutoSignAndInstallEnabled(_ enabled: Bool) {
+        defaults.set(enabled, forKey: Keys.autoSignAndInstall)
+    }
+
+    /// 签名完成后是否自动返回桌面（默认 true）。
+    func autoReturnHomeAfterSigningEnabled() -> Bool {
+        defaults.object(forKey: Keys.autoReturnHomeAfterSigning) as? Bool ?? true
+    }
+
+    func setAutoReturnHomeAfterSigningEnabled(_ enabled: Bool) {
+        defaults.set(enabled, forKey: Keys.autoReturnHomeAfterSigning)
     }
 
     /// 解码失败保护：失败时备份原始 Data（不覆盖），并清空该键让 UI 走空态。

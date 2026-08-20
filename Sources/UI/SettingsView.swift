@@ -6,6 +6,10 @@ struct SettingsView: View {
     @State private var shareItem: ShareItem?
     /// 诊断报告写入失败时的错误提示
     @State private var reportError: String?
+    /// 导入/下载完成后自动签名并安装（默认开）
+    @AppStorage("setting_auto_sign_and_install") private var autoSignAndInstall = true
+    /// 签名完成后自动返回桌面（默认开）
+    @AppStorage("setting_auto_return_home") private var autoReturnHomeAfterSigning = true
 
     var body: some View {
         NavigationView {
@@ -13,6 +17,11 @@ struct SettingsView: View {
                 Section("使用说明") {
                     Label("本工具全部在本地完成签名", systemImage: "lock.shield.fill")
                     Label("证书与私钥保存在系统 Keychain", systemImage: "key.fill")
+                }
+
+                Section("自动流程") {
+                    Toggle("导入/下载后自动签名并安装", isOn: $autoSignAndInstall)
+                    Toggle("签名完成后自动返回桌面", isOn: $autoReturnHomeAfterSigning)
                 }
 
                 Section("诊断与反馈") {
