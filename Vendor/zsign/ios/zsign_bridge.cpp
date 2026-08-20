@@ -541,10 +541,15 @@ int zsign_p12_recreate_legacy(const char* p12Path, const char* password,
     // 这是 iOS SecPKCS12Import（CDSA 解码器）原生支持的格式——OpenSSL 3 默认的
     // PBES2/PBKDF2+AES 新式加密 iOS 无法导入，而传统 PBE 一定可以。
     // iter/mac_iter 用 2048：满足 iOS 对 MAC 迭代次数的要求（太低会被拒），也不会太慢。
+    // NID 用 OBJ_txt2nid 运行时查询（不依赖 obj_mac.h 的宏，跨构建环境最稳），
+    // 查询失败时回退到 objects.txt 里的固定数值：PBE-SHA1-3DES=36、PBE-SHA1-RC2-40=39。
+    int nidKey = OBJ_txt2nid("PBE-SHA1-3DES");
+    int nidCert = OBJ_txt2nid("PBE-SHA1-RC2-40");
+    if (nidKey == NID_undef) { nidKey = 36; }
+    if (nidCert == NID_undef) { nidCert = 39; }
     PKCS12* legacy = PKCS12_create("IPA Manager Server Identity", "IPA Manager Server Identity",
                                    pkey, cert, ca,
-                                   NID_pbe_WithSHA1And3_KeyTripleDES_CBC,
-                                   NID_pbe_WithSHA1And40BitRC2_CBC,
+                                   nidKey, nidCert,
                                    2048, 2048, 0);
     if (!legacy) {
         g_lastError = GetOpenSSLErrors("传统 p12 重打包失败（PKCS12_create）");
