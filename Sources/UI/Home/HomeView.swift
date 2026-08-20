@@ -46,6 +46,9 @@ struct HomeView: View {
                 AppDetailView(app: app)
             }
         }
+        // 全局毛玻璃背景层：渐变 + 半透明材质，ScrollView 内容透出其上的玻璃质感。
+        // 深浅色模式自适应；配合 ScrollView 默认透明背景，滚动时内容在玻璃上掠过。
+        .background(GlassBackground().ignoresSafeArea())
         // 导入进度浮层：导入进行中显示黑色胶囊进度卡（与全局 toast 同风格），
         // 用户无需干等——ProgressView 转圈 + 文件名 + 阶段文字 + i/N 进度
         .overlay(alignment: .bottom) {

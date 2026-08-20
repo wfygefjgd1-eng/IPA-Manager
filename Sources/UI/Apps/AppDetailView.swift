@@ -34,8 +34,11 @@ struct AppDetailView: View {
     @State private var signTimer: Timer?
     /// 当前已用秒数（显示用，随 signTimer 刷新）
     @State private var elapsedSeconds: Int = 0
-    /// 预计剩余秒数（按当前速度外推：elapsed / progress × (1 - progress)）
+    /// 预计剩余秒数（阶段感知估算，见 estimatedRemainingSeconds）
     @State private var etaSeconds: Int = 0
+    /// 真实 85% 锚点时刻：zsign 只在 85% 回调"重新打包开始"，此后无中间进度；
+    /// 展示进度由 smoother 蠕动（假值），ETA 必须基于此锚点而非假进度线性外推。
+    @State private var repackStartTime: Date?
 
     /// 展示层使用的“实时”AppInfo：
     /// - 签名刚完成 → 以签名输出为准（合并原快照的元数据，isSigned = true，path 指向签名产物）；
@@ -142,6 +145,9 @@ struct AppDetailView: View {
             // 签名进行中禁止下滑手势关闭详情页：仅禁用 toolbar 关闭按钮时，
             // 下滑手势仍可关页，签名完成/失败将无任何反馈
             .interactiveDismissDisabled(isSigning)
+            // 毛玻璃背景：infoList 已透明化（见 infoList 的 scrollContentBackground(.hidden)），
+            // 详情页（sheet）同样铺渐变 + 半透明材质，与主界面风格统一
+            .background(GlassBackground().ignoresSafeArea())
             // 视图消失时停止签名时间显示定时器（切页/关闭后不得残留空转）
             .onDisappear {
                 stopSignTimer()
@@ -180,6 +186,8 @@ struct AppDetailView: View {
             infoRow("最低系统", liveApp.minimumOSVersion ?? "未知")
         }
         .listStyle(.insetGrouped)
+        // 毛玻璃背景：隐藏 List 默认不透明底色，透出详情页的 GlassBackground
+        .scrollContentBackground(.hidden)
     }
 
     private func infoRow(_ title: String, _ value: String) -> some View {
@@ -314,6 +322,8 @@ struct AppDetailView: View {
         elapsedSeconds = 0
         etaSeconds = 0
         lastProgressUpdate = Date.distantPast
+        // 重打包里程碑锚点：真实 85%（zsign 回调）到达时刻，用于阶段感知 ETA
+        repackStartTime = nil
         // 启动时间显示：每 0.5s 刷新"已用/预计剩余"（进度由 smoother 推进，
         // 时间必须随真实时钟走，不能只依赖进度回调）
         signStartTime = Date()
@@ -328,14 +338,18 @@ struct AppDetailView: View {
             if !phase.isEmpty {
                 signPhase = phase
             }
-            // 用当前速度外推预计剩余：已用 / 进度 × (1 - 进度)。
-            // 进度为 0 时无法预估，保持 0 显示"预计剩余 0 秒"由下方计算兜底。
+            // 记录真实 85% 锚点：zsign 只在 85% 回调"重新打包开始"，此后无中间进度。
+            // 展示进度由 smoother 蠕动（假值），ETA 不能基于它线性外推，必须用此锚点。
+            if progress >= 0.85 && repackStartTime == nil {
+                repackStartTime = now
+            }
+            // 阶段感知 ETA：zsign 真实进度仅 5/20/85/100 四档，
+            // 用"里程碑锚点 + 阶段经验占比"估算，避免假进度导致的暴涨/虚低。
             if progress > 0 {
                 if let start = signStartTime {
                     let elapsed = now.timeIntervalSince(start)
                     elapsedSeconds = Int(elapsed)
-                    let ratio = (1.0 - progress) / max(progress, 0.001)
-                    etaSeconds = Int(elapsed * ratio)
+                    etaSeconds = estimatedRemainingSeconds(progress: progress, elapsed: elapsed, now: now)
                 }
             }
         }, completion: { [self] result in
@@ -389,10 +403,9 @@ struct AppDetailView: View {
             guard let start = signStartTime else { return }
             let elapsed = Date().timeIntervalSince(start)
             elapsedSeconds = Int(elapsed)
-            // 进度未达 100% 时按当前速度外推剩余；到达后归零（由 completion 兜底）
+            // 进度未达 100% 时按阶段感知估算剩余；到达后归零（由 completion 兜底）
             if signProgress > 0 && signProgress < 1.0 {
-                let ratio = (1.0 - signProgress) / max(signProgress, 0.001)
-                etaSeconds = Int(elapsed * ratio)
+                etaSeconds = estimatedRemainingSeconds(progress: signProgress, elapsed: elapsed, now: Date())
             } else if signProgress >= 1.0 {
                 etaSeconds = 0
             }
@@ -402,6 +415,38 @@ struct AppDetailView: View {
     private func stopSignTimer() {
         signTimer?.invalidate()
         signTimer = nil
+    }
+
+    /// 阶段感知的预计剩余秒数估算。
+    ///
+    /// zsign 桥接层真实回调只有 5/20/85/100 四档，平滑器（ProgressSmoother）把
+    /// 真实进度作为目标值用定时器蠕动逼近——85% 之后每 0.5s 只涨 0.3%，是"仍在
+    /// 工作"的假进度，不是真实时间进程。因此旧的 `elapsed × (1-p)/p` 线性外推
+    /// 必然失真：20% 停留阶段（签名主程序，长时间无回调）剩余会随时间暴涨，
+    /// 85% 蠕动阶段又显示"几秒就好"（实际重新打包大 IPA 要几十秒）。
+    ///
+    /// 新算法分段估算（zsign 只有 5/20/85/100 四档真实进度）：
+    /// - 5% ~ 20%（准备/解压）：极快，剩余按已用 ×2 给短期值，封顶 30s；
+    /// - 20% ~ 85%（签名主程序）：无中间回调、进度停死在 20%，无法精确得知
+    ///   剩余，按"剩余 ≈ 已用 × 1.5"保守递增、封顶 80s，避免暴涨成天文数字；
+    /// - 85% ~ 100%（重新打包）：以真实 85% 锚点为基准，总耗时 ≈ 85% 前耗时
+    ///   × 1.6（打包约占 40%），剩余 = 总耗时 − 已用，随时间收敛到真实值。
+    private func estimatedRemainingSeconds(progress: Double, elapsed: TimeInterval, now: Date) -> Int {
+        guard progress > 0 else { return 0 }
+        if progress >= 0.85 {
+            // 重新打包阶段：总耗时 ≈ 85% 前耗时 × 1.6，剩余 = 总耗时 - 已用。
+            // 锚点缺失（异常路径）时退化为当前已用 × 1。
+            let base = repackStartTime.map { $0.timeIntervalSince(signStartTime ?? $0) } ?? elapsed
+            let totalEstimate = max(base, elapsed) * 1.6
+            return max(2, Int(totalEstimate - elapsed))
+        }
+        if progress >= 0.2 {
+            // 签名主程序：进度停死在 20%，"已用"随真实时钟增长而进度不动，
+            // 只能按经验系数递增并封顶，避免显示如"剩余 300 秒"的失真数字。
+            return max(3, min(Int(elapsed * 1.5), 80))
+        }
+        // 5% ~ 20%（准备/解压）：很快，短期估计即可。
+        return max(3, min(Int(elapsed * 2.0), 30))
     }
 
     // MARK: - 签名完成自动返回桌面（设置开关，默认开）

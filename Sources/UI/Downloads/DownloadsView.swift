@@ -48,7 +48,9 @@ struct DownloadsView: View {
                     }
                     .listStyle(.plain)
                     .scrollContentBackground(.hidden)
-                    .background(Color(.systemGroupedBackground))
+                    // 毛玻璃背景：隐藏 List 默认底色，铺 GlassBackground 渐变 + 半透明材质，
+                    // 下载任务卡片（半透明圆角底）透出其上的玻璃质感
+                    .background(GlassBackground().ignoresSafeArea())
                     .safeAreaInset(edge: .bottom, spacing: 0) {
                         // 底部悬浮操作条：位于 Tab 栏上方，拇指可及；半透明材质不突兀
                         floatingActionBar
@@ -138,6 +140,12 @@ struct DownloadsView: View {
                     toggleSelectAll()
                 }
                 .font(.subheadline.weight(.semibold))
+                .foregroundColor(.accentColor)
+
+                Button("反选") {
+                    invertSelection()
+                }
+                .font(.subheadline)
                 .foregroundColor(.accentColor)
 
                 Spacer()
@@ -647,6 +655,12 @@ struct DownloadsView: View {
         } else {
             selectedIDs = Set(tasks.map { $0.id })
         }
+    }
+
+    /// 反选：勾选当前未选中的、取消当前已选中的
+    private func invertSelection() {
+        let allIDs = Set(tasks.map { $0.id })
+        selectedIDs = allIDs.subtracting(selectedIDs)
     }
 
     private func enterSelection() {

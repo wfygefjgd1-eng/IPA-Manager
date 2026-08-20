@@ -49,7 +49,11 @@ struct SettingsView: View {
                     }
                 }
             }
+            .scrollContentBackground(.hidden)
+            // 毛玻璃背景：List 已透明化（scrollContentBackground(.hidden)），
+            // 这里在导航容器外层铺渐变 + 半透明材质，列表内容透出玻璃质感
             .navigationTitle("设置")
+            .background(GlassBackground().ignoresSafeArea())
             .alert("IPA Manager", isPresented: $showAbout) {
                 Button("确定", role: .cancel) {}
             } message: {

@@ -18,6 +18,9 @@ struct CertificatesView: View {
                 certificatesSection
                 profilesSection
             }
+            .scrollContentBackground(.hidden)
+            // 毛玻璃背景：List 已透明化（scrollContentBackground(.hidden)），
+            // 这里在导航容器外层铺渐变 + 半透明材质，列表内容透出玻璃质感
             .navigationTitle("证书管理")
             .toolbar {
                 ToolbarItemGroup(placement: .navigationBarTrailing) {
@@ -71,6 +74,7 @@ struct CertificatesView: View {
                         .cornerRadius(12)
                 }
             }
+            .background(GlassBackground().ignoresSafeArea())
         }
     }
 

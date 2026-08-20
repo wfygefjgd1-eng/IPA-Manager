@@ -49,6 +49,8 @@ struct AppsView: View {
                             }
                         }
                     }
+                    // 毛玻璃背景：隐藏 List 默认不透明底色，透出下方的 GlassBackground
+                    .scrollContentBackground(.hidden)
                     .safeAreaInset(edge: .bottom, spacing: 0) {
                         // 底部悬浮操作条：位于 Tab 栏上方，拇指可及；半透明材质不突兀
                         floatingActionBar
@@ -56,6 +58,9 @@ struct AppsView: View {
                 }
             }
             .navigationTitle("已签应用")
+            // 毛玻璃背景：List 已透明化（scrollContentBackground(.hidden)），
+            // 这里在导航容器外层铺渐变 + 半透明材质，列表内容透出玻璃质感
+            .background(GlassBackground().ignoresSafeArea())
             .sheet(item: $selectedApp) { app in
                 AppDetailView(app: app)
             }
@@ -85,6 +90,12 @@ struct AppsView: View {
                     toggleSelectAll()
                 }
                 .font(.subheadline.weight(.semibold))
+                .foregroundColor(.accentColor)
+
+                Button("反选") {
+                    invertSelection()
+                }
+                .font(.subheadline)
                 .foregroundColor(.accentColor)
 
                 Spacer()
@@ -178,6 +189,12 @@ struct AppsView: View {
         } else {
             selectedIDs = Set(appState.installedApps.map { $0.id })
         }
+    }
+
+    /// 反选：勾选当前未选中的、取消当前已选中的
+    private func invertSelection() {
+        let allIDs = Set(appState.installedApps.map { $0.id })
+        selectedIDs = allIDs.subtracting(selectedIDs)
     }
 
     private func enterSelection() {
