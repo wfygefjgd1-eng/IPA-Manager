@@ -25,8 +25,9 @@ VENDOR_INC="$REPO_ROOT/Vendor/openssl/include"
 echo "==> 下载 OpenSSL ${OPENSSL_VERSION}"
 mkdir -p "$WORK"
 curl -fL --retry 3 -o "$WORK/openssl.tar.gz" "$TARBALL_URL"
-# 校验 sha256（openssl-3.3.2.tar.gz 官方源码 tarball 校验和）
-echo "2e8a40b01979c8eb9f6cfdc9c9f75e43ac9fbf9c5fde5258db2f3c8d4f7e7de1  $WORK/openssl.tar.gz" \
+# 校验 sha256（GitHub Release 资产 openssl-3.3.2.tar.gz 的实际校验和，
+# 与 openssl.org 官方 tarball 不同——GitHub 会重新生成 Release 源码包）
+echo "2e8a40b01979afe8be0bbfb3de5dc1c6709fedb46d6c89c10da114ab5fc3d281  $WORK/openssl.tar.gz" \
   | shasum -a 256 -c - || { echo "OpenSSL 源码校验失败"; exit 1; }
 cd "$WORK"
 tar -xzf openssl.tar.gz
