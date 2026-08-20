@@ -166,6 +166,9 @@ final class SigningEngine: SigningEngineProtocol {
         }
 
         progress(1.0)
+        // 显式收尾：zsign 可能只回调到 85% 就完成（不保证回调 100%），
+        // 若不主动告知，smoother 的蠕动定时器会继续空转（泄漏 + UI 空转）。
+        smoother.complete()
         Logger.info("签名完成: \(outputURL.path)")
         return outputURL.path
     }
@@ -459,6 +462,16 @@ private final class ProgressSmoother {
             startSlitherIfNeeded()
         }
         rawHandler(displayed)
+    }
+
+    /// 签名流程完成时的显式收尾：归正到 100% 并停止蠕动定时器。
+    /// zsign 不保证回调 100%（可能 85% 后直接返回），调用方在成功后必须调用，
+    /// 否则定时器空转（闭包引用 smoother 造成轻度泄漏 + UI 空转）。
+    func complete() {
+        stopSlither()
+        target = 1.0
+        displayed = 1.0
+        rawHandler(1.0)
     }
 
     /// 85% 后启动蠕动定时器：每 0.5s 展示进度 +0.3%，最高逼近 98%。

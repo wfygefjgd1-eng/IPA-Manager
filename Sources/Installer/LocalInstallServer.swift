@@ -61,7 +61,9 @@ final class LocalInstallServer {
 
     /// 同步探测某个 URL 是否可达（App 自己的网络栈发起 HEAD 请求）。
     /// 返回 nil 表示不可达；可达时返回 HTTP 状态码。
-    private static func probe(_ url: URL, timeout: TimeInterval = 4) -> Int? {
+    /// 本地回环/局域网响应通常毫秒级，1s 超时足够区分“可达”与“不可达”，
+    /// 避免蜂窝网络下不可达地址把安装提示拖慢数秒（此前 4s+1s×N 个候选）。
+    private static func probe(_ url: URL, timeout: TimeInterval = 1) -> Int? {
         var request = URLRequest(url: url, timeoutInterval: timeout)
         request.httpMethod = "HEAD"
         let semaphore = DispatchSemaphore(value: 0)
@@ -144,8 +146,10 @@ final class LocalInstallServer {
         // 注意：蜂窝 CGNAT 的 10.x IP 在设备上不可自访问（流量路由到运营商 NAT
         // 回不到本机）；个人热点模式下 handoff 接口（bridge100/172.20.x.x）通常
         // 可自访问。逐一同步探测，自动选第一个能返回 HTTP 响应的地址。
+        // 最多探测 3 个候选（回环 + 前两个接口 IP）：本地安装场景响应毫秒级，
+        // 遍历全部接口在蜂窝不可达时会逐个等超时（每个 2s），拖慢"是否安装"提示。
         var candidates: [String] = ["127.0.0.1"]
-        candidates.append(contentsOf: Self.allLocalIPAddresses())
+        candidates.append(contentsOf: Self.allLocalIPAddresses().prefix(2))
         var chosenHost: String? = nil
         var probeLogs: [String] = []
         for host in candidates {

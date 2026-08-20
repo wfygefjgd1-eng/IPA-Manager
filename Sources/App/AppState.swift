@@ -140,7 +140,7 @@ final class AppState: ObservableObject {
                     }
                     self.importCertificateBundleOrFile(url)
                 case .appPackage:
-                    // 内含 .app → 应用包：解压并重新打包成 .ipa 后导入“我的应用”
+                    // 内含 .app → 应用包：解压并重新打包成 .ipa 后导入“未签名应用”
                     let ipaURL = try self.parser.convertToIPAIfNeeded(fileURL: url)
                     self.importFile(from: ipaURL) { result in
                         DispatchQueue.main.async {
@@ -154,7 +154,7 @@ final class AppState: ObservableObject {
                         }
                     }
                 case .embeddedIPA(let ipaURL):
-                    // zip 内嵌 .ipa → 直接导入“我的应用”：
+                    // zip 内嵌 .ipa → 直接导入“未签名应用”：
                     // 文件已复制到 .ipa 目录（url.path == destination.path），importFile 会跳过复制直接 parse
                     self.importFile(from: ipaURL) { result in
                         DispatchQueue.main.async {
@@ -437,9 +437,27 @@ final class AppState: ObservableObject {
                 // 走到这里 destination 必为本次导入写入/产生的文件（复制分支成功后，
                 // 或 skip-copy 分支的转换产物），失败清理时才允许删除它
                 destinationCreatedByThisImport = true
-                // 阶段：解压 IPA 并解析 Info.plist / 提取图标（权重 80~95%）
-                self.updateImportProgress(fileName: fileName, index: index, total: total, phase: "解析中…", progress: 0.8)
-                var app = try self.parser.parseAppInfo(fileURL: destination)
+                // 阶段：解压 IPA 并解析 Info.plist / 提取图标。
+                // - 直接导入 .ipa：上一阶段（解压转换 0~60%/复制 60~80%）被跳过，
+                //   进度不应一下子跳到 80%。这里让"解析中"（整包解压，最耗时）从
+                //   5% 起步，按真实解压字节平滑涨到 98%：5% → 10% → 20% … → 90% → 98%。
+                // - zip 导入：解压转换已占 0~60%、复制 60~80%，解析第 2 次解压较快，
+                //   保持 80~95% 权重（parseAppInfo 的 progress 映射到该区间）。
+                let isDirectIPA = url.pathExtension.lowercased() == "ipa"
+                if isDirectIPA {
+                    self.updateImportProgress(fileName: fileName, index: index, total: total, phase: "解析中…", progress: 0.05)
+                } else {
+                    self.updateImportProgress(fileName: fileName, index: index, total: total, phase: "解析中…", progress: 0.8)
+                }
+                var app = try self.parser.parseAppInfo(fileURL: destination, progress: { p in
+                    if isDirectIPA {
+                        // .ipa 直接导入：5% → 98% 线性映射解压字节
+                        self.updateImportProgress(fileName: fileName, index: index, total: total, phase: "解析中…", progress: 0.05 + p * 0.93)
+                    } else {
+                        // zip 导入：80% → 95%
+                        self.updateImportProgress(fileName: fileName, index: index, total: total, phase: "解析中…", progress: 0.8 + p * 0.15)
+                    }
+                })
                 // skip-copy 分支唯一后缀保护：转换产物已直接写入 destination，但该路径若
                 // 已被其它 bundleID 的记录引用（如旧记录指向已丢失的文件、或转换输出恰好
                 // 撞上残留同名文件），把产物改名到唯一后缀，杜绝新旧两条记录指向同一文件。
@@ -466,8 +484,10 @@ final class AppState: ObservableObject {
                 // Extracted/Icons/<baseName>/ 稳定目录后回填 app.iconPath，首页「待签名」
                 // 列表才能稳定显示图标（与已签名列表 persistInstalledAppIcon 同源修复）。
                 // 当前仍在后台队列执行，文件复制不阻塞主线程。
-                // 阶段：把解析出的图标复制到稳定目录（权重 95~100%）
-                self.updateImportProgress(fileName: fileName, index: index, total: total, phase: "提取图标…", progress: 0.95)
+                // 阶段：把解析出的图标复制到稳定目录（直接导入 .ipa 时解析到 98%，图标 98→100；
+                // zip 导入时解析到 95%，图标 95→100）
+                let iconProgress: Double = isDirectIPA ? 0.98 : 0.95
+                self.updateImportProgress(fileName: fileName, index: index, total: total, phase: "提取图标…", progress: iconProgress)
                 if let iconPath = app.iconPath,
                    FileManager.default.fileExists(atPath: iconPath),
                    let stablePath = self.persistImportedAppIcon(
@@ -586,11 +606,12 @@ final class AppState: ObservableObject {
                         self.importedApps[index].signedPath = signedPath
                     }
                     self.saveState()
-                    // 已签名列表在后台串行队列解析后回主线程赋值，完成后才回调，
-                    // 保证 AppDetailView.liveApp 在 completion 后能立刻按 path 匹配到签名产物。
-                    self.refreshInstalledApps {
-                        completion?(.success(signedPath))
-                    }
+                    // 立即回调 completion（弹“签名完成”），再后台异步刷新已签名列表：
+                    // 之前先 refreshInstalledApps 会整包解析刚生成的 Signed/ 产物
+                    // （数百 MB 解压可能需要数秒），阻塞在 completion 之前导致
+                    // “签名完成”弹窗延迟 3~4 秒，用户以为签名没完成。
+                    completion?(.success(signedPath))
+                    self.refreshInstalledApps()
                 }
             } catch {
                 DispatchQueue.main.async {

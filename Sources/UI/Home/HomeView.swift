@@ -58,7 +58,7 @@ struct HomeView: View {
 
     private var appsSection: some View {
         VStack(alignment: .leading, spacing: 8) {
-            Text("我的应用")
+            Text("未签名应用")
                 .font(.headline)
 
             if appState.importedApps.isEmpty && appState.installedApps.isEmpty {

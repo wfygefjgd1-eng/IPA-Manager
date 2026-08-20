@@ -144,8 +144,8 @@ final class IPAParser {
         return message
     }
 
-    func parseAppInfo(fileURL: URL) throws -> AppInfo {
-        let package = try parse(fileURL: fileURL)
+    func parseAppInfo(fileURL: URL, progress: ((Double) -> Void)? = nil) throws -> AppInfo {
+        let package = try parse(fileURL: fileURL, progress: progress)
         var info = try infoParser.parse(at: package.infoPlistURL)
         info.path = package.appURL.path
         info.size = AppFileManager.shared.fileSize(at: fileURL)
