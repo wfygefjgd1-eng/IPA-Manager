@@ -4,7 +4,7 @@ struct AppsView: View {
     @EnvironmentObject private var appState: AppState
     @State private var selectedApp: AppInfo?
     @State private var showClearAllAlert = false
-    /// 多选删除模式：true 时行变为勾选交互，"删除选中"出现在工具栏右侧
+    /// 多选删除模式：true 时行变为勾选交互，操作按钮移到底部悬浮条
     @State private var isSelecting = false
     /// 多选模式下已勾选的应用 id
     @State private var selectedIDs: Set<UUID> = []
@@ -49,35 +49,13 @@ struct AppsView: View {
                             }
                         }
                     }
+                    .safeAreaInset(edge: .bottom, spacing: 0) {
+                        // 底部悬浮操作条：位于 Tab 栏上方，拇指可及；半透明材质不突兀
+                        floatingActionBar
+                    }
                 }
             }
             .navigationTitle("已签应用")
-            .toolbar {
-                ToolbarItem(placement: .navigationBarLeading) {
-                    if isSelecting {
-                        Button("取消") {
-                            exitSelection()
-                        }
-                    } else if !appState.installedApps.isEmpty {
-                        HStack(spacing: 16) {
-                            Button("全部清除", role: .destructive) {
-                                showClearAllAlert = true
-                            }
-                            Button("选择") {
-                                enterSelection()
-                            }
-                        }
-                    }
-                }
-                ToolbarItem(placement: .navigationBarTrailing) {
-                    if isSelecting {
-                        Button("删除选中 (\(selectedIDs.count))", role: .destructive) {
-                            deleteSelectedApps()
-                        }
-                        .disabled(selectedIDs.isEmpty)
-                    }
-                }
-            }
             .sheet(item: $selectedApp) { app in
                 AppDetailView(app: app)
             }
@@ -88,6 +66,53 @@ struct AppsView: View {
                 Button("取消", role: .cancel) {}
             } message: {
                 Text("将删除全部 \(appState.installedApps.count) 个已签应用及对应文件，此操作不可撤销。")
+            }
+        }
+    }
+
+    /// 底部悬浮操作条：非选择模式展示「全部清除 / 选择」；
+    /// 选择模式展示「取消 / 全选（取消全选）/ 删除选中 (N)」。
+    private var floatingActionBar: some View {
+        FloatingActionBar {
+            if isSelecting {
+                Button("取消") {
+                    exitSelection()
+                }
+                .font(.subheadline)
+                .foregroundColor(.secondary)
+
+                Button(allSelected ? "取消全选" : "全选") {
+                    toggleSelectAll()
+                }
+                .font(.subheadline.weight(.semibold))
+                .foregroundColor(.accentColor)
+
+                Spacer()
+
+                Button(role: .destructive) {
+                    deleteSelectedApps()
+                } label: {
+                    Label("删除选中 (\(selectedIDs.count))", systemImage: "trash")
+                        .font(.subheadline.weight(.semibold))
+                }
+                .disabled(selectedIDs.isEmpty)
+            } else {
+                Button(role: .destructive) {
+                    showClearAllAlert = true
+                } label: {
+                    Label("全部清除", systemImage: "trash")
+                        .font(.subheadline)
+                }
+                .disabled(appState.installedApps.isEmpty)
+
+                Spacer()
+
+                Button {
+                    enterSelection()
+                } label: {
+                    Label("选择", systemImage: "checkmark.circle")
+                        .font(.subheadline.weight(.semibold))
+                }
             }
         }
     }
@@ -140,6 +165,20 @@ struct AppsView: View {
     }
 
     // MARK: - 多选删除
+
+    /// 是否已全选当前列表（用于"全选 / 取消全选"切换）
+    private var allSelected: Bool {
+        !appState.installedApps.isEmpty && selectedIDs.count == appState.installedApps.count
+    }
+
+    /// 全选 / 取消全选：已全选时清空勾选，否则选中全部应用
+    private func toggleSelectAll() {
+        if allSelected {
+            selectedIDs.removeAll()
+        } else {
+            selectedIDs = Set(appState.installedApps.map { $0.id })
+        }
+    }
 
     private func enterSelection() {
         selectedIDs.removeAll()

@@ -12,7 +12,7 @@ struct DownloadsView: View {
     @State private var showUnrecognizedAlert = false
     @State private var unrecognizedMessage = ""
     @State private var showClearAllAlert = false
-    /// 多选删除模式：true 时行变为勾选交互，"删除选中"出现在工具栏右侧
+    /// 多选删除模式：true 时行变为勾选交互，操作按钮移到底部悬浮条
     @State private var isSelecting = false
     /// 多选模式下已勾选的任务 id
     @State private var selectedIDs: Set<UUID> = []
@@ -49,47 +49,30 @@ struct DownloadsView: View {
                     .listStyle(.plain)
                     .scrollContentBackground(.hidden)
                     .background(Color(.systemGroupedBackground))
+                    .safeAreaInset(edge: .bottom, spacing: 0) {
+                        // 底部悬浮操作条：位于 Tab 栏上方，拇指可及；半透明材质不突兀
+                        floatingActionBar
+                    }
                 }
             }
             .navigationTitle("")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
-                ToolbarItem(placement: .navigationBarLeading) {
-                    if isSelecting {
-                        Button("取消") {
-                            exitSelection()
-                        }
-                    } else if !tasks.isEmpty {
-                        HStack(spacing: 16) {
-                            Button("全部清除", role: .destructive) {
-                                showClearAllAlert = true
-                            }
-                            Button("选择") {
-                                enterSelection()
-                            }
-                        }
-                    }
-                }
+                // 书签与 Safari 保留在工具栏（浏览入口，与选择/清除无关）；
+                // “全部清除/选择/删除选中/取消”已移至底部悬浮条
                 ToolbarItem(placement: .navigationBarTrailing) {
-                    if isSelecting {
-                        Button("删除选中 (\(selectedIDs.count))", role: .destructive) {
-                            deleteSelectedTasks()
+                    HStack(spacing: 16) {
+                        Button {
+                            showBookmarks = true
+                        } label: {
+                            Image(systemName: "bookmark.fill")
                         }
-                        .disabled(selectedIDs.isEmpty)
-                    } else {
-                        HStack(spacing: 16) {
-                            Button {
-                                showBookmarks = true
-                            } label: {
-                                Image(systemName: "bookmark.fill")
-                            }
-                            Button {
-                                // 直接打开浏览器：清除上次书签跳转遗留的初始 URL
-                                initialBrowserURL = nil
-                                showBrowser = true
-                            } label: {
-                                Image(systemName: "safari")
-                            }
+                        Button {
+                            // 直接打开浏览器：清除上次书签跳转遗留的初始 URL
+                            initialBrowserURL = nil
+                            showBrowser = true
+                        } label: {
+                            Image(systemName: "safari")
                         }
                     }
                 }
@@ -136,6 +119,53 @@ struct DownloadsView: View {
             .onChange(of: appState.importedApps) { _ in
                 // 自动导入完成（importedApps 更新）后立刻刷新，及时呈现可点击状态
                 refreshTasks()
+            }
+        }
+    }
+
+    /// 底部悬浮操作条：非选择模式展示「全部清除 / 选择」；
+    /// 选择模式展示「取消 / 全选（取消全选）/ 删除选中 (N)」。
+    private var floatingActionBar: some View {
+        FloatingActionBar {
+            if isSelecting {
+                Button("取消") {
+                    exitSelection()
+                }
+                .font(.subheadline)
+                .foregroundColor(.secondary)
+
+                Button(allSelected ? "取消全选" : "全选") {
+                    toggleSelectAll()
+                }
+                .font(.subheadline.weight(.semibold))
+                .foregroundColor(.accentColor)
+
+                Spacer()
+
+                Button(role: .destructive) {
+                    deleteSelectedTasks()
+                } label: {
+                    Label("删除选中 (\(selectedIDs.count))", systemImage: "trash")
+                        .font(.subheadline.weight(.semibold))
+                }
+                .disabled(selectedIDs.isEmpty)
+            } else {
+                Button(role: .destructive) {
+                    showClearAllAlert = true
+                } label: {
+                    Label("全部清除", systemImage: "trash")
+                        .font(.subheadline)
+                }
+                .disabled(tasks.isEmpty)
+
+                Spacer()
+
+                Button {
+                    enterSelection()
+                } label: {
+                    Label("选择", systemImage: "checkmark.circle")
+                        .font(.subheadline.weight(.semibold))
+                }
             }
         }
     }
@@ -604,6 +634,20 @@ struct DownloadsView: View {
     }
 
     // MARK: - 多选删除
+
+    /// 是否已全选当前列表（用于"全选 / 取消全选"切换）
+    private var allSelected: Bool {
+        !tasks.isEmpty && selectedIDs.count == tasks.count
+    }
+
+    /// 全选 / 取消全选：已全选时清空勾选，否则选中全部任务
+    private func toggleSelectAll() {
+        if allSelected {
+            selectedIDs.removeAll()
+        } else {
+            selectedIDs = Set(tasks.map { $0.id })
+        }
+    }
 
     private func enterSelection() {
         selectedIDs.removeAll()
