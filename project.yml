@@ -86,9 +86,10 @@ targets:
         NSAppTransportSecurity:
           NSAllowsArbitraryLoads: true
         # itms-services 打开后 App 立即退到后台，本地 HTTP 服务器（NWListener）必须继续
-        # 接受 manifest/ipa 下载连接：声明 network 后台模式，退后台后网络套接字不被挂起。
+        # 接受 manifest/ipa 下载连接：用 audio 后台模式 + 静音音频保活（iOS 无 "network"
+        # 后台模式值，network 会被忽略），退后台后进程不挂起、NWListener 持续接收连接。
         UIBackgroundModes:
-          - network
+          - audio
         ITSAppUsesNonExemptEncryption: false
         UISupportedInterfaceOrientations:
           - UIInterfaceOrientationPortrait

@@ -30,6 +30,9 @@ final class LocalInstallServer {
 
         listener.start(queue: ServerQueue.shared.queue)
         Logger.info("本地安装服务器已启动: 127.0.0.1:\(port)")
+        // itms-services 打开后 App 将立即退到后台：启动静音音频保活，
+        // 让进程不被挂起，SpringBoard 才能连上本地服务器下载 manifest/ipa 。
+        BackgroundAudioKeepAlive.shared.start()
         return URL(string: "http://127.0.0.1:\(port)")!
     }
 
@@ -44,6 +47,7 @@ final class LocalInstallServer {
         listener = nil
         servingIPA = nil
         manifestData = nil
+        BackgroundAudioKeepAlive.shared.stop()
         Logger.info("本地安装服务器已停止")
     }
 
