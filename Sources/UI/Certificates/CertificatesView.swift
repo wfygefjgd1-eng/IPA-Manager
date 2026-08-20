@@ -150,32 +150,33 @@ struct CertificatesView: View {
         }
     }
 
-    /// 底部悬浮「一键导入证书」：大号半透明胶囊 + 阴影，悬浮在内容底部（类似已签应用/下载页的操作条），
-    /// 替代原右上角小按钮，改成页面底部的醒目入口。
+    /// 底部悬浮「一键导入证书」：低调极简，单个中性浅底胶囊，无彩色底、无外层轮廓/光晕。
+    /// 证书页用户很少进，画面感不需要强：不套 FloatingActionBar 的半透明容器，
+    /// 避免"蓝底 + 外圈轮廓"双层叠套的观感。
     private var importFloatingBar: some View {
-        FloatingActionBar {
-            Button {
-                // 全类型导入（zip/p12/pfx/mobileprovision）
-                importTarget = nil
-                showImporter = true
-            } label: {
-                HStack(spacing: 8) {
-                    Image(systemName: "square.and.arrow.down")
-                        .font(.system(size: 17, weight: .semibold))
-                    Text("一键导入证书")
-                        .font(.headline.weight(.semibold))
-                }
-                .foregroundColor(.white)
-                .frame(maxWidth: .infinity)
-                .padding(.vertical, 12)
-                .background(
-                    Capsule()
-                        .fill(Color.accentColor.gradient)
-                )
-                .shadow(color: .accentColor.opacity(0.35), radius: 8, x: 0, y: 4)
+        Button {
+            // 全类型导入（zip/p12/pfx/mobileprovision）
+            importTarget = nil
+            showImporter = true
+        } label: {
+            HStack(spacing: 8) {
+                Image(systemName: "square.and.arrow.down")
+                    .font(.system(size: 17, weight: .semibold))
+                Text("一键导入证书")
+                    .font(.headline.weight(.semibold))
             }
-            .buttonStyle(.plain)
+            .foregroundColor(.primary)
+            .frame(maxWidth: .infinity)
+            .padding(.vertical, 12)
+            .padding(.horizontal, 16)
+            .background(
+                Capsule()
+                    .fill(Color.primary.opacity(0.07))
+            )
         }
+        .buttonStyle(.plain)
+        .padding(.horizontal, 16)
+        .padding(.bottom, 8)
     }
 
     /// 文档选择器按导入目标限定类型：证书 → p12/pfx/zip；描述文件 → mobileprovision/zip；全类型 → 所有
@@ -226,8 +227,8 @@ struct CertificatesView: View {
                     .multilineTextAlignment(.center)
                 // 明确的导入引导：让用户知道这个框可以点
                 Label("点击导入", systemImage: "arrow.up.doc")
-                    .font(.caption.weight(.semibold))
-                    .foregroundColor(.accentColor)
+                    .font(.caption.weight(.medium))
+                    .foregroundColor(.secondary)
                     .padding(.top, 4)
             }
             .frame(maxWidth: .infinity)
@@ -263,14 +264,14 @@ struct CertificatesView: View {
     private func certificateRow(_ certificate: CertificateInfo) -> some View {
         cardContainer {
             HStack(spacing: 12) {
-                // 图标底：有效/过期不同浅色，一眼看到状态
+                // 图标底：有效/过期用很淡的浅色区分，低调不抢眼（证书页少进，无需强画面感）
                 Image(systemName: "key.fill")
-                    .font(.system(size: 20, weight: .medium))
-                    .foregroundColor(certificate.status == .valid ? .green : (certificate.status == .expired ? .red : .secondary))
+                    .font(.system(size: 20, weight: .regular))
+                    .foregroundColor(certificate.status == .valid ? .green.opacity(0.75) : (certificate.status == .expired ? .red.opacity(0.75) : .secondary))
                     .frame(width: 44, height: 44)
                     .background(
                         RoundedRectangle(cornerRadius: 11, style: .continuous)
-                            .fill((certificate.status == .valid ? Color.green : (certificate.status == .expired ? Color.red : Color.secondary)).opacity(0.14))
+                            .fill((certificate.status == .valid ? Color.green : (certificate.status == .expired ? Color.red : Color.secondary)).opacity(0.07))
                     )
 
                 VStack(alignment: .leading, spacing: 5) {
@@ -280,15 +281,14 @@ struct CertificatesView: View {
                             .foregroundColor(.primary)
                             .lineLimit(1)
 
-                        // 「默认」徽章：自动签名默认使用的证书，
-                        // 用安静的胶囊徽章而非可点的勾选圈，突出“展示、不可操作”
+                        // 「默认」徽章：低调小字，避免喧宾夺主
                         if appState.selectedCertificate?.id == certificate.id {
                             Text("默认")
-                                .font(.caption2.weight(.semibold))
-                                .foregroundColor(.accentColor)
+                                .font(.caption2.weight(.medium))
+                                .foregroundColor(.secondary)
                                 .padding(.horizontal, 7)
                                 .padding(.vertical, 2)
-                                .background(Capsule().fill(Color.accentColor.opacity(0.14)))
+                                .background(Capsule().fill(Color.primary.opacity(0.07)))
                         }
                     }
 
@@ -325,12 +325,12 @@ struct CertificatesView: View {
         cardContainer {
             HStack(spacing: 12) {
                 Image(systemName: "doc.badge.gearshape")
-                    .font(.system(size: 20, weight: .medium))
-                    .foregroundColor(profile.status == .valid ? .blue : (profile.status == .expired ? .red : .secondary))
+                    .font(.system(size: 20, weight: .regular))
+                    .foregroundColor(profile.status == .valid ? .blue.opacity(0.75) : (profile.status == .expired ? .red.opacity(0.75) : .secondary))
                     .frame(width: 44, height: 44)
                     .background(
                         RoundedRectangle(cornerRadius: 11, style: .continuous)
-                            .fill((profile.status == .valid ? Color.blue : (profile.status == .expired ? Color.red : Color.secondary)).opacity(0.14))
+                            .fill((profile.status == .valid ? Color.blue : (profile.status == .expired ? Color.red : Color.secondary)).opacity(0.07))
                     )
 
                 VStack(alignment: .leading, spacing: 5) {
@@ -340,14 +340,14 @@ struct CertificatesView: View {
                             .foregroundColor(.primary)
                             .lineLimit(1)
 
-                        // 「默认」徽章：自动签名默认使用的描述文件
+                        // 「默认」徽章：低调小字，避免喧宾夺主
                         if appState.selectedProfile?.uuid == profile.uuid {
                             Text("默认")
-                                .font(.caption2.weight(.semibold))
-                                .foregroundColor(.accentColor)
+                                .font(.caption2.weight(.medium))
+                                .foregroundColor(.secondary)
                                 .padding(.horizontal, 7)
                                 .padding(.vertical, 2)
-                                .background(Capsule().fill(Color.accentColor.opacity(0.14)))
+                                .background(Capsule().fill(Color.primary.opacity(0.07)))
                         }
                     }
 
@@ -398,15 +398,15 @@ struct CertificatesView: View {
         return "限定 \(profile.provisionedDevices.count) 台设备"
     }
 
-    /// 状态胶囊：有效/无效统一浅色圆角底，与下载页 statusChip 同款
+    /// 状态胶囊：有效/无效统一浅色圆角底，颜色极淡、低调
     private func statusChip(_ text: String, isGood: Bool, expired: Bool) -> some View {
         Text(text)
-            .font(.caption2.weight(.semibold))
-            .foregroundColor(expired ? .red : (isGood ? .green : .secondary))
+            .font(.caption2.weight(.medium))
+            .foregroundColor(expired ? .red.opacity(0.75) : (isGood ? .green.opacity(0.75) : .secondary))
             .padding(.horizontal, 8)
             .padding(.vertical, 3)
             .background(
-                Capsule().fill((expired ? Color.red : (isGood ? Color.green : Color.secondary)).opacity(0.12))
+                Capsule().fill((expired ? Color.red : (isGood ? Color.green : Color.secondary)).opacity(0.07))
             )
     }
 
