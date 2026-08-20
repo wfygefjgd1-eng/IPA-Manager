@@ -14,7 +14,14 @@
 #include <openssl/x509v3.h>
 #include <openssl/err.h>
 #include <openssl/provider.h>
-#include <openssl/providers.h>
+
+// 静态链接的 libcrypto.a 里内嵌 legacy provider，其入口符号 legacy_provider 在
+// <openssl/providers.h> 声明——但该头文件未进入 OpenSSL 的公开安装目录（CI 报
+// "openssl/providers.h: file not found"），因此这里按 OpenSSL 3 的 ABI 自行 extern
+// 声明该符号（类型 OSSL_provider_init_fn，符号名与 providers 模块一致，不会 name-mangle）。
+extern "C" {
+    extern OSSL_provider_init_fn legacy_provider;
+}
 
 #include "common.h"
 #include "openssl.h"
