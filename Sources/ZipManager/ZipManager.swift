@@ -61,7 +61,8 @@ final class ZipManager {
         guard let archive = try? Archive(url: archiveURL, accessMode: .read) else {
             throw ZipError.corrupted("ZIP 文件无法读取")
         }
-        defer { archive.close() }
+        // Archive 由 deinit 自动关闭（部分 ZIPFoundation 版本无公开 close()，
+        // 不调用可避免编译差异；只读遍历在函数作用域内完成）。
 
         var totalBytes: UInt64 = 0
         var entryCount = 0
@@ -92,7 +93,7 @@ final class ZipManager {
         }
     }
 
-    func zip(folderURL: URL, outputURL: URL, shouldKeepParent: Bool = false, compressionMethod: Archive.CompressionMethod = .deflate) throws {
+    func zip(folderURL: URL, outputURL: URL, shouldKeepParent: Bool = false) throws {
         Logger.info("打包开始: \(outputURL.lastPathComponent)")
 
         if fileManager.fileExists(atPath: outputURL.path) {
@@ -103,12 +104,13 @@ final class ZipManager {
             // shouldKeepParent=false：把文件夹内容（Payload/）直接打到压缩包根，
             // 否则 ZIPFoundation 会把 staging 目录名作为前缀（IPA-Build-<UUID>/Payload/...），
             // 生成的 ".ipa" 顶层不是 Payload，后续解析/签名/安装全部不可用。
-            // compressionMethod 默认 .deflate：转换产物必须压缩，避免 2~4 倍体积膨胀。
+            // zipItem 内部默认 deflate 压缩：转换产物必须压缩，避免 2~4 倍体积膨胀
+            // （不使用带 compressionMethod 的重载与 ZipArchive/CompressionMethod 类型名，
+            // 这些在部分 ZIPFoundation 版本不存在；默认压缩方法即 deflate）。
             try fileManager.zipItem(
                 at: folderURL,
                 to: outputURL,
-                shouldKeepParent: shouldKeepParent,
-                compressionMethod: compressionMethod
+                shouldKeepParent: shouldKeepParent
             )
         } catch {
             throw AppError.operationFailed("打包失败: \(outputURL.lastPathComponent)")
