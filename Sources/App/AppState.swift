@@ -252,7 +252,7 @@ final class AppState: ObservableObject {
                 // 当前仍在后台队列执行，文件复制不阻塞主线程。
                 if let iconPath = app.iconPath,
                    FileManager.default.fileExists(atPath: iconPath),
-                   let stablePath = persistImportedAppIcon(
+                   let stablePath = self.persistImportedAppIcon(
                        from: iconPath,
                        baseName: destination.deletingPathExtension().lastPathComponent
                    ) {
