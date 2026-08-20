@@ -4,7 +4,8 @@ import UIKit
 
 /// 首页导入进度状态：nil 表示当前没有导入任务进行中。
 /// 导入流程按阶段推进（解压转换 → 复制 → 解析 → 提取图标），
-/// 每个阶段都会更新 phase 文字，让用户在耗时操作期间看到明确反馈。
+/// 每个阶段都会更新 phase 文字与 progress 百分比，让用户在耗时操作期间
+/// 看到明确反馈（阶段内百分比由 ZIPFoundation 逐条目解压真实字节推算）。
 struct ImportProgress: Equatable {
     /// 正在导入的文件名（如 xxx.ipa）
     let fileName: String
@@ -14,6 +15,8 @@ struct ImportProgress: Equatable {
     let totalCount: Int
     /// 阶段文字，如 "解压中…" / "解析中…" / "复制文件…"
     let phase: String
+    /// 整体进度 0~1（各阶段加权合成：解压转换 60% / 复制 20% / 解析 10% / 图标 10%）
+    let progress: Double
 }
 
 final class AppState: ObservableObject {
@@ -268,18 +271,31 @@ final class AppState: ObservableObject {
 
     /// 更新导入进度（任意线程可调，内部切回主线程赋值 @Published，
     /// 避免后台队列直接修改 ObservableObject 状态导致 SwiftUI 更新异常）。
+    /// progress 为整体进度 0~1；阶段内由各阶段自身推进（解压按字节、其余按权重）。
+    /// 节流：主线程内同阶段 progress 变化 <1% 时跳过，避免大包解压逐条目高频
+    /// 刷新主队列（数万次 async 会造成 UI 掉帧）；首次进入阶段与跨阶段必更新。
+    private var lastImportProgressKey: String = ""
+    private var lastImportProgressValue: Double = -1
     func updateImportProgress(
         fileName: String,
         index: Int,
         total: Int,
-        phase: String
+        phase: String,
+        progress: Double = 0
     ) {
         DispatchQueue.main.async {
+            let key = "\(index)-\(total)-\(phase)"
+            let shouldThrottle = key == self.lastImportProgressKey
+                && abs(self.lastImportProgressValue - progress) < 0.01
+            guard !shouldThrottle else { return }
+            self.lastImportProgressKey = key
+            self.lastImportProgressValue = progress
             self.importProgress = ImportProgress(
                 fileName: fileName,
                 currentIndex: index,
                 totalCount: total,
-                phase: phase
+                phase: phase,
+                progress: progress
             )
         }
     }
@@ -288,6 +304,9 @@ final class AppState: ObservableObject {
     func clearImportProgress() {
         DispatchQueue.main.async {
             self.importProgress = nil
+            // 重置节流状态：下一文件/下次导入的首档进度必须显示
+            self.lastImportProgressKey = ""
+            self.lastImportProgressValue = -1
         }
     }
 
@@ -324,9 +343,12 @@ final class AppState: ObservableObject {
                 // 会在转换时抛“未找到 .app 应用包”，由上层给用户明确提示，不会入库。
                 let importURL: URL
                 if url.pathExtension.lowercased() == "zip" {
-                    // 阶段：解压源压缩包并重新打包成 .ipa（可能耗时最长）
-                    self.updateImportProgress(fileName: fileName, index: index, total: total, phase: "解压转换中…")
-                    importURL = try self.parser.convertToIPAIfNeeded(fileURL: url)
+                    // 阶段：解压源压缩包并重新打包成 .ipa（可能耗时最长）。
+                    // 权重 0~60%：convertToIPAIfNeeded 内部按解压字节上报 p*0.6
+                    self.updateImportProgress(fileName: fileName, index: index, total: total, phase: "解压转换中…", progress: 0)
+                    importURL = try self.parser.convertToIPAIfNeeded(fileURL: url, progress: { p in
+                        self.updateImportProgress(fileName: fileName, index: index, total: total, phase: "解压转换中…", progress: p * 0.6)
+                    })
                 } else {
                     importURL = url
                 }
@@ -356,12 +378,12 @@ final class AppState: ObservableObject {
                             try FileManager.default.removeItem(at: destination)
                         }
                     }
-                    // 阶段：复制到 IPA 目录
-                    self.updateImportProgress(fileName: fileName, index: index, total: total, phase: "复制文件…")
+                    // 阶段：复制到 IPA 目录（权重 60~80%）
+                    self.updateImportProgress(fileName: fileName, index: index, total: total, phase: "复制文件…", progress: 0.6)
                     try self.fileManager.copyItem(from: importURL, to: destination)
                 }
-                // 阶段：解压 IPA 并解析 Info.plist / 提取图标（耗时较长）
-                self.updateImportProgress(fileName: fileName, index: index, total: total, phase: "解析中…")
+                // 阶段：解压 IPA 并解析 Info.plist / 提取图标（权重 80~95%）
+                self.updateImportProgress(fileName: fileName, index: index, total: total, phase: "解析中…", progress: 0.8)
                 var app = try self.parser.parseAppInfo(fileURL: destination)
                 app.path = destination.path
                 // 待签名图标持久化：parseAppInfo 返回的 iconPath 是本次解压目录
@@ -370,8 +392,8 @@ final class AppState: ObservableObject {
                 // Extracted/Icons/<baseName>/ 稳定目录后回填 app.iconPath，首页「待签名」
                 // 列表才能稳定显示图标（与已签名列表 persistInstalledAppIcon 同源修复）。
                 // 当前仍在后台队列执行，文件复制不阻塞主线程。
-                // 阶段：把解析出的图标复制到稳定目录
-                self.updateImportProgress(fileName: fileName, index: index, total: total, phase: "提取图标…")
+                // 阶段：把解析出的图标复制到稳定目录（权重 95~100%）
+                self.updateImportProgress(fileName: fileName, index: index, total: total, phase: "提取图标…", progress: 0.95)
                 if let iconPath = app.iconPath,
                    FileManager.default.fileExists(atPath: iconPath),
                    let stablePath = self.persistImportedAppIcon(

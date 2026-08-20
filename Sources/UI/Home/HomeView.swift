@@ -218,11 +218,21 @@ struct HomeView: View {
         }
     }
 
-    /// 导入进度卡片：黑色胶囊 + 转圈 + 文件名 + 阶段文字，与全局 toast（ContentView）同风格。
+    /// 导入进度卡片：黑色胶囊 + 进度条（百分比）+ 文件名 + 阶段文字 + i/N，
+    /// 与全局 toast（ContentView）同风格。进度条用当前阶段真实进度加权后的
+    /// 整体百分比（0~1），解压阶段随字节数实时增长，让用户看到明确进展。
     private func importProgressCard(_ progress: ImportProgress) -> some View {
         HStack(spacing: 12) {
-            ProgressView()
-                .progressViewStyle(CircularProgressViewStyle(tint: .white))
+            ZStack {
+                // 转圈 + 内圈百分比：双重反馈，进度直观
+                ProgressView()
+                    .progressViewStyle(CircularProgressViewStyle(tint: .white))
+                    .opacity(0.35)
+                Text("\(Int((progress.progress * 100).rounded()))%")
+                    .font(.system(size: 10, weight: .bold))
+                    .foregroundColor(.white)
+            }
+            .frame(width: 40, height: 40)
             VStack(alignment: .leading, spacing: 3) {
                 Text("正在导入 \(progress.fileName)")
                     .font(.footnote)
@@ -234,7 +244,7 @@ struct HomeView: View {
                         .font(.caption2)
                         .opacity(0.85)
                 } else {
-                    Text(progress.phase)
+                    Text("\(progress.phase) \(Int((progress.progress * 100).rounded()))%")
                         .font(.caption2)
                         .opacity(0.85)
                 }

@@ -16,7 +16,7 @@ final class IPAParser {
     private let zipManager = ZipManager.shared
     private let infoParser = InfoPlistParser()
 
-    func parse(fileURL: URL) throws -> ParsedPackage {
+    func parse(fileURL: URL, progress: ((Double) -> Void)? = nil) throws -> ParsedPackage {
         let ext = fileURL.pathExtension.lowercased()
         guard ext == "ipa" || ext == "zip" else {
             throw AppError.operationFailed("不支持的格式: \(ext)")
@@ -27,7 +27,11 @@ final class IPAParser {
 
         let extractDir = extractedDirectory(for: fileURL)
         do {
-            try zipManager.unzip(archiveURL: fileURL, destinationURL: extractDir)
+            if let progress = progress {
+                try zipManager.unzipWithProgress(archiveURL: fileURL, destinationURL: extractDir, progress: progress)
+            } else {
+                try zipManager.unzip(archiveURL: fileURL, destinationURL: extractDir)
+            }
         } catch let error as ZipManager.ZipError {
             // ZipError 的 errorDescription 已经是面向用户的中文
             // （“不是有效的 ZIP / 下载到的是网页 / 已损坏或下载不完整”），直接透传保留全部细节。
@@ -149,12 +153,15 @@ final class IPAParser {
         return info
     }
 
-    func convertToIPAIfNeeded(fileURL: URL) throws -> URL {
+    func convertToIPAIfNeeded(fileURL: URL, progress: ((Double) -> Void)? = nil) throws -> URL {
         let ext = fileURL.pathExtension.lowercased()
         if ext == "ipa" { return fileURL }
 
         // 解压源压缩包并定位 .app（找不到会抛出“未找到 .app 应用包”）
-        let package = try parse(fileURL: fileURL)
+        let package = try parse(fileURL: fileURL, progress: { p in
+            // 解压阶段占整体 0~60%（60% 之后为复制/解析/图标）
+            progress?(p * 0.6)
+        })
 
         // 构造干净的临时目录，只包含 Payload/<应用名>.app，
         // 保证打包出的 .ipa 无论源结构（Payload/、Archive/ 或裸 .app）都合法

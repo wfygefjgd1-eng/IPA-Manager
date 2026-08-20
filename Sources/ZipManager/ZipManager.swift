@@ -126,7 +126,50 @@ final class ZipManager {
     /// 空 ZIP 的签名 "PK\x05\x06"（仅含中央目录结束记录，无任何条目）
     private static let emptyArchiveSignature: [UInt8] = [0x50, 0x4B, 0x05, 0x06]
 
-    /// 校验 ZIP 文件头（前 4 字节）。非 PK 头时进一步判断是否为 HTML 网页错误页。
+    // MARK: - 带进度的解压（逐条目提取，按已解压字节/总字节上报 0~1）
+
+    /// 逐条目解压并按已处理字节上报进度（供导入进度条展示真实百分比）。
+    /// 与 unzip 的完整校验（文件头 + zip-slip 条目校验）一致，只是改为
+    /// 逐条目 extract 以便计算进度。progress 在主调用线程回调（调用方负责切主线程）。
+    func unzipWithProgress(
+        archiveURL: URL,
+        destinationURL: URL,
+        progress: @escaping (Double) -> Void
+    ) throws {
+        try validateZipHeader(at: archiveURL)
+        try validateEntryPaths(at: archiveURL)
+
+        if fileManager.fileExists(atPath: destinationURL.path) {
+            try fileManager.removeItem(at: destinationURL)
+        }
+        try fileManager.createDirectory(at: destinationURL, withIntermediateDirectories: true)
+
+        do {
+            guard let archive = try? Archive(url: archiveURL, accessMode: .read) else {
+                throw ZipError.corrupted("ZIP 文件无法读取")
+            }
+            let totalBytes = archive.reduce(UInt64(0)) { $0 + $1.uncompressedSize }
+            guard totalBytes > 0 else {
+                // 空 zip：直接完成
+                progress(1.0)
+                return
+            }
+            var processed: UInt64 = 0
+            for entry in archive {
+                try archive.extract(entry, to: destinationURL)
+                processed += entry.uncompressedSize
+                progress(Double(processed) / Double(totalBytes))
+            }
+        } catch let error as ZipManager.ZipError {
+            try? fileManager.removeItem(at: destinationURL)
+            throw error
+        } catch {
+            Logger.error("ZIP 解压失败（底层原因）: \(error)")
+            try? fileManager.removeItem(at: destinationURL)
+            throw ZipError.corrupted("ZIP 文件已损坏或下载不完整，请删除后重新下载")
+        }
+    }
+
     private func validateZipHeader(at url: URL) throws {
         guard let handle = try? FileHandle(forReadingFrom: url) else {
             throw ZipError.notAZipFile("该文件不是有效的 ZIP 压缩包")

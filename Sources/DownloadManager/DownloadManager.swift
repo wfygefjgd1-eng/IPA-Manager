@@ -182,8 +182,18 @@ final class DownloadManager: NSObject {
     /// 分类/校验/模型更新再放后台队列执行。
     private func finishDownload(id: UUID, model: DownloadTask, location: URL) {
         var updated = model
-        let destination = AppFileManager.shared.directoryURL(.downloads)
-            .appendingPathComponent(Self.sanitizeFileName(updated.fileName.isEmpty ? "download" : updated.fileName))
+        // 同名冲突唯一化：多个任务（重复下载/不同来源同名文件）先后完成时，
+        // 若目标已存在且非本次任务自己，追加 UUID 后缀，避免后写覆盖先写、
+        // 以及前一个任务的 destinationPath 指向被替换文件导致自动导入错乱。
+        let baseName = Self.sanitizeFileName(updated.fileName.isEmpty ? "download" : updated.fileName)
+        var destination = AppFileManager.shared.directoryURL(.downloads)
+            .appendingPathComponent(baseName)
+        if FileManager.default.fileExists(atPath: destination.path) {
+            let base = destination.deletingPathExtension().lastPathComponent
+            let ext = destination.pathExtension
+            destination = AppFileManager.shared.directoryURL(.downloads)
+                .appendingPathComponent("\(base)-\(UUID().uuidString.prefix(8)).\(ext)")
+        }
 
         // 同步移动（URLSession 临时文件生命周期约束，见上方注释）
         do {
@@ -232,6 +242,16 @@ final class DownloadManager: NSObject {
             }
 
             DispatchQueue.main.async {
+                // 竞态守卫：用户在后台校验期间取消/删除了任务（taskModels[id] 已移除），
+                // 不得把任务“复活”回列表，更不能触发自动导入/自动重试。
+                guard self.taskModels[id] != nil else {
+                    // 文件已同步移入 Downloads（同卷 rename 已完成），但任务已删除：
+                    // 目标文件不再被任何记录引用，清理掉避免堆积。
+                    if updated.status == .completed {
+                        try? AppFileManager.shared.deleteItem(at: destination)
+                    }
+                    return
+                }
                 self.tasks.removeValue(forKey: id)
                 self.taskModels[id] = updated
                 self.persistTasks()
@@ -286,6 +306,8 @@ final class DownloadManager: NSObject {
     }
 
     /// 读取文件头少量字节判断下载内容真实性（小 IO，主队列可接受）。
+    /// zip 分支额外校验文件尾 EOCD 记录：PK 头完好但缺中央目录/结束记录的
+    /// 截断文件（最常见的“下载不完整”形态）会被判为可重试的失败而非 completed。
     private func classifyDownload(at path: String) -> DownloadContentKind {
         guard let handle = FileHandle(forReadingAtPath: path) else { return .other }
         defer { try? handle.close() }
@@ -294,23 +316,44 @@ final class DownloadManager: NSObject {
         // 普通 zip (PK\x03\x04) 与 空 zip (PK\x05\x06) 都算有效压缩包，
         // 与 ZipManager.validateZipHeader 的判断保持一致
         if data.starts(with: [0x50, 0x4B, 0x03, 0x04])
-            || data.starts(with: [0x50, 0x4B, 0x05, 0x06]) { return .zip }
+            || data.starts(with: [0x50, 0x4B, 0x05, 0x06]) {
+            return hasValidEndOfCentralDirectory(at: path) ? .zip : .other
+        }
         let text = String(data: data, encoding: .utf8)?.lowercased() ?? ""
         let htmlSignals = ["<!doctype html", "<html", "<head", "not found", "404"]
         if htmlSignals.contains(where: { text.contains($0) }) { return .html }
         return .other
     }
 
-    /// 文件名净化：百分号解码、剔除控制字符、拒绝 "." / ".." / 空名回退 "download"。
+    /// 读取文件末尾 64KB 查找 EOCD 签名（PK\x05\x06）。EOCD 位于压缩包最末
+    /// 22+ 字节，注释可长达 65535 字节，读尾部 64KB 足够覆盖并容忍尾部差异。
+    private func hasValidEndOfCentralDirectory(at path: String) -> Bool {
+        guard let handle = FileHandle(forReadingAtPath: path) else { return false }
+        defer { try? handle.close() }
+        let fileSize = (try? handle.seekToEnd()) ?? 0
+        guard fileSize > 0 else { return false }
+        let tailLength = min(fileSize, 65_536)
+        try? handle.seek(toOffset: fileSize - tailLength)
+        let tail = (try? handle.read(upToCount: Int(tailLength))) ?? Data()
+        // EOCD 签名 0x50 0x4B 0x05 0x06（空 zip 也以该签名结尾，与头部校验一致）
+        return tail.range(of: Data([0x50, 0x4B, 0x05, 0x06]), options: [.backwards]) != nil
+    }
+
+    /// 文件名净化：百分号解码、剔除控制字符、拒绝路径穿越与非法字符。
     /// 未净化直接用 URL.lastPathComponent 拼路径时，%20 会落进文件名、
-    /// ".." 会让 appendingPathComponent 上跳一阶（路径穿越）。
+    /// "../.." 会让 appendingPathComponent 上跳一阶（路径穿越写出下载目录）。
     static func sanitizeFileName(_ raw: String) -> String {
         var name = raw.removingPercentEncoding ?? raw
         // 剔除控制字符
         name = name.unicodeScalars.filter { !CharacterSet.controlCharacters.contains($0) }
             .map { String($0) }.joined()
-        // 拒绝 . 与 ..（整名）与空名
-        if name == "." || name == ".." || name.isEmpty {
+        // 路径穿越/分隔符防御：显式拒绝含路径分隔符或 ".." 组件的名字，
+        // 不依赖 appendingPathComponent 的行为（不同系统版本对内嵌 ".." 解析不同）。
+        let components = name.split(separator: "/").map(String.init)
+        if components.contains("..")
+            || name.contains("\\")
+            || components.count > 1
+            || name == "." || name == ".." || name.isEmpty {
             name = "download"
         }
         // 尾部点/斜杠清理（iOS 文件名规则）
@@ -362,6 +405,12 @@ extension DownloadManager: URLSessionDownloadDelegate {
     ) {
         guard let error = error else { return }
         guard let id = taskID(for: task) else { return }
+
+        // 守卫：任务已被主动取消/删除时（cancelDownload 已移除模型），
+        // 忽略该回调——否则会以「新 UUID 的占位模型」写回旧 id 键，
+        // 产生列表里永久删不掉的“未知文件/失败”幽灵任务（重启前无法消除）。
+        // NSURLErrorCancelled 是 cancel() 的必然回调，模型不存在时直接丢弃。
+        guard taskModels[id] != nil else { return }
 
         // 保存断点续传数据：进程被杀/网络中断后，恢复时可用 resumeData 续传
         var updated = taskModels[id] ?? DownloadTask()
