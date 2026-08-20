@@ -39,7 +39,11 @@ struct CertificatesView: View {
                     handleImportedFile(url)
                 }
             }
-            .sheet(isPresented: $showPasswordSheet) {
+            .sheet(isPresented: $showPasswordSheet, onDismiss: {
+                // 兜底清理：下滑手势关闭等未走 onImport/onCancel 的关闭路径，
+                // 托管 P12 与解压目录若仍在，必须清理（明文私钥不得常驻 Documents）
+                cleanupPendingCertImport()
+            }) {
                 PasswordPromptView(
                     importURL: pendingImportURL,
                     onImport: { cert in
@@ -53,11 +57,6 @@ struct CertificatesView: View {
                         cleanupPendingCertImport()
                     }
                 )
-                .onDismiss {
-                    // 兜底清理：下滑手势关闭等未走 onImport/onCancel 的关闭路径，
-                    // 托管 P12 与解压目录若仍在，必须清理（明文私钥不得常驻 Documents）
-                    cleanupPendingCertImport()
-                }
             }
             .alert("提示", isPresented: $showAlert) {
                 Button("确定", role: .cancel) {}

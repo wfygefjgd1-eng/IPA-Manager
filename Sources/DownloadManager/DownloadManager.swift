@@ -242,35 +242,31 @@ final class DownloadManager: NSObject {
 
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             guard let self = self else { return }
-            do {
-                switch self.classifyDownload(at: destination.path) {
-                case .zip:
-                    updated.status = .completed
-                case .html:
+            // classifyDownload 内部已全部容错（FileHandle nil / read 失败 → .other），不抛错，
+            // 因此这里不再需要 do-catch（历史上 catch 分支不可达，只会触发编译警告）。
+            switch self.classifyDownload(at: destination.path) {
+            case .zip:
+                updated.status = .completed
+            case .html:
+                updated.status = .failed
+                updated.error = "下载到的是网页而非文件（可能链接失效或被拦截），请检查链接后重试"
+                Logger.error("下载校验失败: \(updated.error ?? "")")
+                try? AppFileManager.shared.deleteItem(at: destination)
+                retryableFailure = true
+            case .other:
+                // 非 zip 且非 HTML 的完整下载（.tar/.apk/.tar.gz 等）按 completed 收尾：
+                // 任务显示完成，是否可导入交给自动导入环节给出中文原因——这里不应把
+                // 完整下载误判为“损坏”。只有确证截断（已知总大小且实际收到更少）才判
+                // failed 并自动重下；截断文件删掉，避免把坏文件留在下载目录。
+                if updated.totalBytes > 0 && updated.receivedBytes < updated.totalBytes {
                     updated.status = .failed
-                    updated.error = "下载到的是网页而非文件（可能链接失效或被拦截），请检查链接后重试"
+                    updated.error = "下载不完整，文件可能损坏"
                     Logger.error("下载校验失败: \(updated.error ?? "")")
                     try? AppFileManager.shared.deleteItem(at: destination)
                     retryableFailure = true
-                case .other:
-                    // 非 zip 且非 HTML 的完整下载（.tar/.apk/.tar.gz 等）按 completed 收尾：
-                    // 任务显示完成，是否可导入交给自动导入环节给出中文原因——这里不应把
-                    // 完整下载误判为“损坏”。只有确证截断（已知总大小且实际收到更少）才判
-                    // failed 并自动重下；截断文件删掉，避免把坏文件留在下载目录。
-                    if updated.totalBytes > 0 && updated.receivedBytes < updated.totalBytes {
-                        updated.status = .failed
-                        updated.error = "下载不完整，文件可能损坏"
-                        Logger.error("下载校验失败: \(updated.error ?? "")")
-                        try? AppFileManager.shared.deleteItem(at: destination)
-                        retryableFailure = true
-                    } else {
-                        updated.status = .completed
-                    }
+                } else {
+                    updated.status = .completed
                 }
-            } catch {
-                updated.status = .failed
-                updated.error = error.localizedDescription
-                Logger.error("下载校验失败: \(error.localizedDescription)")
             }
 
             DispatchQueue.main.async {
