@@ -24,6 +24,18 @@ struct AppDetailView: View {
     @State private var lastProgressUpdate = Date.distantPast
     /// 签名中禁止关闭详情页
     @State private var closeLocked = false
+    /// 当前签名阶段文字（"正在解压…/正在签名主程序…/正在重新打包…"），
+    /// 由 SigningEngine 回调透传，与进度条同步刷新。
+    @State private var signPhase = ""
+    /// 签名开始时间：用于计算"已用/预计剩余"时间显示。
+    @State private var signStartTime: Date?
+    /// 刷新时间显示的定时器（已用/剩余秒数需要独立于进度回调持续更新；
+    /// 进度数值由 smoother 推进，但时间也要随真实时钟走）。
+    @State private var signTimer: Timer?
+    /// 当前已用秒数（显示用，随 signTimer 刷新）
+    @State private var elapsedSeconds: Int = 0
+    /// 预计剩余秒数（按当前速度外推：elapsed / progress × (1 - progress)）
+    @State private var etaSeconds: Int = 0
 
     /// 展示层使用的“实时”AppInfo：
     /// - 签名刚完成 → 以签名输出为准（合并原快照的元数据，isSigned = true，path 指向签名产物）；
@@ -128,6 +140,10 @@ struct AppDetailView: View {
             // 签名进行中禁止下滑手势关闭详情页：仅禁用 toolbar 关闭按钮时，
             // 下滑手势仍可关页，签名完成/失败将无任何反馈
             .interactiveDismissDisabled(isSigning)
+            // 视图消失时停止签名时间显示定时器（切页/关闭后不得残留空转）
+            .onDisappear {
+                stopSignTimer()
+            }
         }
     }
 
@@ -173,11 +189,31 @@ struct AppDetailView: View {
     }
 
     private var signingProgressView: some View {
-        VStack(spacing: 8) {
+        VStack(spacing: 6) {
             ProgressView(value: signProgress)
-            Text(String(format: "%.0f%%", signProgress * 100))
-                .font(.caption)
-                .foregroundColor(.secondary)
+            HStack {
+                // 阶段文字（"正在解压…/正在签名主程序…/正在重新打包…"）
+                Text(signPhase.isEmpty ? "签名中…" : signPhase)
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                Spacer()
+                Text(String(format: "%.0f%%", signProgress * 100))
+                    .font(.caption)
+                    .fontWeight(.semibold)
+                    .foregroundColor(.secondary)
+            }
+            // 时间显示：已用 Xs · 预计剩余 Ys（进度 >0 才预估；完成即显示总用时）
+            if signProgress >= 1.0 {
+                Text("总用时 \(elapsedSeconds) 秒")
+                    .font(.caption2)
+                    .foregroundColor(.tertiary)
+            } else {
+                Text("已用 \(elapsedSeconds) 秒 · 预计剩余 \(etaSeconds) 秒")
+                    .font(.caption2)
+                    .foregroundColor(.tertiary)
+            }
         }
         .padding(.horizontal)
         .padding(.vertical, 8)
@@ -251,15 +287,36 @@ struct AppDetailView: View {
         isSigning = true
         closeLocked = true
         signProgress = 0
+        signPhase = "准备中…"
+        elapsedSeconds = 0
+        etaSeconds = 0
         lastProgressUpdate = Date.distantPast
-        appState.signApp(app, certificate: certificate, profile: profile, progress: { progress in
+        // 启动时间显示：每 0.5s 刷新"已用/预计剩余"（进度由 smoother 推进，
+        // 时间必须随真实时钟走，不能只依赖进度回调）
+        signStartTime = Date()
+        startSignTimer()
+        appState.signApp(app, certificate: certificate, profile: profile, progress: { progress, phase in
             // 进度节流：变化 ≥1% 或间隔 ≥0.1s 才更新 @State，避免详情页频繁重算
             let now = Date()
             if abs(progress - signProgress) >= 0.01 || now.timeIntervalSince(lastProgressUpdate) >= 0.1 {
                 signProgress = progress
                 lastProgressUpdate = now
             }
+            if !phase.isEmpty {
+                signPhase = phase
+            }
+            // 用当前速度外推预计剩余：已用 / 进度 × (1 - 进度)。
+            // 进度为 0 时无法预估，保持 0 显示"预计剩余 0 秒"由下方计算兜底。
+            if progress > 0 {
+                if let start = signStartTime {
+                    let elapsed = now.timeIntervalSince(start)
+                    elapsedSeconds = Int(elapsed)
+                    let ratio = (1.0 - progress) / max(progress, 0.001)
+                    etaSeconds = Int(elapsed * ratio)
+                }
+            }
         }, completion: { [self] result in
+            stopSignTimer()
             switch result {
             case .success(let signedPath):
                 isSigning = false
@@ -267,6 +324,13 @@ struct AppDetailView: View {
                 // 记录签名产物路径，供 liveApp 实时反映“已签名”状态（installedApps 会在回调前由 refreshInstalledApps 刷新）
                 signedOutputPath = signedPath
                 signedDidInstall = installAfter
+                // 归正显示：进度 100% + 阶段"签名完成"（smoother 已归正，但兜底再设一次）
+                signProgress = 1.0
+                signPhase = "签名完成"
+                if let start = signStartTime {
+                    elapsedSeconds = Int(Date().timeIntervalSince(start))
+                }
+                etaSeconds = 0
                 if installAfter {
                     do {
                         try appState.installSignedPath(signedPath, certificate: certificate)
@@ -287,6 +351,29 @@ struct AppDetailView: View {
                 showAlert = true
             }
         })
+    }
+
+    /// 启动时间显示定时器：每 0.5s 更新"已用秒数"，并在进度>0 时重算"预计剩余"。
+    /// 与 smoother 的进度推进解耦——进度回调只负责推进百分比，这里负责真实时钟。
+    private func startSignTimer() {
+        stopSignTimer()
+        signTimer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [self] _ in
+            guard let start = signStartTime else { return }
+            let elapsed = Date().timeIntervalSince(start)
+            elapsedSeconds = Int(elapsed)
+            // 进度未达 100% 时按当前速度外推剩余；到达后归零（由 completion 兜底）
+            if signProgress > 0 && signProgress < 1.0 {
+                let ratio = (1.0 - signProgress) / max(signProgress, 0.001)
+                etaSeconds = Int(elapsed * ratio)
+            } else if signProgress >= 1.0 {
+                etaSeconds = 0
+            }
+        }
+    }
+
+    private func stopSignTimer() {
+        signTimer?.invalidate()
+        signTimer = nil
     }
 
     /// 当失败原因是“源文件丢失”时，在错误信息后附加一行恢复指引，

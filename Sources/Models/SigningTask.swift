@@ -18,6 +18,9 @@ struct SigningTask: Identifiable, Codable, Hashable {
 
     var status: Status = .queued
     var progress: Double = 0
+    /// 当前阶段文字（如"正在解压 IPA..."/"正在签名主程序..."/"正在重新打包..."），
+    /// 供签名过程页与历史记录展示"正在干什么"。
+    var phase: String = ""
     var error: String?
     var log: [String] = []
 

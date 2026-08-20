@@ -7,7 +7,7 @@ protocol SigningEngineProtocol {
         sourcePath: String,
         certificate: CertificateInfo,
         profile: ProvisioningInfo,
-        progress: @escaping (Double) -> Void
+        progress: @escaping (Double, String) -> Void
     ) throws -> String
 }
 
@@ -25,9 +25,9 @@ final class SigningEngine: SigningEngineProtocol {
         sourcePath: String,
         certificate: CertificateInfo,
         profile: ProvisioningInfo,
-        progress: @escaping (Double) -> Void
+        progress: @escaping (Double, String) -> Void
     ) throws -> String {
-        progress(0.0)
+        progress(0.0, "开始准备…")
 
         // 源文件可能已被删除/移动（列表记录还在但磁盘文件丢失）：
         // 若直接进入导出流程，zsign 桥接层会报 "Input file not found" 这类不友好的英文错误。
@@ -85,7 +85,7 @@ final class SigningEngine: SigningEngineProtocol {
         }
 
         Logger.info("开始签名: \(sourcePath)")
-        progress(0.05)
+        progress(0.05, "准备证书与描述文件…")
 
         guard let keychainID = certificate.keychainIdentifier else {
             let reason = "证书缺少 Keychain 标识"
@@ -121,7 +121,7 @@ final class SigningEngine: SigningEngineProtocol {
         // 平滑器把真实进度作为目标值，用主线程定时器让展示进度在 85% 后缓慢蠕动
         // 逼近 98%（"仍在工作"的反馈），收到真实 100% 立即归正并停止。
         let smoother = ProgressSmoother(rawHandler: progress)
-        let box = ProgressBox(handler: smoother.receive)
+        let box = ProgressBox(handler: { p, phase in smoother.receive(p, phase: phase) })
         let context = Unmanaged.passRetained(box).toOpaque()
         defer { Unmanaged<ProgressBox>.fromOpaque(context).release() }
 
@@ -165,7 +165,7 @@ final class SigningEngine: SigningEngineProtocol {
             throw AppError.signFailed(userMessage)
         }
 
-        progress(1.0)
+        progress(1.0, "签名完成")
         // 显式收尾：zsign 可能只回调到 85% 就完成（不保证回调 100%），
         // 若不主动告知，smoother 的蠕动定时器会继续空转（泄漏 + UI 空转）。
         smoother.complete()
@@ -427,9 +427,9 @@ final class SigningEngine: SigningEngineProtocol {
 }
 
 private final class ProgressBox {
-    let handler: (Double) -> Void
+    let handler: (Double, String) -> Void
 
-    init(handler: @escaping (Double) -> Void) {
+    init(handler: @escaping (Double, String) -> Void) {
         self.handler = handler
     }
 }
@@ -441,27 +441,30 @@ private final class ProgressBox {
 /// 收到真实 100% 立即归正并停表。全部状态仅在主线程访问
 /// （progressCallbackFunc 已 DispatchQueue.main.async），无数据竞争。
 private final class ProgressSmoother {
-    private let rawHandler: (Double) -> Void
+    private let rawHandler: (Double, String) -> Void
     private var target: Double = 0
     private var displayed: Double = 0
+    /// 当前阶段文字：随真实回调更新，蠕动期间沿用（如"正在重新打包"）。
+    private var currentPhase: String = "签名中…"
     private var timer: Timer?
 
-    init(rawHandler: @escaping (Double) -> Void) {
+    init(rawHandler: @escaping (Double, String) -> Void) {
         self.rawHandler = rawHandler
     }
 
-    /// 收到 zsign 真实进度（主线程调用）。只前进不回退；
-    /// 90% 定为"重打包阶段"开始——大 IPA 在此停留最久。
-    func receive(_ p: Double) {
+    /// 收到 zsign 真实进度与阶段文字（主线程调用）。只前进不回退；
+    /// 85% 定为"重打包阶段"开始——大 IPA 在此停留最久。
+    func receive(_ p: Double, phase: String) {
         guard p >= target else { return }
         target = p
         displayed = max(displayed, p)
+        if !phase.isEmpty { currentPhase = phase }
         if p >= 1.0 {
             stopSlither()
         } else if p >= 0.85 {
             startSlitherIfNeeded()
         }
-        rawHandler(displayed)
+        rawHandler(displayed, currentPhase)
     }
 
     /// 签名流程完成时的显式收尾：归正到 100% 并停止蠕动定时器。
@@ -471,7 +474,8 @@ private final class ProgressSmoother {
         stopSlither()
         target = 1.0
         displayed = 1.0
-        rawHandler(1.0)
+        currentPhase = "签名完成"
+        rawHandler(1.0, currentPhase)
     }
 
     /// 85% 后启动蠕动定时器：每 0.5s 展示进度 +0.3%，最高逼近 98%。
@@ -486,7 +490,7 @@ private final class ProgressSmoother {
             }
             if self.displayed < 0.98 {
                 self.displayed = min(0.98, self.displayed + 0.003)
-                self.rawHandler(self.displayed)
+                self.rawHandler(self.displayed, self.currentPhase)
             }
         }
         timer = t
@@ -502,11 +506,8 @@ private final class ProgressSmoother {
 private let progressCallbackFunc: ZSignProgressCallback = { (context, percent, message) in
     guard let context = context else { return }
     let box = Unmanaged<ProgressBox>.fromOpaque(context).takeUnretainedValue()
+    let phase = message.map { String(cString: $0) } ?? "签名中…"
     DispatchQueue.main.async {
-        box.handler(Double(percent) / 100.0)
-    }
-    if let message = message {
-        let text = String(cString: message)
-        Logger.debug("zsign: \(text)")
+        box.handler(Double(percent) / 100.0, phase)
     }
 }

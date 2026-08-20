@@ -559,7 +559,7 @@ final class AppState: ObservableObject {
         _ app: AppInfo,
         certificate: CertificateInfo,
         profile: ProvisioningInfo,
-        progress: @escaping (Double) -> Void,
+        progress: @escaping (Double, String) -> Void,
         completion: ((Result<String, Error>) -> Void)? = nil
     ) {
         var task = SigningTask()
@@ -583,11 +583,14 @@ final class AppState: ObservableObject {
                     sourcePath: app.path,
                     certificate: certificate,
                     profile: profile,
-                    progress: { p in
+                    progress: { p, phase in
                         DispatchQueue.main.async {
-                            progress(p)
+                            progress(p, phase)
                             if let index = self.signingTasks.firstIndex(where: { $0.id == task.id }) {
                                 self.signingTasks[index].progress = p
+                                if !phase.isEmpty {
+                                    self.signingTasks[index].phase = phase
+                                }
                             }
                         }
                     }
