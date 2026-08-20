@@ -370,7 +370,9 @@ final class CertificateManager {
 
     /// 安全读取 zsign_last_error()：判空 + strnlen 限定长度，避免依赖 C 侧
     /// 缓冲区生命周期/非 NUL 结尾导致越界读。
-    private static func safeZSignError(limit: Int = 512) -> String {
+    /// 安全读取 zsign 错误信息：strnlen 限定长度，避免越界读取。
+    /// internal：SigningEngine 在 zsign 命令失败时也用它读取桥接层错误。
+    static func safeZSignError(limit: Int = 512) -> String {
         guard let ptr = zsign_last_error() else { return "" }
         let len = strnlen(ptr, limit)
         guard len > 0 else { return "" }

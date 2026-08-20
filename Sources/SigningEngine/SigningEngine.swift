@@ -131,12 +131,16 @@ final class SigningEngine: SigningEngineProtocol {
             Logger.error("导出 PEM 私钥失败: \(reason)")
             throw AppError.signFailed(reason)
         }
-        let identity = rawIdentity as? SecIdentity
-        guard let identity = identity else {
+        // SecIdentity 是 CoreFoundation 类型，不能对 CF 类型做条件转换（编译器报错
+        // “conditional downcast to CoreFoundation type will always succeed”），
+        // 与 ServerIdentityProvider 一致：CFGetTypeID 校验类型后用强制转换，
+        // 类型不符时抛中文错误而非崩溃。
+        guard CFGetTypeID(rawIdentity as CFTypeRef) == SecIdentityGetTypeID() else {
             let reason = "证书数据格式异常（无法获取签名身份）"
             Logger.error("导出 PEM 私钥失败: \(reason)")
             throw AppError.signFailed(reason)
         }
+        let identity = rawIdentity as! SecIdentity
 
         var privateKey: SecKey?
         let keyStatus = SecIdentityCopyPrivateKey(identity, &privateKey)

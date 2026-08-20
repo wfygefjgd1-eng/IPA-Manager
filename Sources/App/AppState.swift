@@ -617,8 +617,7 @@ final class AppState: ObservableObject {
                 ? ""
                 : URL(fileURLWithPath: importedApps[index].path).deletingPathExtension().lastPathComponent
             // 在对应的 <baseName> 图标目录下找同名文件
-            if let dir = iconDirsByBase[baseName] {
-                let dirURL = dir
+            if let dirs = iconDirsByBase[baseName], let dirURL = dirs.first {
                 let matches = (try? FileManager.default.contentsOfDirectory(atPath: dirURL.path)) ?? []
                 if let match = matches.first(where: { $0 == fileName }) {
                     importedApps[index].iconPath = dirURL.appendingPathComponent(match).path

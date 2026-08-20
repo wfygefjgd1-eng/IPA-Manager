@@ -58,7 +58,7 @@ final class ZipManager {
     /// ZIPFoundation 0.9.19 已内置词法包含性检查，这里在 App 侧再加一道保险，
     /// 并显式拒绝符号链接条目（IPA 极少需要符号链接，恶意压缩包常用其越界写文件）。
     private func validateEntryPaths(at archiveURL: URL) throws {
-        guard let archive = try? ZipArchive(url: archiveURL, accessMode: .read) else {
+        guard let archive = try? Archive(url: archiveURL, accessMode: .read) else {
             throw ZipError.corrupted("ZIP 文件无法读取")
         }
         defer { archive.close() }
@@ -92,7 +92,7 @@ final class ZipManager {
         }
     }
 
-    func zip(folderURL: URL, outputURL: URL, shouldKeepParent: Bool = false, compressionMethod: ZipArchive.CompressionMethod = .deflate) throws {
+    func zip(folderURL: URL, outputURL: URL, shouldKeepParent: Bool = false, compressionMethod: Archive.CompressionMethod = .deflate) throws {
         Logger.info("打包开始: \(outputURL.lastPathComponent)")
 
         if fileManager.fileExists(atPath: outputURL.path) {
