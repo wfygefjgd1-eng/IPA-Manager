@@ -12,6 +12,10 @@ struct DownloadsView: View {
     @State private var showUnrecognizedAlert = false
     @State private var unrecognizedMessage = ""
     @State private var showClearAllAlert = false
+    /// 多选删除模式：true 时行变为勾选交互，"删除选中"出现在工具栏右侧
+    @State private var isSelecting = false
+    /// 多选模式下已勾选的任务 id
+    @State private var selectedIDs: Set<UUID> = []
 
     var body: some View {
         NavigationView {
@@ -51,25 +55,41 @@ struct DownloadsView: View {
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .navigationBarLeading) {
-                    if !tasks.isEmpty {
-                        Button("全部清除", role: .destructive) {
-                            showClearAllAlert = true
+                    if isSelecting {
+                        Button("取消") {
+                            exitSelection()
+                        }
+                    } else if !tasks.isEmpty {
+                        HStack(spacing: 16) {
+                            Button("全部清除", role: .destructive) {
+                                showClearAllAlert = true
+                            }
+                            Button("选择") {
+                                enterSelection()
+                            }
                         }
                     }
                 }
                 ToolbarItem(placement: .navigationBarTrailing) {
-                    HStack(spacing: 16) {
-                        Button {
-                            showBookmarks = true
-                        } label: {
-                            Image(systemName: "bookmark.fill")
+                    if isSelecting {
+                        Button("删除选中 (\(selectedIDs.count))", role: .destructive) {
+                            deleteSelectedTasks()
                         }
-                        Button {
-                            // 直接打开浏览器：清除上次书签跳转遗留的初始 URL
-                            initialBrowserURL = nil
-                            showBrowser = true
-                        } label: {
-                            Image(systemName: "safari")
+                        .disabled(selectedIDs.isEmpty)
+                    } else {
+                        HStack(spacing: 16) {
+                            Button {
+                                showBookmarks = true
+                            } label: {
+                                Image(systemName: "bookmark.fill")
+                            }
+                            Button {
+                                // 直接打开浏览器：清除上次书签跳转遗留的初始 URL
+                                initialBrowserURL = nil
+                                showBrowser = true
+                            } label: {
+                                Image(systemName: "safari")
+                            }
                         }
                     }
                 }
@@ -139,6 +159,12 @@ struct DownloadsView: View {
     /// 仅做视觉呈现；点击、contextMenu（重试/删除）、暂停恢复等业务行为保持原样。
     private func downloadRow(_ task: DownloadTask) -> some View {
         HStack(alignment: .center, spacing: 12) {
+            // 多选模式：行首勾选圈（点击切换选中，由 onTapGesture 统一处理）
+            if isSelecting {
+                Image(systemName: selectedIDs.contains(task.id) ? "checkmark.circle.fill" : "circle")
+                    .font(.title3)
+                    .foregroundColor(selectedIDs.contains(task.id) ? .accentColor : .secondary)
+            }
             // 文件类型图标 + 按状态的浅色圆角底
             ZStack(alignment: .bottomTrailing) {
                 RoundedRectangle(cornerRadius: 10, style: .continuous)
@@ -226,12 +252,16 @@ struct DownloadsView: View {
         )
         .contentShape(Rectangle())
         .onTapGesture {
-            guard task.status == .completed else { return }
-            if let app = matchedApp(for: task) {
-                rememberResolvedTask(task: task, app: app)
-                selectedApp = app
+            if isSelecting {
+                toggleSelection(task.id)
             } else {
-                recognizeUnmatchedTask(task)
+                guard task.status == .completed else { return }
+                if let app = matchedApp(for: task) {
+                    rememberResolvedTask(task: task, app: app)
+                    selectedApp = app
+                } else {
+                    recognizeUnmatchedTask(task)
+                }
             }
         }
         .contextMenu {
@@ -571,6 +601,38 @@ struct DownloadsView: View {
             DownloadManager.shared.cancelDownload(id: id)
         }
         refreshTasks()
+    }
+
+    // MARK: - 多选删除
+
+    private func enterSelection() {
+        selectedIDs.removeAll()
+        isSelecting = true
+    }
+
+    private func exitSelection() {
+        isSelecting = false
+        selectedIDs.removeAll()
+    }
+
+    private func toggleSelection(_ id: UUID) {
+        if selectedIDs.contains(id) {
+            selectedIDs.remove(id)
+        } else {
+            selectedIDs.insert(id)
+        }
+    }
+
+    /// 删除勾选中的任务（只删本次勾选的，保留其余），删除后退出多选模式。
+    /// 若期间任务列表被外部改动，以当前 tasks 为准重新匹配 id。
+    private func deleteSelectedTasks() {
+        let selected = tasks.filter { selectedIDs.contains($0.id) }
+        guard !selected.isEmpty else { return }
+        for task in selected {
+            DownloadManager.shared.cancelDownload(id: task.id)
+        }
+        refreshTasks()
+        exitSelection()
     }
 
     /// 全部清除：取消并移除所有下载任务。
