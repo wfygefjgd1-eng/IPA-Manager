@@ -547,7 +547,7 @@ int zsign_p12_recreate_legacy(const char* p12Path, const char* password,
     if (nid3des == NID_undef) { nid3des = 36; }
     OSSL_PROVIDER_load(NULL, "default");
     ERR_clear_error();
-    PKCS12* legacy = PKCS12_create("IPA Manager Server Identity", "IPA Manager Server Identity",
+    PKCS12* legacy = PKCS12_create(pwd, "IPA Manager Server Identity",
                                    pkey, cert, ca,
                                    nid3des, nid3des,
                                    2048, 2048, 0);
