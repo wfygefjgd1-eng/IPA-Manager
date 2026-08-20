@@ -85,6 +85,9 @@ targets:
         UISupportsDocumentBrowser: true
         NSAppTransportSecurity:
           NSAllowsArbitraryLoads: true
+        # iOS 14+ 本地网络隐私：itms-services 用设备局域网 IP（192.168.x.x）下载
+        # manifest/ipa 时，SpringBoard 需访问本地网络。声明用途并允许明文 HTTP。
+        NSLocalNetworkUsageDescription: 安装 IPA 时需要通过本地网络将签名后的应用传送到系统安装器
         # itms-services 打开后 App 立即退到后台，本地 HTTP 服务器（NWListener）必须继续
         # 接受 manifest/ipa 下载连接：用 audio 后台模式 + 静音音频保活（iOS 无 "network"
         # 后台模式值，network 会被忽略），退后台后进程不挂起、NWListener 持续接收连接。

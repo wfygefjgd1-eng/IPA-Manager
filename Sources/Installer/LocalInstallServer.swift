@@ -1,5 +1,6 @@
 import Foundation
 import Network
+import Darwin
 
 final class LocalInstallServer {
     static let shared = LocalInstallServer()
@@ -9,21 +10,53 @@ final class LocalInstallServer {
     private var servingIPA: URL?
     private var manifestData: Data?
 
+    /// 获取设备局域网 IPv4 地址（如 192.168.x.x）。iOS 27 的系统安装进程
+    /// 不连接 127.0.0.1 回环（1.0.53 实测：服务器监听正常但 SpringBoard 的
+    /// TCP 连接从未到达），必须用设备可路由的局域网 IP 供 itms-services 下载。
+    /// AltStore/Esign/Feather 等本地安装工具在其上也用局域网 IP 或回环成功；
+    /// iOS 27 + 明文 HTTP 回环被系统层忽略，因此这里改走局域网 IP。
+    private static func localIPAddress() -> String? {
+        var ifaddr: UnsafeMutablePointer<ifaddrs>?
+        guard getifaddrs(&ifaddr) == 0 else { return nil }
+        defer { freeifaddrs(ifaddr) }
+        var ptr = ifaddr
+        while let current = ptr {
+            let interface = current.pointee
+            let family = interface.ifa_addr.pointee.sa_family
+            if family == UInt8(AF_INET) {
+                let name = String(cString: interface.ifa_name)
+                // en0/en1 = Wi-Fi，pdp_ip0 = 蜂窝。两者都可被 SpringBoard 路由。
+                if name.hasPrefix("en") || name.hasPrefix("pdp_ip") {
+                    var host = [CChar](repeating: 0, count: Int(NI_MAXHOST))
+                    getnameinfo(interface.ifa_addr,
+                                socklen_t(interface.ifa_addr.pointee.sa_len),
+                                &host, socklen_t(host.count),
+                                nil, 0, NI_NUMERICHOST)
+                    let ip = String(cString: host)
+                    if !ip.hasPrefix("127.") && !ip.hasPrefix("169.254.") {
+                        return ip
+                    }
+                }
+            }
+            ptr = interface.ifa_next
+        }
+        return nil
+    }
+
     func start(ipaLocalURL: URL) throws -> URL {
         stop()
 
         let port = UInt16.random(in: 49152...65535)
-        // 用明文 HTTP 回环：AltStore（开源、iOS 本地安装的业界标准）就是用
-        // http://127.0.0.1:端口/manifest.plist + itms-services 成功安装，整个
-        // iOS 版本线都可用，http 不会被系统拒绝（Apple 文档推荐 https 但不是强制）。
-        //
-        // 为什么不用 https：iPhone Distribution 证书的 Extended Key Usage 只有
-        // codeSigning、没有 serverAuth，系统安装进程验证服务器证书时直接拒绝，
-        // TLS 握手失败 → 连接看似"没到达"（1.0.52 实测：TLS=true 但无任何请求日志）。
-        // 127.0.0.1 回环流量不出设备，明文无泄露风险，且不依赖证书信任。
+        // iOS 27 的系统安装进程不连接 127.0.0.1 回环（1.0.53 实测：服务器监听正常、
+        // 保活正常、无 TLS，但 SpringBoard 的 TCP 连接从未到达）。因此：
+        //  1. 监听全部接口（不限定 loopback），让 SpringBoard 经局域网 IP 可达；
+        //  2. manifest URL 用设备局域网 IP（192.168.x.x / 蜂窝 IP）。
+        // 明文 HTTP 是整个 iOS 版本线都可用的做法（AltStore 等本地安装器标准），
+        // 127.0.0.1/局域网流量数据均不出错网络（若用蜂窝 IP 才出设备）。
+        // 不用 https：iPhone Distribution 证书 EKU 缺 serverAuth，系统会拒绝握手。
         let parameters = NWParameters.tcp
         parameters.allowLocalEndpointReuse = true
-        parameters.requiredInterfaceType = .loopback
+        // 不设置 requiredInterfaceType，默认监听所有可达接口（含 Wi-Fi/蜂窝）。
 
         let listener = try NWListener(using: parameters, on: .init(rawValue: port)!)
         self.listener = listener
@@ -54,11 +87,14 @@ final class LocalInstallServer {
         if waitResult != .success {
             Logger.error("本地服务器 5 秒内未就绪，安装可能失败")
         }
-        Logger.info("本地安装服务器已启动: 127.0.0.1:\(port) (协议=HTTP明文)")
+
+        // 局域网 IP 优先；拿不到时回退 127.0.0.1（旧 iOS 仍可用）。
+        let host = Self.localIPAddress() ?? "127.0.0.1"
+        Logger.info("本地安装服务器已启动: \(host):\(port) (协议=HTTP明文, 局域网IP=\(host != "127.0.0.1"))")
         // itms-services 打开后 App 将立即退到后台：启动静音音频保活，
         // 让进程不被挂起，SpringBoard 才能连上本地服务器下载 manifest/ipa 。
         BackgroundAudioKeepAlive.shared.start()
-        return URL(string: "http://127.0.0.1:\(port)")!
+        return URL(string: "http://\(host):\(port)")!
     }
 
     func cacheManifest(_ data: Data) {
