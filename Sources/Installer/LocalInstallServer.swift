@@ -13,10 +13,21 @@ final class LocalInstallServer {
         stop()
 
         let port = UInt16.random(in: 49152...65535)
-        // 用明文 HTTP（NWParameters.tcp）而非 TLS：itms-services 的 manifest/ipa 下载由
-        // SpringBoard/Safari 执行，它们不会信任自签名证书（报"连接不上 127.0.0.1"）。
-        // 127.0.0.1 回环流量不出设备，明文是 AltStore/Esign 等本地安装工具的标准做法。
-        let parameters = NWParameters.tcp
+        // 用 HTTPS：Apple 企业部署文档要求 itms-services 的 manifest URL 必须是 HTTPS，
+        // iOS 27 系统安装器会直接拒绝 http://127.0.0.1 明文（1.0.50 日志显示请求根本没
+        // 到达服务器——不是响应问题，是 URL 协议被系统层拦截）。
+        // 本服务器使用 iPhone Distribution 证书的 TLS 身份（已由传统 p12 重打包修复，
+        // 证书由 Apple 根签发、系统信任），SpringBoard 可完成握手并下载 manifest/ipa。
+        // 传输全程在 127.0.0.1 回环内，数据不出设备。
+        let identityProvider = ServerIdentityProvider.shared
+        let hasTLSIdentity = identityProvider.currentIdentity != nil || identityProvider.currentCertKey != nil
+        let parameters: NWParameters
+        if hasTLSIdentity {
+            parameters = NWParameters(tls: identityProvider.tlsOptions())
+        } else {
+            parameters = NWParameters.tcp
+            Logger.warning("TLS 身份不可用，回退明文 HTTP")
+        }
         parameters.allowLocalEndpointReuse = true
         parameters.requiredInterfaceType = .loopback
 
@@ -28,12 +39,32 @@ final class LocalInstallServer {
             self?.handleConnection(connection)
         }
 
+        // start 是异步的：listener 需要进入 .ready 状态才会接受连接。
+        // 若不等待就立刻打开 itms-services，SpringBoard 的连接请求会落在
+        // 未就绪的监听器上被丢弃（日志表现为"没有收到任何请求"）。
+        let readyGroup = DispatchGroup()
+        readyGroup.enter()
+        listener.stateUpdateHandler = { [weak self] state in
+            switch state {
+            case .ready:
+                readyGroup.leave()
+            case .failed(let error):
+                Logger.error("本地服务器监听失败: \(error)")
+                readyGroup.leave()
+            default:
+                break
+            }
+        }
         listener.start(queue: ServerQueue.shared.queue)
-        Logger.info("本地安装服务器已启动: 127.0.0.1:\(port)")
+        let waitResult = readyGroup.wait(timeout: .now() + 5)
+        if waitResult != .success {
+            Logger.error("本地服务器 5 秒内未就绪，安装可能失败")
+        }
+        Logger.info("本地安装服务器已启动: 127.0.0.1:\(port) (TLS=\(parameters.tls != nil))")
         // itms-services 打开后 App 将立即退到后台：启动静音音频保活，
         // 让进程不被挂起，SpringBoard 才能连上本地服务器下载 manifest/ipa 。
         BackgroundAudioKeepAlive.shared.start()
-        return URL(string: "http://127.0.0.1:\(port)")!
+        return URL(string: "https://127.0.0.1:\(port)")!
     }
 
     func cacheManifest(_ data: Data) {

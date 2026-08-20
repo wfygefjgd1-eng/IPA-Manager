@@ -25,13 +25,16 @@ final class BackgroundAudioKeepAlive {
             try session.setActive(true)
             let wav = Self.silentWAV(seconds: 1)
             let player = try AVAudioPlayer(data: wav)
-            player.volume = 0.0
+            // 音量用极小的非零值（不用 0.0）：部分 iOS 版本把 0 音量判定为"无实际音频输出"，
+            // 会导致 audio 后台模式不生效、进程退后台即被挂起（本地服务器随之失联）。
+            // 0.001 人耳完全听不到，但系统识别为"正在播放音频"，保活可靠。
+            player.volume = 0.001
             player.numberOfLoops = -1
             player.prepareToPlay()
             player.play()
             self.player = player
             isActive = true
-            Logger.info("后台音频保活已启动（本地安装服务器持续监听）")
+            Logger.info("后台音频保活已启动（player.isPlaying=\(player.isPlaying)，本地安装服务器持续监听）")
         } catch {
             Logger.warning("后台音频保活启动失败: \(error.localizedDescription)")
         }
