@@ -103,7 +103,7 @@ final class CertificateManager {
         }
 
         // 优先用 OpenSSL 解析（支持 PBES2/AES 等新式 P12）；失败再回退系统 SecPKCS12Import，
-        // 保证 bundled 证书（密码 “1”）与用户自己的 P12 都能导入。
+        // 保证用户导入的各类 P12 都能识别。
         if let info = try? readCertificateViaOpenSSL(from: url, password: password) {
             return info
         }

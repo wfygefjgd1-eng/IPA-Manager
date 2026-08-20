@@ -29,7 +29,6 @@ final class AppState: ObservableObject {
         DownloadManager.shared.onDownloadComplete = { [weak self] url in
             self?.handleDownloadedFile(at: url)
         }
-        BundledCertificateBootstrap.shared.importIfNeeded(into: self)
         Logger.info("AppState 初始化完成")
     }
 
@@ -419,7 +418,8 @@ final class AppState: ObservableObject {
                            let profile = try? ProvisioningManager.shared.importProfile(from: profileURL) {
                             self.addProfile(profile)
                         }
-                        // 证书：优先用捆绑证书的已知密码尝试导入，失败则提示用户走证书页手动导入
+                        // 证书：尝试用常见密码 "1" 导入（兼容多数自签证书包），
+                        // 失败则提示用户走证书页手动输入密码导入
                         if let p12URL = moved.p12URL {
                             CertificateManager.shared.importCertificate(from: p12URL, password: "1") { result in
                                 DispatchQueue.main.async {
