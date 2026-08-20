@@ -58,7 +58,13 @@ jobs:
             CURRENT_PROJECT_VERSION="${BUILD_NUMBER}" \
             build
           mkdir -p build/artifacts
-          ditto -c -k --keepParent "build/device/Build/Products/Release-iphoneos/IPA Manager.app" "build/artifacts/IPA-Manager-v${MARKETING_VERSION}-unsigned.ipa"
+          # 标准 IPA 结构：必须 Payload/<App>.app/，否则 zsign 签名报
+          # "Can't find payload directory"（ditto --keepParent 会把 .app 直接放
+          # 压缩包根，生成结构非法的"IPA"，连自己都无法签名/安装）。
+          mkdir -p build/staging/Payload
+          cp -R "build/device/Build/Products/Release-iphoneos/IPA Manager.app" build/staging/Payload/
+          cd build/staging
+          ditto -c -k Payload "../artifacts/IPA-Manager-v${MARKETING_VERSION}-unsigned.ipa"
 
       - name: Upload Build Artifacts
         uses: actions/upload-artifact@v4

@@ -1,5 +1,6 @@
 import Foundation
 import Security
+import ZIPFoundation
 
 protocol SigningEngineProtocol {
     func sign(
@@ -15,6 +16,7 @@ final class SigningEngine: SigningEngineProtocol {
 
     private let fileManager = AppFileManager.shared
     private let certManager = CertificateManager.shared
+    private let zipManager = ZipManager.shared
 
     func sign(
         sourcePath: String,
@@ -33,7 +35,32 @@ final class SigningEngine: SigningEngineProtocol {
             throw AppError.signFailed(reason)
         }
 
+        // 源 IPA 结构规范化：标准 IPA 顶层必须是 Payload/<App>.app/。
+        // 历史 CI 产物（ditto --keepParent 会把 .app 直接放压缩包根）和某些
+        // 第三方来源的包不符合该结构，zsign 解压后报 "Can't find payload directory"。
+        // 这里在签名前自动校验并修复：非标准结构解压 → 找 .app → 重打包为
+        // Payload/ 标准结构再交给 zsign，任何来源的 IPA 都能签。
+        let signingSourcePath: String
+        var normalizedWorkDir: URL?
+        var normalizedOutputURL: URL?
+        if let normalized = try? normalizeSourceIPAIfNeeded(sourcePath) {
+            signingSourcePath = normalized.outputURL.path
+            normalizedWorkDir = normalized.workRoot
+            normalizedOutputURL = normalized.outputURL
+        } else {
+            signingSourcePath = sourcePath
+        }
+        defer {
+            if let normalizedWorkDir = normalizedWorkDir {
+                try? fileManager.deleteItem(at: normalizedWorkDir)
+            }
+            if let normalizedOutputURL = normalizedOutputURL {
+                try? fileManager.deleteItem(at: normalizedOutputURL)
+            }
+        }
+
         Logger.info("开始签名: \(sourcePath)")
+        progress(0.05)
 
         guard let keychainID = certificate.keychainIdentifier else {
             let reason = "证书缺少 Keychain 标识"
@@ -71,7 +98,7 @@ final class SigningEngine: SigningEngineProtocol {
         // 临时目录必须可写：iOS 沙箱内 NSTemporaryDirectory 保证可用（不能用 /tmp）
         let tempDir = NSTemporaryDirectory()
 
-        let result: Int32 = sourcePath.withCString { inputCStr in
+        let result: Int32 = signingSourcePath.withCString { inputCStr in
             outputURL.path.withCString { outputCStr in
                 keyPath.withCString { p12CStr in
                     profile.path.withCString { provCStr in
@@ -219,6 +246,110 @@ final class SigningEngine: SigningEngineProtocol {
             .appendingPathComponent("export-\(identifier)-\(UUID().uuidString).p12")
         try certManager.exportP12(identifier: identifier, to: tempURL)
         return tempURL
+    }
+
+    // MARK: - 源 IPA 结构规范化
+
+    /// 校验源 IPA 顶层是否为标准结构（含 Payload/ 目录）：
+    /// 标准 IPA 必须形如 Payload/<App>.app/，zsign 签名依赖该结构。
+    /// 历史 CI 产物（ditto --keepParent 把 .app 直接打进压缩包根）及部分第三方
+    /// 打包工具生成的包顶层直接是 .app，缺 Payload 层，zsign 解压后报
+    /// "Can't find payload directory"。签名前先做结构校验，非标准则就地修复。
+    /// - Returns: 已是标准结构时 nil；否则返回 (workRoot, outputURL)——
+    ///   workRoot 为规范化临时目录（调用方签名完成后统一删除），
+    ///   outputURL 为修复后的标准结构 IPA，交给 zsign 签名。
+    private func normalizeSourceIPAIfNeeded(_ sourcePath: String) -> (workRoot: URL, outputURL: URL)? {
+        let sourceURL = URL(fileURLWithPath: sourcePath)
+
+        // 快速路径：直接读 zip 条目，检查顶层是否含 Payload/ 或 Payload 目录。
+        if hasPayloadDirectory(in: sourceURL) {
+            return nil
+        }
+
+        Logger.warning("源 IPA 顶层缺少 Payload/ 目录，签名前自动修复结构: \(sourcePath)")
+        let workRoot = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("IPA-Normalize-\(UUID().uuidString)", isDirectory: true)
+
+        do {
+            // 解压源 IPA 到临时目录（校验 + zip-slip 防御由 ZipManager 统一负责）
+            let extractDir = workRoot.appendingPathComponent("extract", isDirectory: true)
+            try zipManager.unzip(archiveURL: sourceURL, destinationURL: extractDir)
+
+            // 找到顶层 .app（兼容裸 .app 结构与极少数嵌套结构）
+            guard let appURL = findAppBundle(in: extractDir) else {
+                Logger.error("源 IPA 结构修复失败：未找到 .app 应用包")
+                return nil
+            }
+
+            // 构造标准结构：workRoot/Payload/<App>.app
+            let payloadDir = workRoot.appendingPathComponent("Payload", isDirectory: true)
+            try fileManager.createDirectory(at: payloadDir, withIntermediateDirectories: true)
+            let targetApp = payloadDir.appendingPathComponent(appURL.lastPathComponent)
+            try fileManager.moveItem(at: appURL, to: targetApp)
+
+            // 清理残留解压文件（只保留 Payload/），再整体打包为标准 IPA。
+            // 输出文件放在 workRoot 之外：zipItem 打包输入文件夹时若输出也在其中，
+            // 会把自己当作待打包内容（异常/递归）。workRoot 与 outputURL 由调用方统一清理。
+            try? fileManager.deleteItem(at: extractDir)
+            let outputURL = URL(fileURLWithPath: NSTemporaryDirectory())
+                .appendingPathComponent("normalized-\(UUID().uuidString).ipa")
+            try zipManager.zip(folderURL: workRoot, outputURL: outputURL, shouldKeepParent: false)
+
+            Logger.info("源 IPA 已规范化为标准结构（含 Payload/）: \(outputURL.path)")
+            return (workRoot, outputURL)
+        } catch {
+            Logger.error("源 IPA 结构修复失败: \(error.localizedDescription)")
+            return nil
+        }
+    }
+
+    /// 读 zip 条目判断顶层是否含 Payload/ 目录（只读中央目录，不解压实体，
+    /// 对几百 MB 的 IPA 也足够快）。
+    private func hasPayloadDirectory(in url: URL) -> Bool {
+        guard let archive = try? Archive(url: url, accessMode: .read) else {
+            // 打不开按“未知结构”处理：交给 zsign 自身报错更准确
+            return true
+        }
+        // Archive 由 deinit 自动关闭（与 ZipManager 一致，不调用 close()）
+        for entry in archive {
+            let path = entry.path
+            if path == "Payload" || path.hasPrefix("Payload/") {
+                return true
+            }
+            // 顶层第一条非 Payload 条目即可判定非标准（先到先得，避免全量遍历）
+            if !path.isEmpty && !path.hasPrefix("Payload") {
+                return false
+            }
+        }
+        return false
+    }
+
+    /// 在解压目录中查找 .app 应用包（顶层优先，递归兜底）。
+    private func findAppBundle(in rootURL: URL) -> URL? {
+        // 顶层直接枚举（标准解压后 .app 应在 Payload/ 或根）
+        if let items = try? fileManager.contentsOfDirectory(at: rootURL, includingPropertiesForKeys: nil) {
+            for item in items {
+                if item.pathExtension == "app" {
+                    var isDir: ObjCBool = false
+                    if fileManager.fileExists(atPath: item.path, isDirectory: &isDir), isDir.boolValue {
+                        return item
+                    }
+                }
+            }
+        }
+        // 递归兜底（zip 内嵌目录结构异常时）
+        guard let enumerator = fileManager.enumerator(
+            at: rootURL,
+            includingPropertiesForKeys: [.isDirectoryKey],
+            options: [.skipsHiddenFiles]
+        ) else { return nil }
+        while let element = enumerator.nextObject() as? URL {
+            if element.pathExtension == "app",
+               (try? element.resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory == true {
+                return element
+            }
+        }
+        return nil
     }
 }
 
