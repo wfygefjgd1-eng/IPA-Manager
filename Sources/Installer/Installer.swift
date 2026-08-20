@@ -27,33 +27,71 @@ final class Installer: Installing {
         try ServerIdentityProvider.shared.setIdentity(from: p12URL, password: password)
 
         let ipaURL = URL(fileURLWithPath: ipaPath)
+        // 本地服务器只负责流式提供 IPA；manifest 走公网 HTTPS
+        // （api.palera.in /genPlist 生成，Feather 同款），绕开 iOS 27
+        // 系统安装进程拒绝本地 HTTP manifest、以及蜂窝 CGNAT IP 本机
+        // 不可自访问两个问题。
         let baseURL = try LocalInstallServer.shared.start(ipaLocalURL: ipaURL)
 
-        guard let manifest = try generateManifest(ipaURL: ipaURL, baseURL: baseURL) else {
-            LocalInstallServer.shared.stop()
-            throw AppError.installFailed("manifest 生成失败")
+        // 解析安装元数据（bundle-identifier / 名称 / 版本）
+        var bundleID = "com.ipamanager.installed"
+        var appName = ipaURL.deletingPathExtension().lastPathComponent
+        var version = "1.0"
+        if let appInfo = try? IPAParser().parseAppInfo(fileURL: ipaURL) {
+            if !appInfo.bundleID.isEmpty { bundleID = appInfo.bundleID }
+            if !appInfo.version.isEmpty { version = appInfo.version }
         }
 
-        LocalInstallServer.shared.cacheManifest(manifest)
+        guard let manifestURL = try generateExternalManifestURL(
+            bundleID: bundleID, name: appName, version: version,
+            payloadURL: baseURL.appendingPathComponent(ipaURL.lastPathComponent)
+        ) else {
+            LocalInstallServer.shared.stop()
+            throw AppError.installFailed("公网 manifest 生成失败")
+        }
 
-        // itms-services 链接中的 manifest URL 必须做百分号编码（文件名可能含空格/中文）
-        let encodedManifestURL = baseURL
-            .appendingPathComponent("manifest.plist")
-            .absoluteString
+        // itms-services 链接的 url 参数编码，照抄 Feather 同款双重编码：
+        // 第一次按 urlQueryAllowed 编码完整 manifest URL，第二次按 alphanumerics
+        // 编码（作为 itms-services 的查询参数值），系统解码后得到原始 URL。
+        let encodedBase = manifestURL.absoluteString
             .addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? ""
-        let installURLStr = "itms-services://?action=download-manifest&url=\(encodedManifestURL)"
+        let finalEncoded = encodedBase
+            .addingPercentEncoding(withAllowedCharacters: .alphanumerics) ?? ""
+        let installURLStr = "itms-services://?action=download-manifest&url=\(finalEncoded)"
         guard let installURL = URL(string: installURLStr) else {
             LocalInstallServer.shared.stop()
             throw AppError.installFailed("安装链接生成失败")
         }
 
-        Logger.info("打开安装链接: \(installURLStr)")
+        Logger.info("打开安装链接: itms-services://?action=download-manifest&url=<公网HTTPS manifest>")
+        Logger.info("公网 manifest: \(manifestURL.absoluteString)")
         UIApplication.shared.open(installURL) { [weak self] success in
             if !success {
                 Logger.error("无法打开 itms-services 链接")
                 self?.stopServer()
             }
         }
+    }
+
+    /// 用公网 HTTPS 服务生成 manifest（Feather 同款：api.palera.in/genPlist）。
+    /// manifest 由公网托管 → 系统安装进程可正常 HTTPS 获取（不依赖本地服务器、
+    /// 不被 VPN/代理拦截）；manifest 内的 software-package 指向本地服务器
+    /// 的 IPA URL（AltStore/Esign 标准做法）。
+    private func generateExternalManifestURL(
+        bundleID: String, name: String, version: String, payloadURL: URL
+    ) throws -> URL? {
+        var comps = URLComponents()
+        comps.scheme = "https"
+        comps.host = "api.palera.in"
+        comps.path = "/genPlist"
+        comps.queryItems = [
+            URLQueryItem(name: "bundleid", value: bundleID),
+            URLQueryItem(name: "name", value: name),
+            URLQueryItem(name: "version", value: version),
+            // fetchurl 必须是百分号编码后的完整 IPA URL
+            URLQueryItem(name: "fetchurl", value: payloadURL.absoluteString),
+        ]
+        return comps.url
     }
 
     private func stopServer() {

@@ -10,14 +10,12 @@ final class LocalInstallServer {
     private var servingIPA: URL?
     private var manifestData: Data?
 
-    /// 获取设备局域网 IPv4 地址（如 192.168.x.x）。iOS 27 的系统安装进程
-    /// 不连接 127.0.0.1 回环（1.0.53 实测：服务器监听正常但 SpringBoard 的
-    /// TCP 连接从未到达），必须用设备可路由的局域网 IP 供 itms-services 下载。
-    /// AltStore/Esign/Feather 等本地安装工具在其上也用局域网 IP 或回环成功；
-    /// iOS 27 + 明文 HTTP 回环被系统层忽略，因此这里改走局域网 IP。
-    private static func localIPAddress() -> String? {
+    /// 枚举设备全部可路由 IPv4 地址（Wi-Fi en0/en1、蜂窝 pdp_ip0、个人热点
+    /// bridge100/172.20.x.x 等，等），排除回环和链路本地。Feather 同款做法。
+    private static func allLocalIPAddresses() -> [String] {
+        var result: [String] = []
         var ifaddr: UnsafeMutablePointer<ifaddrs>?
-        guard getifaddrs(&ifaddr) == 0 else { return nil }
+        guard getifaddrs(&ifaddr) == 0 else { return result }
         defer { freeifaddrs(ifaddr) }
         var ptr = ifaddr
         while let current = ptr {
@@ -25,38 +23,68 @@ final class LocalInstallServer {
             let family = interface.ifa_addr.pointee.sa_family
             if family == UInt8(AF_INET) {
                 let name = String(cString: interface.ifa_name)
-                // en0/en1 = Wi-Fi，pdp_ip0 = 蜂窝。两者都可被 SpringBoard 路由。
-                if name.hasPrefix("en") || name.hasPrefix("pdp_ip") {
+                if name.hasPrefix("en") || name.hasPrefix("pdp_ip") || name.hasPrefix("bridge") || name.hasPrefix("utun") {
                     var host = [CChar](repeating: 0, count: Int(NI_MAXHOST))
                     getnameinfo(interface.ifa_addr,
                                 socklen_t(interface.ifa_addr.pointee.sa_len),
                                 &host, socklen_t(host.count),
                                 nil, 0, NI_NUMERICHOST)
                     let ip = String(cString: host)
-                    if !ip.hasPrefix("127.") && !ip.hasPrefix("169.254.") {
-                        return ip
+                    if !ip.hasPrefix("127.") && !ip.hasPrefix("169.254.") && !result.contains(ip) {
+                        result.append(ip)
                     }
                 }
             }
             ptr = interface.ifa_next
         }
-        return nil
+        return result
+    }
+
+    func isReachable() async -> Bool {
+        guard let base = lastBaseURL else { return false }
+        var request = URLRequest(url: base, timeoutInterval: 5)
+        request.httpMethod = "HEAD"
+        do {
+            let (_, response) = try await URLSession.shared.data(for: request)
+            let status = (response as? HTTPURLResponse)?.statusCode ?? 0
+            // manifest 尚未缓存时根路径可能 404：只要服务器返回了 HTTP 响应（连接成功）
+            // 就算可达，连接级失败（-1004/-1009 等）才判为不可达。
+            Logger.info("安装服务器自检: HEAD \(base.absoluteString) -> HTTP \(status)")
+            return status >= 200 && status < 600
+        } catch {
+            Logger.error("安装服务器自检失败: \(error.localizedDescription)")
+            return false
+        }
+    }
+
+    private var lastBaseURL: URL?
+
+    /// 同步探测某个 URL 是否可达（App 自己的网络栈发起 HEAD 请求）。
+    /// 返回 nil 表示不可达；可达时返回 HTTP 状态码。
+    private static func probe(_ url: URL, timeout: TimeInterval = 4) -> Int? {
+        var request = URLRequest(url: url, timeoutInterval: timeout)
+        request.httpMethod = "HEAD"
+        let semaphore = DispatchSemaphore(value: 0)
+        var result: Int?
+        let task = URLSession.shared.dataTask(with: request) { _, response, _ in
+            result = (response as? HTTPURLResponse)?.statusCode
+            semaphore.signal()
+        }
+        task.resume()
+        _ = semaphore.wait(timeout: .now() + timeout + 1)
+        task.cancel()
+        return result
     }
 
     func start(ipaLocalURL: URL) throws -> URL {
         stop()
 
         let port = UInt16.random(in: 49152...65535)
-        // iOS 27 的系统安装进程不连接 127.0.0.1 回环（1.0.53 实测：服务器监听正常、
-        // 保活正常、无 TLS，但 SpringBoard 的 TCP 连接从未到达）。因此：
-        //  1. 监听全部接口（不限定 loopback），让 SpringBoard 经局域网 IP 可达；
-        //  2. manifest URL 用设备局域网 IP（192.168.x.x / 蜂窝 IP）。
-        // 明文 HTTP 是整个 iOS 版本线都可用的做法（AltStore 等本地安装器标准），
-        // 127.0.0.1/局域网流量数据均不出错网络（若用蜂窝 IP 才出设备）。
+        // 监听全部接口（不限定 loopback），让 SpringBoard 经任意可路由地址可达。
+        // 明文 HTTP 是本地安装器（AltStore 等）的标准，127.0.0.1/局域网流量不出设备；
         // 不用 https：iPhone Distribution 证书 EKU 缺 serverAuth，系统会拒绝握手。
         let parameters = NWParameters.tcp
         parameters.allowLocalEndpointReuse = true
-        // 不设置 requiredInterfaceType，默认监听所有可达接口（含 Wi-Fi/蜂窝）。
 
         let listener = try NWListener(using: parameters, on: .init(rawValue: port)!)
         self.listener = listener
@@ -88,13 +116,37 @@ final class LocalInstallServer {
             Logger.error("本地服务器 5 秒内未就绪，安装可能失败")
         }
 
-        // 局域网 IP 优先；拿不到时回退 127.0.0.1（旧 iOS 仍可用）。
-        let host = Self.localIPAddress() ?? "127.0.0.1"
-        Logger.info("本地安装服务器已启动: \(host):\(port) (协议=HTTP明文, 局域网IP=\(host != "127.0.0.1"))")
+        // 候选地址：回环优先，然后是所有接口 IP（Wi-Fi/蜂窝/热点）。
+        // 注意：蜂窝 CGNAT 的 10.x IP 在设备上不可自访问（流量路由到运营商 NAT
+        // 回不到本机）；个人热点模式下 handoff 接口（bridge100/172.20.x.x）通常
+        // 可自访问。逐一同步探测，自动选第一个能返回 HTTP 响应的地址。
+        var candidates: [String] = ["127.0.0.1"]
+        candidates.append(contentsOf: Self.allLocalIPAddresses())
+        var chosenHost: String? = nil
+        var probeLogs: [String] = []
+        for host in candidates {
+            let url = URL(string: "http://\(host):\(port)")!
+            if let status = Self.probe(url) {
+                chosenHost = host
+                probeLogs.append("\(host) -> HTTP \(status) ✅ 可达")
+                break
+            } else {
+                probeLogs.append("\(host) -> 不可达 ❌")
+            }
+        }
+        let host = chosenHost ?? "127.0.0.1"
+        let baseURL = URL(string: "http://\(host):\(port)")!
+        self.lastBaseURL = baseURL
+        Logger.info("本地安装服务器已启动: \(host):\(port) (协议=HTTP明文) | 候选探测: \(probeLogs.joined(separator: ", "))")
         // itms-services 打开后 App 将立即退到后台：启动静音音频保活，
         // 让进程不被挂起，SpringBoard 才能连上本地服务器下载 manifest/ipa 。
         BackgroundAudioKeepAlive.shared.start()
-        return URL(string: "http://\(host):\(port)")!
+
+        Task { [weak self] in
+            let ok = await self?.isReachable() ?? false
+            Logger.info("安装服务器自检结果: \(ok ? "可达（本机 HTTP 正常）" : "不可达（本机 HTTP 失败！）") — 请关闭 VPN/代理并连接 Wi-Fi 后重试")
+        }
+        return baseURL
     }
 
     func cacheManifest(_ data: Data) {

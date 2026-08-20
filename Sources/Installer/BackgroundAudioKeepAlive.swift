@@ -12,6 +12,7 @@ final class BackgroundAudioKeepAlive {
 
     private var player: AVAudioPlayer?
     private var isActive = false
+    private var heartbeatTimer: Timer?
 
     private init() {}
 
@@ -35,14 +36,29 @@ final class BackgroundAudioKeepAlive {
             self.player = player
             isActive = true
             Logger.info("后台音频保活已启动（player.isPlaying=\(player.isPlaying)，本地安装服务器持续监听）")
+            // 后台心跳：每 5 秒记录一次，证明退后台后进程仍未被挂起。
+            // 若心跳日志中断/消失 → 进程被系统挂起，NWListener 停止接受连接，
+            // 这才能解释"SpringBoard 从未收到连接"的根本原因。
+            startHeartbeat()
         } catch {
             Logger.warning("后台音频保活启动失败: \(error.localizedDescription)")
         }
     }
 
+    private func startHeartbeat() {
+        let t = Timer(timeInterval: 5.0, repeats: true) { _ in
+            let playing = BackgroundAudioKeepAlive.shared.player?.isPlaying ?? false
+            Logger.info("后台音频保活心跳: 进程存活, player.isPlaying=\(playing)")
+        }
+        RunLoop.main.add(t, forMode: .common)
+        heartbeatTimer = t
+    }
+
     /// 停止保活：停掉静音播放并释放 AudioSession。幂等。
     func stop() {
         guard isActive else { return }
+        heartbeatTimer?.invalidate()
+        heartbeatTimer = nil
         player?.stop()
         player = nil
         isActive = false
