@@ -85,6 +85,10 @@ targets:
         UISupportsDocumentBrowser: true
         NSAppTransportSecurity:
           NSAllowsArbitraryLoads: true
+        # itms-services 打开后 App 立即退到后台，本地 HTTP 服务器（NWListener）必须继续
+        # 接受 manifest/ipa 下载连接：声明 network 后台模式，退后台后网络套接字不被挂起。
+        UIBackgroundModes:
+          - network
         ITSAppUsesNonExemptEncryption: false
         UISupportedInterfaceOrientations:
           - UIInterfaceOrientationPortrait

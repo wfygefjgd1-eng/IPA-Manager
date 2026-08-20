@@ -13,7 +13,10 @@ final class LocalInstallServer {
         stop()
 
         let port = UInt16.random(in: 49152...65535)
-        let parameters = NWParameters(tls: Self.tlsOptions())
+        // 用明文 HTTP（NWParameters.tcp）而非 TLS：itms-services 的 manifest/ipa 下载由
+        // SpringBoard/Safari 执行，它们不会信任自签名证书（报"连接不上 127.0.0.1"）。
+        // 127.0.0.1 回环流量不出设备，明文是 AltStore/Esign 等本地安装工具的标准做法。
+        let parameters = NWParameters.tcp
         parameters.allowLocalEndpointReuse = true
         parameters.requiredInterfaceType = .loopback
 
@@ -27,7 +30,7 @@ final class LocalInstallServer {
 
         listener.start(queue: ServerQueue.shared.queue)
         Logger.info("本地安装服务器已启动: 127.0.0.1:\(port)")
-        return URL(string: "https://127.0.0.1:\(port)")!
+        return URL(string: "http://127.0.0.1:\(port)")!
     }
 
     func cacheManifest(_ data: Data) {
