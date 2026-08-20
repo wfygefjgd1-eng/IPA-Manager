@@ -414,10 +414,12 @@ struct AppDetailView: View {
     private func scheduleAutoReturnIfNeeded() {
         guard appState.autoReturnHomeAfterSigningEnabled() else { return }
         cancelAutoReturnIfNeeded()
-        let work = DispatchWorkItem { [weak self] in
-            guard let self = self else { return }
+        // SwiftUI View 是 struct：不能用 [weak self]（仅适用于 class）。DispatchWorkItem
+        // 被 cancel 后不会执行（cancelAutoReturnIfNeeded 已保证），值捕获 self 安全，
+        // 且闭包内只读写 @State（nonmutating set），不会产生循环引用。
+        let work = DispatchWorkItem { [self] in
             // 弹窗仍在展示且用户未手动操作时自动“返回”
-            if self.showSignedAlert {
+            if showSignedAlert {
                 self.performReturnHome()
             }
         }
