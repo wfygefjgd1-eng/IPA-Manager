@@ -26,15 +26,13 @@ struct HomeView: View {
             .sheet(isPresented: $showFileImporter) {
                 DocumentPicker(
                     onPick: { _ in },
-                    // 多选导入：逐个交给 handleImportedFile，每个文件独立出结果提示
+                    // 多选导入：串行逐个导入，进度 "正在导入 i/N" 随文件推进；每个文件独立出结果提示
                     onPickMany: { urls in
                         showFileImporter = false
                         importSuccessCount = 0
                         importFailureCount = 0
                         pendingImportCount = urls.count
-                        for url in urls {
-                            handleImportedFile(url)
-                        }
+                        importRemaining(urls, startIndex: 0)
                     },
                     allowsMultiple: true
                 )
@@ -48,6 +46,14 @@ struct HomeView: View {
                 AppDetailView(app: app)
             }
         }
+        // 导入进度浮层：导入进行中显示黑色胶囊进度卡（与全局 toast 同风格），
+        // 用户无需干等——ProgressView 转圈 + 文件名 + 阶段文字 + i/N 进度
+        .overlay(alignment: .bottom) {
+            if let progress = appState.importProgress {
+                importProgressCard(progress)
+            }
+        }
+        .animation(.easeInOut(duration: 0.25), value: appState.importProgress)
     }
 
     private var appsSection: some View {
@@ -162,9 +168,17 @@ struct HomeView: View {
         return "\(prefix) \(Self.fileDateFormatter.string(from: date))"
     }
 
-    private func handleImportedFile(_ url: URL) {
+    private func handleImportedFile(
+        _ url: URL,
+        index: Int = 1,
+        total: Int = 1,
+        completion: (() -> Void)? = nil
+    ) {
         let isZip = (url.pathExtension.lowercased() == "zip")
-        appState.importFile(from: url) { importResult in
+        // progressContext 传入序号/总数，导入进度卡片据此显示 "正在导入 i/N"
+        appState.importFile(from: url, progressContext: (index: index, total: total)) { importResult in
+            // 无论成功/失败/提前 return 都通知串行导入器继续下一个文件
+            defer { completion?() }
             switch importResult {
             case .success(let app):
                 importSuccessCount += 1
@@ -193,6 +207,44 @@ struct HomeView: View {
                 }
             }
         }
+    }
+
+    /// 串行导入剩余文件：每个文件完成后再导入下一个，
+    /// 保证进度卡片上的 "正在导入 i/N" 随文件逐个推进（多选导入）。
+    private func importRemaining(_ urls: [URL], startIndex: Int) {
+        guard startIndex < urls.count else { return }
+        handleImportedFile(urls[startIndex], index: startIndex + 1, total: urls.count) {
+            importRemaining(urls, startIndex: startIndex + 1)
+        }
+    }
+
+    /// 导入进度卡片：黑色胶囊 + 转圈 + 文件名 + 阶段文字，与全局 toast（ContentView）同风格。
+    private func importProgressCard(_ progress: ImportProgress) -> some View {
+        HStack(spacing: 12) {
+            ProgressView()
+                .progressViewStyle(CircularProgressViewStyle(tint: .white))
+            VStack(alignment: .leading, spacing: 3) {
+                Text("正在导入 \(progress.fileName)")
+                    .font(.footnote)
+                    .fontWeight(.medium)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                if progress.totalCount > 1 {
+                    Text("正在导入 \(progress.currentIndex)/\(progress.totalCount) · \(progress.phase)")
+                        .font(.caption2)
+                        .opacity(0.85)
+                } else {
+                    Text(progress.phase)
+                        .font(.caption2)
+                        .opacity(0.85)
+                }
+            }
+            .foregroundColor(.white)
+        }
+        .padding(.horizontal, 16)
+        .padding(.vertical, 12)
+        .background(Capsule().fill(Color.black.opacity(0.8)))
+        .padding(.bottom, 12)
     }
 
     /// 多选导入结束后的汇总提示（成功/失败个数）

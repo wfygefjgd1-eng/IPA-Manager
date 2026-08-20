@@ -102,12 +102,14 @@ struct AppDetailView: View {
                 Text(alertMessage)
             }
             // 签名完成弹窗：内容“签名完成，已发起安装”，旁边“确定”和“返回”两个按钮。
-            // “返回”：关闭当前详情界面并回到首页（应用主界面 / 桌面）。
+            // “返回”：关闭当前详情界面、切回首页 Tab，并挂起 App 直接回到 iOS 桌面（主屏幕）。
             .alert("签名完成", isPresented: $showSignedAlert) {
                 Button("确定", role: .cancel) {}
                 Button("返回") {
                     dismiss()
                     appState.selectedTab = 0
+                    // 挂起 App 回到 iOS 桌面（主屏幕）；App 保留在后台，点图标可恢复
+                    appState.minimizeToHomeScreen()
                 }
             } message: {
                 Text(signedDidInstall ? "签名完成，已发起安装" : "签名完成，未自动安装")

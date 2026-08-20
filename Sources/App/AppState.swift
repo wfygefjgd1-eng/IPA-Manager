@@ -1,5 +1,20 @@
 import SwiftUI
 import Foundation
+import UIKit
+
+/// 首页导入进度状态：nil 表示当前没有导入任务进行中。
+/// 导入流程按阶段推进（解压转换 → 复制 → 解析 → 提取图标），
+/// 每个阶段都会更新 phase 文字，让用户在耗时操作期间看到明确反馈。
+struct ImportProgress: Equatable {
+    /// 正在导入的文件名（如 xxx.ipa）
+    let fileName: String
+    /// 当前是第几个（从 1 开始）
+    let currentIndex: Int
+    /// 一共几个文件（单文件导入为 1）
+    let totalCount: Int
+    /// 阶段文字，如 "解压中…" / "解析中…" / "复制文件…"
+    let phase: String
+}
 
 final class AppState: ObservableObject {
     static let shared = AppState()
@@ -13,6 +28,9 @@ final class AppState: ObservableObject {
     @Published var selectedCertificate: CertificateInfo?
     @Published var selectedProfile: ProvisioningInfo?
     @Published var selectedTab: Int = 0
+
+    /// 首页导入进度（nil = 无导入进行中）；多文件导入时随文件逐个推进
+    @Published var importProgress: ImportProgress?
 
     private let fileManager = AppFileManager.shared
     private let store = UserDefaultsStore()
@@ -41,6 +59,23 @@ final class AppState: ObservableObject {
             }
             self.toastWorkItem = work
             DispatchQueue.main.asyncAfter(deadline: .now() + 3.0, execute: work)
+        }
+    }
+
+    /// 挂起 App 回到 iOS 桌面（主屏幕）。
+    ///
+    /// 民间技巧说明：iOS 没有公开 API 能直接把 App“最小化到桌面”，这里通过 selector
+    /// 调用 UIApplication 的私有 suspend 动作，效果与用户按 Home 键一致——App 退到后台
+    /// （回到主屏幕），进程仍保留在后台，用户点击图标可随时恢复，无数据丢失。
+    /// 用 responds(to:) 守卫：个别系统版本若不支持该 selector 则静默失败，
+    /// 不影响调用方在此之前已执行的动作（如关闭详情页、切换 Tab）。
+    /// 注意：该技巧仅适用于本类自签名安装的侧载工具，不可用于 App Store 上架应用。
+    /// 必须在主线程调用（UIApplication 操作）。
+    func minimizeToHomeScreen() {
+        let selector = NSSelectorFromString("suspend")
+        if UIApplication.shared.responds(to: selector) {
+            // perform(_:) 返回的 Unmanaged 结果无需使用，显式丢弃避免“结果未使用”警告
+            _ = UIApplication.shared.perform(selector)
         }
     }
 
@@ -231,13 +266,54 @@ final class AppState: ObservableObject {
         url.pathComponents.contains { $0.hasSuffix(".app") }
     }
 
-    func importFile(from url: URL, completion: @escaping (Result<AppInfo, Error>) -> Void) {
+    /// 更新导入进度（任意线程可调，内部切回主线程赋值 @Published，
+    /// 避免后台队列直接修改 ObservableObject 状态导致 SwiftUI 更新异常）。
+    func updateImportProgress(
+        fileName: String,
+        index: Int,
+        total: Int,
+        phase: String
+    ) {
+        DispatchQueue.main.async {
+            self.importProgress = ImportProgress(
+                fileName: fileName,
+                currentIndex: index,
+                totalCount: total,
+                phase: phase
+            )
+        }
+    }
+
+    /// 清除导入进度（导入成功/失败后调用，内部切回主线程赋值）。
+    func clearImportProgress() {
+        DispatchQueue.main.async {
+            self.importProgress = nil
+        }
+    }
+
+    /// 导入单个文件。progressContext 携带多选导入时的序号/总数（单文件调用可省略，
+    /// 默认按 total=1 处理），用于首页进度卡片显示"正在导入 i/N"。
+    /// 进度状态在后台各阶段间更新（内部切回主线程赋值 @Published），
+    /// 成功/失败均会清除进度，失败仍走既有 completion(.failure) 错误提示逻辑。
+    func importFile(
+        from url: URL,
+        progressContext: (index: Int, total: Int)? = nil,
+        completion: @escaping (Result<AppInfo, Error>) -> Void
+    ) {
         let accessed = url.startAccessingSecurityScopedResource()
         defer {
             if accessed {
                 url.stopAccessingSecurityScopedResource()
             }
         }
+
+        // 进度上下文：未传时按单文件处理（index/total = 1）
+        let index = progressContext?.index ?? 1
+        let total = progressContext?.total ?? 1
+        let fileName = url.lastPathComponent
+
+        // 初始阶段（调用方通常在主线程；updateImportProgress 内部仍会切回主线程赋值）
+        updateImportProgress(fileName: fileName, index: index, total: total, phase: "准备导入…")
 
         DispatchQueue.global(qos: .userInitiated).async {
             // destination 声明在 do 外，便于解析失败时清理可能残留的半成品文件
@@ -248,6 +324,8 @@ final class AppState: ObservableObject {
                 // 会在转换时抛“未找到 .app 应用包”，由上层给用户明确提示，不会入库。
                 let importURL: URL
                 if url.pathExtension.lowercased() == "zip" {
+                    // 阶段：解压源压缩包并重新打包成 .ipa（可能耗时最长）
+                    self.updateImportProgress(fileName: fileName, index: index, total: total, phase: "解压转换中…")
                     importURL = try self.parser.convertToIPAIfNeeded(fileURL: url)
                 } else {
                     importURL = url
@@ -278,8 +356,12 @@ final class AppState: ObservableObject {
                             try FileManager.default.removeItem(at: destination)
                         }
                     }
+                    // 阶段：复制到 IPA 目录
+                    self.updateImportProgress(fileName: fileName, index: index, total: total, phase: "复制文件…")
                     try self.fileManager.copyItem(from: importURL, to: destination)
                 }
+                // 阶段：解压 IPA 并解析 Info.plist / 提取图标（耗时较长）
+                self.updateImportProgress(fileName: fileName, index: index, total: total, phase: "解析中…")
                 var app = try self.parser.parseAppInfo(fileURL: destination)
                 app.path = destination.path
                 // 待签名图标持久化：parseAppInfo 返回的 iconPath 是本次解压目录
@@ -288,6 +370,8 @@ final class AppState: ObservableObject {
                 // Extracted/Icons/<baseName>/ 稳定目录后回填 app.iconPath，首页「待签名」
                 // 列表才能稳定显示图标（与已签名列表 persistInstalledAppIcon 同源修复）。
                 // 当前仍在后台队列执行，文件复制不阻塞主线程。
+                // 阶段：把解析出的图标复制到稳定目录
+                self.updateImportProgress(fileName: fileName, index: index, total: total, phase: "提取图标…")
                 if let iconPath = app.iconPath,
                    FileManager.default.fileExists(atPath: iconPath),
                    let stablePath = self.persistImportedAppIcon(
@@ -303,6 +387,8 @@ final class AppState: ObservableObject {
                         self.importedApps.append(app)
                     }
                     self.saveState()
+                    // 导入成功：清除进度
+                    self.clearImportProgress()
                     completion(.success(app))
                 }
             } catch {
@@ -311,6 +397,8 @@ final class AppState: ObservableObject {
                     if FileManager.default.fileExists(atPath: destination.path) {
                         try? FileManager.default.removeItem(at: destination)
                     }
+                    // 导入失败：同样清除进度，错误提示走既有逻辑
+                    self.clearImportProgress()
                     completion(.failure(error))
                 }
             }
