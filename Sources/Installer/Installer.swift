@@ -149,42 +149,4 @@ final class Installer: Installing {
     private func stopServer() {
         LocalInstallServer.shared.stop()
     }
-
-    private func generateManifest(ipaURL: URL, baseURL: URL) throws -> Data? {
-        let ipaName = ipaURL.lastPathComponent
-        // 从已签名的 IPA 中解析真实包信息，避免硬编码 bundle-identifier/version
-        var metadata: [String: Any] = [
-            "kind": "software",
-            "title": ipaURL.deletingPathExtension().lastPathComponent
-        ]
-        if let appInfo = try? IPAParser().parseAppInfo(fileURL: ipaURL) {
-            if !appInfo.bundleID.isEmpty {
-                metadata["bundle-identifier"] = appInfo.bundleID
-            }
-            if !appInfo.version.isEmpty {
-                metadata["bundle-version"] = appInfo.version
-            }
-        }
-        // 兜底：解析失败时给占位，避免 manifest 缺键导致安装直接失败
-        if metadata["bundle-identifier"] == nil {
-            metadata["bundle-identifier"] = "com.ipamanager.installed"
-        }
-        if metadata["bundle-version"] == nil {
-            metadata["bundle-version"] = "1.0"
-        }
-
-        let softwareURL = baseURL.appendingPathComponent(ipaName).absoluteString
-        let manifestDict: [String: Any] = [
-            "items": [
-                [
-                    "assets": [
-                        ["kind": "software-package", "url": softwareURL]
-                    ],
-                    "metadata": metadata
-                ]
-            ]
-        ]
-
-        return try? PropertyListSerialization.data(fromPropertyList: manifestDict, format: .xml, options: 0)
-    }
 }

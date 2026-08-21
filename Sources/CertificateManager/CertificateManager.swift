@@ -81,29 +81,7 @@ final class CertificateManager {
         return String(data: data, encoding: .utf8)
     }
 
-    func listCertificates() -> [CertificateInfo] {
-        let query: [String: Any] = [
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: keychainService,
-            kSecReturnAttributes as String: true,
-            kSecMatchLimit as String: kSecMatchLimitAll
-        ]
-
-        var result: AnyObject?
-        let status = SecItemCopyMatching(query as CFDictionary, &result)
-
-        guard status == errSecSuccess, let items = result as? [[String: Any]] else {
-            return []
-        }
-
-        return items.compactMap { item in
-            guard let identifier = item[kSecAttrAccount as String] as? String else { return nil }
-            var cert = CertificateInfo()
-            cert.keychainIdentifier = identifier
-            cert.name = identifier
-            return cert
-        }
-    }
+    // MARK: - 删除与查询
 
     /// 删除证书及其对应密码条目。返回是否成功（errSecItemNotFound 视为成功）。
     /// 密码条目按证书 identifier 反查删除，不依赖可能缺失的 passwordKeychainIdentifier，

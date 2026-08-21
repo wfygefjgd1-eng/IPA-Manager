@@ -17,10 +17,12 @@ enum Logger {
     private(set) static var recentEntries: [LogEntry] = []
     /// 失败与异常专区：只收集 ERROR / warning（DEFAULT）等非 INFO/DEBUG 的消息，供诊断报告使用。
     private(set) static var failureEntries: [LogEntry] = []
+    /// OSLog 对象可复用：每次调用都新建会白白浪费一次对象构造开销（签名/下载
+    /// 进度类高频日志尤其明显），提升为单一 static 实例。
+    private static let log = OSLog(subsystem: subsystem, category: "IPA Manager")
 
     static func log(_ message: String, level: OSLogType = .info, file: String = #file, line: Int = #line) {
         let fileName = (file as NSString).lastPathComponent
-        let log = OSLog(subsystem: subsystem, category: "IPA Manager")
         os_log("%@ [%@:%d] %@", log: log, type: level, level.description, fileName, line, message)
         #if DEBUG
         print("[\(level.description)] \(fileName):\(line) \(message)")
