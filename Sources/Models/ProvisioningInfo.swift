@@ -35,10 +35,16 @@ struct ProvisioningInfo: Identifiable, Codable, Hashable {
         }
     }
 
+    /// 缓存的日期格式化器：避免每次访问都重新创建 DateFormatter（创建开销约数毫秒），
+    /// 与 Logger.cachedTimestampFormatter 同模式，全局复用。
+    private static let cachedDateFormatter: DateFormatter = {
+        let f = DateFormatter()
+        f.dateFormat = "yyyy-MM-dd"
+        return f
+    }()
+
     var expireDateDescription: String {
         guard let expire = expireDate else { return "未知" }
-        let formatter = DateFormatter()
-        formatter.dateFormat = "yyyy-MM-dd"
-        return formatter.string(from: expire)
+        return Self.cachedDateFormatter.string(from: expire)
     }
 }

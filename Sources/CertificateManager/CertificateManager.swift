@@ -237,9 +237,17 @@ final class CertificateManager {
                 certInfo.expireDate = Date(timeIntervalSince1970: TimeInterval(info.endTime))
             }
             certInfo.isPasswordProtected = !password.isEmpty
-            certInfo.keychainIdentifier = UUID().uuidString
-            if !password.isEmpty {
-                certInfo.passwordKeychainIdentifier = UUID().uuidString
+            // 统一改用 stableKeychainID（基于 P12 SHA256 前 8 字节 + 密码 + 角色），
+            // 与 importCertificate 入口行为一致，避免同一证书从两条路径导入产生 N 条 Keychain 记录
+            if let p12Data = try? Data(contentsOf: url) {
+                let stableID = Self.stableKeychainID(for: p12Data, password: password, role: "cert")
+                certInfo.keychainIdentifier = stableID
+                if !password.isEmpty {
+                    certInfo.passwordKeychainIdentifier =
+                        Self.stableKeychainID(for: p12Data, password: password, role: "pwd")
+                }
+            } else {
+                certInfo.keychainIdentifier = UUID().uuidString
             }
             return certInfo
         case -2:

@@ -10,6 +10,10 @@ struct DownloadTask: Identifiable, Codable, Hashable {
     var createdAt: Date = Date()
     /// 断点续传数据：下载中断/失败时由 URLSession 提供，重启后可续传
     var resumeData: Data?
+    /// 自动重试计数：用于追踪已重试次数，避免进程重启后无限重试
+    var retryCount: Int = 0
+    /// 上次重试时间：用于超过 24 小时后自动重置 `retryCount`，防止长时间未完成的任务永远卡在"已达重试上限"
+    var lastRetryDate: Date?
 
     enum Status: String, Codable {
         case waiting

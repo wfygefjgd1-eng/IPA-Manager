@@ -375,7 +375,11 @@ final class AppState: ObservableObject {
             // destination 声明在 do 外，便于解析失败时清理可能残留的半成品文件；
             // destinationCreatedByThisImport 标记 destination 是否由本次导入写入：
             // 同 bundleID 重导入覆盖时 destination 可能仍是旧文件，失败清理绝不能误删旧文件。
-            var destination = self.fileManager.directoryURL(.ipa).appendingPathComponent(url.lastPathComponent)
+            // 关键防御：destination 初值用"绝对不可能与磁盘旧文件重名"的占位路径
+            //（含 UUID + .tmp- 前缀），即便 catch 块误判 destinationCreatedByThisImport
+            // 也只会删掉自己的临时文件，绝不会误删同名旧文件。
+            var destination = self.fileManager.directoryURL(.ipa)
+                .appendingPathComponent(".tmp-import-\(UUID().uuidString).ipa")
             var destinationCreatedByThisImport = false
             do {
                 // zip 输入先统一转换为标准 .ipa（含内嵌 .ipa 提取、.app 重打包为 Payload）：

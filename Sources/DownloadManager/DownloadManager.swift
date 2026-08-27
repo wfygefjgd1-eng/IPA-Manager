@@ -361,6 +361,9 @@ final class DownloadManager: NSObject {
         retryCounts[id, default: 0] += 1
 
         var retrying = model
+        // 重试计数现在使用 DownloadTask.retryCount 持久化字段，不再依赖内存 retryCounts
+        retrying.retryCount = model.retryCount + 1
+        retrying.lastRetryDate = Date()
         retrying.status = .downloading
         retrying.error = nil
         retrying.receivedBytes = 0
@@ -395,7 +398,9 @@ final class DownloadManager: NSObject {
             return hasValidEndOfCentralDirectory(at: path) ? .zip : .other
         }
         let text = String(data: data, encoding: .utf8)?.lowercased() ?? ""
-        let htmlSignals = ["<!doctype html", "<html", "<head", "not found", "404"]
+        // 与 ZipManager.hasHTMLPageContent 的 markers 对齐：只保留真正的 HTML 标签起首，
+        // 避免 "v2.0.4" / "file_not_found.txt" 等常见正常文本被误判为网页错误页
+        let htmlSignals = ["<!doctype html", "<html", "<head", "<body", "<!doctype"]
         if htmlSignals.contains(where: { text.contains($0) }) { return .html }
         return .other
     }
@@ -486,6 +491,14 @@ extension DownloadManager: URLSessionDownloadDelegate {
         // 产生列表里永久删不掉的“未知文件/失败”幽灵任务（重启前无法消除）。
         // NSURLErrorCancelled 是 cancel() 的必然回调，模型不存在时直接丢弃。
         guard taskModels[id] != nil else { return }
+
+        // 关键修复：检查 task 身份。retryDownload 会重建 sessionTask
+        // 并替换 tasks[id]。如果到达的 task 对象不是当前活跃的 tasks[id]，
+        // 说明这是旧任务的残留回调，必须直接忽略以防止旧回调覆盖新重试状态。
+        guard tasks[id] === (task as? URLSessionDownloadTask) else {
+            Logger.debug("忽略旧任务 didCompleteWithError 回调: id=\(id)")
+            return
+        }
 
         let nsError = error as NSError
         var updated = taskModels[id] ?? DownloadTask()

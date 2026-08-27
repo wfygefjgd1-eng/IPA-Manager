@@ -42,14 +42,18 @@ enum Logger {
 
     static func log(_ message: String, level: OSLogType = .info, file: String = #file, line: Int = #line) {
         let fileName = (file as NSString).lastPathComponent
-        os_log("%@ [%@:%d] %@", log: log, type: level, level.description, fileName, line, message)
+        // 提前求值 level.description 为本地常量：避免直接传入 OSLogType 临时
+        // 描述字符串作为 os_log 的 %@ vararg（C 字符串约定下生命周期不显式，
+        // Swift 6 strict-concurrency 下需要明确 ownership）
+        let levelDesc = level.description
+        os_log("%@ [%@:%d] %@", log: log, type: level, levelDesc, fileName, line, message)
         #if DEBUG
-        print("[\(level.description)] \(fileName):\(line) \(message)")
+        print("[\(levelDesc)] \(fileName):\(line) \(message)")
         #endif
 
         lock.lock()
         defer { lock.unlock() }
-        let entry = LogEntry(timestamp: Date(), level: level.description, message: "[\(fileName):\(line)] \(message)")
+        let entry = LogEntry(timestamp: Date(), level: levelDesc, message: "[\(fileName):\(line)] \(message)")
         recentEntries.append(entry)
         if recentEntries.count > maxEntries {
             recentEntries.removeFirst(recentEntries.count - maxEntries)
