@@ -227,8 +227,7 @@ final class LocalInstallServer {
         // 可自访问。并发探测首个可达地址，默认 127.0.0.1。
         // 最多 3 个候选（回环 + 前两个接口 IP），通过 TaskGroup 并发探测（0.5s/候选），
         // 总耗时约 0.5-1.5s，不再串行阻塞 3×(1+1)s，且支持取消。
-        var candidates: [String] = ["127.0.0.1"]
-        candidates.append(contentsOf: Self.allLocalIPAddresses().prefix(2))
+        let candidates: [String] = ["127.0.0.1"] + Array(Self.allLocalIPAddresses().prefix(2))
         // 并发探测（TaskGroup）：由于 start 是同步方法，用 semaphore 桥接异步结果，
         // 等待上限仅 1.5s，远小于串行版本，且可取消；超时或全部不可达则回退到 127.0.0.1 + 同步兜底
         let holder = ProbeHolder()
