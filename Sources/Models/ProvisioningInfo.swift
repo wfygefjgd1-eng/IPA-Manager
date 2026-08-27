@@ -16,14 +16,13 @@ struct ProvisioningInfo: Identifiable, Codable, Hashable {
     enum Status: String, Codable {
         case valid
         case expired
-        case mismatched
+        case mismatched // 由调用方按需设置（如 Bundle ID 不匹配时）
         case unknown
     }
 
     var status: Status {
         guard let expire = expireDate else { return .unknown }
-        guard expire > Date() else { return .expired }
-        return .valid
+        return expire > Date() ? .valid : .expired
     }
 
     var statusDescription: String {

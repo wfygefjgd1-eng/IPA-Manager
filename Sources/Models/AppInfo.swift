@@ -13,7 +13,15 @@ struct AppInfo: Identifiable, Codable, Hashable {
     var isSigned: Bool = false
     var signedPath: String?
 
+    /// 缓存的 ByteCountFormatter：避免每次访问都重新创建（创建开销约数毫秒），
+    /// 与 Logger.cachedTimestampFormatter / CertificateInfo.cachedDateFormatter 同模式。
+    private static let cachedFormatter: ByteCountFormatter = {
+        let formatter = ByteCountFormatter()
+        formatter.countStyle = .file
+        return formatter
+    }()
+
     var sizeDescription: String {
-        ByteCountFormatter.string(fromByteCount: size, countStyle: .file)
+        Self.cachedFormatter.string(fromByteCount: size, countStyle: .file)
     }
 }

@@ -238,7 +238,7 @@ final class SigningEngine: SigningEngineProtocol {
             pemBlock = "-----BEGIN RSA PRIVATE KEY-----\n"
         }
 
-        let base64Lines = (keyData as Data).base64EncodedString()
+        let base64Lines = keyData.base64EncodedString()
         var pem = pemBlock
         var index = 0
         let step = 64
@@ -418,8 +418,9 @@ final class SigningEngine: SigningEngineProtocol {
         if raw.contains("Invalid temp folder") {
             return "临时目录不可用"
         }
-        // 其余情况：含英文字符的底层错误加中文前缀；纯中文直接透传
-        if raw.range(of: "[A-Za-z]", options: .regularExpression) != nil {
+        // 其余情况：含英文字母且不含汉字的底层错误加中文前缀；纯中文直接透传
+        if raw.range(of: "[a-zA-Z]", options: .regularExpression) != nil
+            && raw.range(of: #"[\u{4E00}-\u{9FFF}]"#, options: .regularExpression) == nil {
             return "签名内部错误：\(raw)"
         }
         return raw

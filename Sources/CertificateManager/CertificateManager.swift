@@ -297,9 +297,17 @@ final class CertificateManager {
         var info = CertificateInfo()
         info.name = first[kSecImportItemLabel as String] as? String ?? "P12 证书"
         info.isPasswordProtected = !password.isEmpty
-        info.keychainIdentifier = UUID().uuidString
-        if !password.isEmpty {
-            info.passwordKeychainIdentifier = UUID().uuidString
+        // 统一改用 stableKeychainID（基于 P12 SHA256 前 8 字节 + 密码 + 角色），
+        // 与 OpenSSL 路径一致，避免同一证书从回退路径导入时仍产生 N 条 Keychain 记录
+        //（与 readCertificateViaOpenSSL 中相同的处理逻辑）。
+        if let p12Data = try? Data(contentsOf: url) {
+            let stableID = Self.stableKeychainID(for: p12Data, password: password, role: "cert")
+            info.keychainIdentifier = stableID
+            if !password.isEmpty {
+                info.passwordKeychainIdentifier = Self.stableKeychainID(for: p12Data, password: password, role: "pwd")
+            }
+        } else {
+            info.keychainIdentifier = UUID().uuidString
         }
 
         if let cert = certChain.first {
