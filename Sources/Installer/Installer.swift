@@ -58,17 +58,56 @@ final class Installer: Installing {
                 if !appInfo.name.isEmpty { appName = appInfo.name }
             }
 
-            guard let manifestURL = try generateExternalManifestURL(
-                bundleID: bundleID, name: appName, version: version,
-                payloadURL: baseURL.appendingPathComponent(ipaURL.lastPathComponent)
-            ) else {
-                throw AppError.installFailed("公网 manifest 生成失败")
+            let payloadURL = baseURL.appendingPathComponent(ipaURL.lastPathComponent)
+
+            // 优先使用公网 manifest（api.palera.in /genPlist），失败则回退本地 manifest。
+            // 公网方案：manifest 由公网 HTTPS 托管，系统安装进程可稳定获取；本地回退保证
+            // 在无外网或 api.palera.in 故障时仍可通过 127.0.0.1 安装。
+            var manifestURL: URL?
+            var isLocalFallback = false
+            do {
+                manifestURL = try generateExternalManifestURL(
+                    bundleID: bundleID, name: appName, version: version,
+                    payloadURL: payloadURL
+                )
+                if manifestURL == nil {
+                    throw AppError.installFailed("公网 manifest 生成返回 nil")
+                }
+                // 预生成本地 manifest 作为暖备（不切换 URL），便于日志排查与后续快速回退
+                let warmData = generateLocalManifestData(bundleID: bundleID, name: appName, version: version, payloadURL: payloadURL)
+                if !warmData.isEmpty {
+                    Logger.debug("本地 manifest 已预生成（暖备，大小 \(warmData.count) 字节），主用公网")
+                }
+            } catch {
+                Logger.warning("公网 manifest 生成失败，回退到本地: \(error.localizedDescription)")
+                manifestURL = nil
+            }
+
+            if manifestURL == nil {
+                // 本地 fallback：生成 plist Data 并通过 LocalInstallServer.cacheManifest 缓存，
+                // 返回本地 http URL（http://127.0.0.1:port/manifest.plist），确保打开 itms-services 前已缓存
+                guard let localURL = generateLocalManifestURL(
+                    bundleID: bundleID, name: appName, version: version,
+                    payloadURL: payloadURL, baseURL: baseURL
+                ) else {
+                    throw AppError.installFailed("本地 manifest 生成失败")
+                }
+                manifestURL = localURL
+                isLocalFallback = true
+                Logger.info("已回退到本地 manifest: \(localURL.absoluteString)")
+            }
+
+            guard let finalManifestURL = manifestURL else {
+                throw AppError.installFailed("manifest 生成失败")
+            }
+            if isLocalFallback {
+                Logger.info("本地 manifest 已缓存，准备打开 itms-services (local fallback)")
             }
 
             // itms-services 链接的 url 参数编码，照抄 Feather 同款双重编码：
             // 第一次按 urlQueryAllowed 编码完整 manifest URL，第二次按 alphanumerics
             // 编码（作为 itms-services 的查询参数值），系统解码后得到原始 URL。
-            let encodedBase = manifestURL.absoluteString
+            let encodedBase = finalManifestURL.absoluteString
                 .addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? ""
             let finalEncoded = encodedBase
                 .addingPercentEncoding(withAllowedCharacters: .alphanumerics) ?? ""
@@ -78,8 +117,13 @@ final class Installer: Installing {
             }
 
             DispatchQueue.main.async { [weak self] in
-                Logger.info("打开安装链接: itms-services://?action=download-manifest&url=<公网HTTPS manifest>")
-                Logger.info("公网 manifest: \(manifestURL.absoluteString)")
+                if isLocalFallback {
+                    Logger.info("打开安装链接: itms-services://?action=download-manifest&url=<本地HTTP manifest>")
+                    Logger.info("本地 manifest: \(finalManifestURL.absoluteString) (fallback)")
+                } else {
+                    Logger.info("打开安装链接: itms-services://?action=download-manifest&url=<公网HTTPS manifest>")
+                    Logger.info("公网 manifest: \(finalManifestURL.absoluteString)")
+                }
                 UIApplication.shared.open(installURL) { success in
                     if !success {
                         Logger.error("无法打开 itms-services 链接")
@@ -114,6 +158,49 @@ final class Installer: Installing {
             URLQueryItem(name: "fetchurl", value: payloadURL.absoluteString),
         ]
         return comps.url
+    }
+
+    /// 本地 manifest Data 生成：使用 PropertyListSerialization 本地构建 OTA plist（XML），
+    /// 不依赖外部网络。结构与 Apple OTA 标准一致，包含 software-package asset 与 metadata。
+    private func generateLocalManifestData(
+        bundleID: String, name: String, version: String, payloadURL: URL
+    ) -> Data {
+        let plist: [String: Any] = [
+            "items": [
+                [
+                    "assets": [
+                        ["kind": "software-package", "url": payloadURL.absoluteString]
+                    ],
+                    "metadata": [
+                        "bundle-identifier": bundleID,
+                        "bundle-version": version,
+                        "kind": "software",
+                        "title": name
+                    ]
+                ]
+            ]
+        ]
+        do {
+            let data = try PropertyListSerialization.data(fromPropertyList: plist, format: .xml, options: 0)
+            return data
+        } catch {
+            Logger.error("本地 manifest 序列化失败: \(error.localizedDescription)")
+            return Data()
+        }
+    }
+
+    /// 本地 manifest URL 生成并缓存：先生成 Data 调用 LocalInstallServer.cacheManifest，
+    /// 再返回本地 http URL（http://127.0.0.1:port/manifest.plist），确保 itms-services 打开前已缓存。
+    /// - Parameters: baseURL 为 LocalInstallServer.start 返回的 http baseURL（含端口）
+    private func generateLocalManifestURL(
+        bundleID: String, name: String, version: String, payloadURL: URL, baseURL: URL
+    ) -> URL? {
+        let data = generateLocalManifestData(bundleID: bundleID, name: name, version: version, payloadURL: payloadURL)
+        guard !data.isEmpty else { return nil }
+        LocalInstallServer.shared.cacheManifest(data)
+        let manifestURL = baseURL.appendingPathComponent("manifest.plist")
+        Logger.info("本地 manifest 已生成并缓存: \(data.count) 字节 -> \(manifestURL.absoluteString)")
+        return manifestURL
     }
 
     /// 轻量读取 IPA 元数据：只读 zip 中央目录里 Payload/<App>.app/Info.plist 的

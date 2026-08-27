@@ -10,7 +10,7 @@ struct AppsView: View {
     @State private var selectedIDs: Set<UUID> = []
 
     var body: some View {
-        NavigationView {
+        NavigationStack {
             Group {
                 if appState.isRefreshingInstalledApps && appState.installedApps.isEmpty {
                     // 启动/删除后的扫描期：显示加载态而非"暂无应用"空态，避免误认为没有应用
@@ -39,16 +39,7 @@ struct AppsView: View {
                                 }
                                 .padding(12)
                                 .frame(maxWidth: .infinity, alignment: .leading)
-                                // 卡片形式：浅色圆角底 + 细描边，图标/文字整体一块，
-                                // 行与行之间有明确间隔，不再是无界线的"一溜"
-                                .background(
-                                    RoundedRectangle(cornerRadius: 14, style: .continuous)
-                                        .fill(Color(.secondarySystemGroupedBackground).opacity(0.85))
-                                )
-                                .overlay(
-                                    RoundedRectangle(cornerRadius: 14, style: .continuous)
-                                        .stroke(Color.primary.opacity(0.06), lineWidth: 0.5)
-                                )
+                                .cardStyle()
                             }
                             // 卡片之间的间隔：行上下各留 5pt，行与行即 10pt 空隙
                             .listRowInsets(EdgeInsets(top: 5, leading: 16, bottom: 5, trailing: 16))

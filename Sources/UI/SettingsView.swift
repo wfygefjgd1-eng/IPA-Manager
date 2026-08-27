@@ -12,7 +12,7 @@ struct SettingsView: View {
     @AppStorage("setting_auto_return_home") private var autoReturnHomeAfterSigning = true
 
     var body: some View {
-        NavigationView {
+        NavigationStack {
             List {
                 Section {
                     announcementCard
@@ -283,14 +283,7 @@ private extension View {
             .padding(.horizontal, 12)
             .padding(.vertical, 8)
             .frame(maxWidth: .infinity, alignment: .leading)
-            .background(
-                RoundedRectangle(cornerRadius: 14, style: .continuous)
-                    .fill(Color(.secondarySystemGroupedBackground).opacity(0.85))
-            )
-            .overlay(
-                RoundedRectangle(cornerRadius: 14, style: .continuous)
-                    .stroke(Color.primary.opacity(0.06), lineWidth: 0.5)
-            )
+            .cardStyle()
             .listRowInsets(EdgeInsets(top: 5, leading: 16, bottom: 5, trailing: 16))
             .listRowSeparator(.hidden)
             .listRowBackground(Color.clear)

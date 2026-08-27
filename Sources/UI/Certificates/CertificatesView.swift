@@ -21,7 +21,7 @@ struct CertificatesView: View {
     }
 
     var body: some View {
-        NavigationView {
+        NavigationStack {
             List {
                 certificatesSection
                 profilesSection
@@ -251,14 +251,7 @@ struct CertificatesView: View {
         content()
             .padding(12)
             .frame(maxWidth: .infinity, alignment: .leading)
-            .background(
-                RoundedRectangle(cornerRadius: 14, style: .continuous)
-                    .fill(Color(.secondarySystemGroupedBackground).opacity(0.85))
-            )
-            .overlay(
-                RoundedRectangle(cornerRadius: 14, style: .continuous)
-                    .stroke(Color.primary.opacity(0.06), lineWidth: 0.5)
-            )
+            .cardStyle()
     }
 
     private func certificateRow(_ certificate: CertificateInfo) -> some View {

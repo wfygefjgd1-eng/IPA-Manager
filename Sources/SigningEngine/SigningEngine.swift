@@ -446,7 +446,10 @@ private final class ProgressSmoother {
     private var displayed: Double = 0
     /// 当前阶段文字：随真实回调更新，蠕动期间沿用（如"正在重新打包"）。
     private var currentPhase: String = "签名中…"
-    private var timer: Timer?
+    /// 替换 Timer 为 DispatchSourceTimer：Timer 依赖 RunLoop，App 退后台 RunLoop 暂停
+    /// 时蠕动卡死（85% 后停在 85% 不动），DispatchSourceTimer 走内核 timer，App
+    /// 退后台继续触发（itms-services 安装期间 App 必然退后台，蠕动必须保持）。
+    private var timer: DispatchSourceTimer?
 
     init(rawHandler: @escaping (Double, String) -> Void) {
         self.rawHandler = rawHandler
@@ -482,7 +485,9 @@ private final class ProgressSmoother {
     /// 收到真实 100%（receive(1.0)）即停表并归正。
     private func startSlitherIfNeeded() {
         guard timer == nil else { return }
-        let t = Timer(timeInterval: 0.5, repeats: true) { [weak self] _ in
+        let t = DispatchSource.makeTimerSource(queue: DispatchQueue.main)
+        t.schedule(deadline: .now() + 0.5, repeating: 0.5)
+        t.setEventHandler { [weak self] in
             guard let self = self else { return }
             guard self.target < 1.0 else {
                 self.stopSlither()
@@ -494,11 +499,11 @@ private final class ProgressSmoother {
             }
         }
         timer = t
-        RunLoop.main.add(t, forMode: .common)
+        t.resume()
     }
 
     private func stopSlither() {
-        timer?.invalidate()
+        timer?.cancel()
         timer = nil
     }
 }

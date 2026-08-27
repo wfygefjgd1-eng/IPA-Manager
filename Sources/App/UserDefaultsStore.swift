@@ -16,6 +16,12 @@ final class UserDefaultsStore {
         static let autoReturnHomeAfterSigning = "setting_auto_return_home"
         /// 解码失败时备份原始数据的键（<key>_backup），避免迁移/排查时永久丢失
         static func backupKey(for key: String) -> String { "\(key)_backup" }
+        /// 备份时间戳键（<key>_backup_date），用于 TTL 清理（>7 天自动删除）
+        static func backupDateKey(for key: String) -> String { "\(key)_backup_date" }
+        /// 所有需要检查 TTL 的持久化键集合
+        static let allPersistedKeys: [String] = [
+            certificates, profiles, signingTasks, downloadTasks, importedApps
+        ]
     }
 
     /// 当前持久化 schema 版本：模型字段增删改都必须提升此版本并在此处补迁移逻辑
@@ -36,6 +42,32 @@ final class UserDefaultsStore {
         // 保持原数据不覆盖，避免主动破坏新版本写入的数据。
         if storedVersion > Self.currentSchemaVersion {
             Logger.warning("持久化数据版本高于当前 App 版本（\(storedVersion) > \(Self.currentSchemaVersion)），数据只读保留")
+        }
+        // 启动时清理过期备份（>7 天），避免 _backup 数据无限堆积
+        clearOldBackups()
+    }
+
+    /// 清理超过 TTL（7 天）的备份数据。每个备份键对应一个日期键，
+    /// 无日期键的旧备份（历史版本）视为已过期直接清理。
+    func clearOldBackups() {
+        let now = Date()
+        for key in Keys.allPersistedKeys {
+            let backupKey = Keys.backupKey(for: key)
+            let dateKey = Keys.backupDateKey(for: key)
+            guard defaults.data(forKey: backupKey) != nil else { continue }
+            if let date = defaults.object(forKey: dateKey) as? Date {
+                if now.timeIntervalSince(date) > Limits.backupTTLInterval {
+                    defaults.removeObject(forKey: backupKey)
+                    defaults.removeObject(forKey: dateKey)
+                    Logger.info("已清理过期备份: \(backupKey) (\(Int(now.timeIntervalSince(date)/86400)) 天前)")
+                }
+            } else {
+                // 历史数据：无时间戳的备份视为过期，直接清理避免堆积
+                defaults.removeObject(forKey: backupKey)
+                // 同时清理可能残留的旧标记
+                defaults.removeObject(forKey: dateKey)
+                Logger.info("已清理无时间戳的旧备份: \(backupKey)")
+            }
         }
     }
 
@@ -101,14 +133,22 @@ final class UserDefaultsStore {
 
     /// 解码失败保护：失败时备份原始 Data（不覆盖），并清空该键让 UI 走空态。
     /// 返回 nil 表示读取失败/无数据；备份可用于后续排查或回滚。
+    /// 备份会附带时间戳，供 TTL 清理使用（>7 天自动删除）。
     private func load<T: Codable>(_ type: T.Type, key: String) -> T? {
+        // 缺失键优雅处理：无数据时返回 nil，调用方以 ?? [] / 默认值兜底
         guard let data = defaults.data(forKey: key) else { return nil }
+        // 空数据亦视为缺失
+        guard !data.isEmpty else {
+            defaults.removeObject(forKey: key)
+            return nil
+        }
         do {
             return try decoder.decode(type, from: data)
         } catch {
             Logger.error("持久化数据解码失败 (\(key)): \(error.localizedDescription)")
-            // 保留原始数据副本，防止迁移不及时导致数据永久丢失
+            // 保留原始数据副本，防止迁移不及时导致数据永久丢失；带时间戳便于 TTL
             defaults.set(data, forKey: Keys.backupKey(for: key))
+            defaults.set(Date(), forKey: Keys.backupDateKey(for: key))
             defaults.removeObject(forKey: key)
             return nil
         }
@@ -118,8 +158,9 @@ final class UserDefaultsStore {
         do {
             let data = try encoder.encode(value)
             defaults.set(data, forKey: key)
-            // 保存成功后清理该键的失败备份，避免堆积
+            // 保存成功后清理该键的失败备份及时间戳，避免堆积
             defaults.removeObject(forKey: Keys.backupKey(for: key))
+            defaults.removeObject(forKey: Keys.backupDateKey(for: key))
         } catch {
             Logger.error("持久化数据写入失败 (\(key)): \(error.localizedDescription)")
         }

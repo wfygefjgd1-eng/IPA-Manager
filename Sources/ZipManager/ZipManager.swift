@@ -17,9 +17,9 @@ final class ZipManager {
         var errorDescription: String? {
             switch self {
             case .notAZipFile(let message),
-                 .corrupted(let message),
-                 .unknown(let message):
-                return message
+                  .corrupted(let message),
+                  .unknown(let message):
+                 return message
             }
         }
     }
@@ -32,8 +32,9 @@ final class ZipManager {
         // 解压前先校验文件头，把“根本不是 zip / 下载到的是网页错误页”的情况
         // 挡在解压之前，给出可操作的中文提示（替代底层英文报错）。
         try validateZipHeader(at: archiveURL)
-        // zip-slip 纵深防御：解压前遍历全部条目，拒绝路径穿越条目
-        try validateEntryPaths(at: archiveURL)
+        // 单次 Archive 打开完成 zip-slip + symlink + zip-bomb 校验，并返回可复用的 Archive
+        // （避免 validateEntryPaths 与 unzipItem 各自再开一次 Archive 的 2~3 次遍历）。
+        let (archive, _) = try validateAndGetArchive(at: archiveURL)
 
         if fileManager.fileExists(atPath: destinationURL.path) {
             try fileManager.removeItem(at: destinationURL)
@@ -41,7 +42,25 @@ final class ZipManager {
         try fileManager.createDirectory(at: destinationURL, withIntermediateDirectories: true)
 
         do {
-            try fileManager.unzipItem(at: archiveURL, to: destinationURL)
+            for entry in archive {
+                // 关键：ZIPFoundation 的 extract(entry, to:) 中 to 是"条目自身的完整
+                // 目标路径"（FileManager.unzipItem 内部就是 destination + entry.path），
+                // 不是解压根目录！若直接把根目录传给 extract，第一个文件条目会在
+                // "已存在的目录路径"上 createFile → NSFileWriteFileExistsError（516）
+                // → 被误判为"ZIP 文件已损坏或下载不完整"。
+                let targetURL = destinationURL.appendingPathComponent(entry.path)
+                do {
+                    try archive.extract(entry, to: targetURL)
+                } catch let error as CocoaError where error.code == .fileWriteFileExists {
+                    // 条目目标已存在（重复条目/目录与文件同名）：unzipItem 内部
+                    // createFile 对已存在文件是覆盖、createDirectory 幂等，不会抛；
+                    // 这里显式跳过兜底，不视为归档损坏。
+                    Logger.debug("跳过已存在条目（不视为损坏）: \(entry.path)")
+                }
+            }
+        } catch let error as ZipManager.ZipError {
+            try? fileManager.removeItem(at: destinationURL)
+            throw error
         } catch {
             // 文件头是 PK 却仍解压失败 → 归档结构已损坏（典型如：下载被截断、
             // 缺少中央目录记录 "End of central directory"），归类为 corrupted。
@@ -54,10 +73,10 @@ final class ZipManager {
         Logger.info("解压完成: \(destinationURL.path)")
     }
 
-    /// zip-slip 防御：逐条目校验路径是否安全（拒绝绝对路径、.. 越界、含冒号驱动符）。
-    /// ZIPFoundation 0.9.19 已内置词法包含性检查，这里在 App 侧再加一道保险，
-    /// 并显式拒绝符号链接条目（IPA 极少需要符号链接，恶意压缩包常用其越界写文件）。
-    private func validateEntryPaths(at archiveURL: URL) throws {
+    /// 单次 Archive 打开完成全部条目级安全校验，并返回已校验的 Archive 与总解压体积。
+    /// 合并了原 validateEntryPaths 的 zip-slip / symlink / 数量与体积上限检查，
+    /// 同时计算 totalBytes，避免 unzipWithProgress 再做一次 reduce 遍历。
+    private func validateAndGetArchive(at archiveURL: URL) throws -> (Archive, UInt64) {
         guard let archive = try? Archive(url: archiveURL, accessMode: .read) else {
             throw ZipError.corrupted("ZIP 文件无法读取")
         }
@@ -66,8 +85,8 @@ final class ZipManager {
 
         var totalBytes: UInt64 = 0
         var entryCount = 0
-        let maxEntries = 50_000
-        let maxTotalBytes: UInt64 = 4 * 1024 * 1024 * 1024 // 4GB 上限，防 zip bomb 撑爆沙箱
+        let maxEntries = Limits.maxEntries
+        let maxTotalBytes: UInt64 = Limits.maxTotalBytes // 4GB 上限，防 zip bomb 撑爆沙箱
 
         for entry in archive {
             entryCount += 1
@@ -82,7 +101,9 @@ final class ZipManager {
                 throw ZipError.corrupted("ZIP 含非法文件路径，已拦截")
             }
             // 拒绝符号链接（IPA 内无需符号链接，恶意压缩包常用其越界写文件）
-            if entry.type == .symlink {
+            // ZIPFoundation 的 entry.type 对非 Unix OS 类型可能回落为 .file，需用
+            // externalFileAttributes 兜底检测 S_IFLNK。
+            if isSymlink(entry) {
                 Logger.error("ZIP 含符号链接条目，已拒绝: \(path)")
                 throw ZipError.corrupted("ZIP 含符号链接条目，已拦截")
             }
@@ -91,6 +112,53 @@ final class ZipManager {
                 throw ZipError.corrupted("ZIP 解压体积超出安全上限，已停止")
             }
         }
+        return (archive, totalBytes)
+    }
+
+    /// zip-slip 防御：逐条目校验路径是否安全（拒绝绝对路径、.. 越界、含冒号驱动符）。
+    /// 已合并到 validateAndGetArchive 单次遍历；此方法保留作兼容入口，内部直接复用
+    /// 单次打开逻辑，避免旧调用方重复开 Archive。
+    private func validateEntryPaths(at archiveURL: URL) throws {
+        _ = try validateAndGetArchive(at: archiveURL)
+    }
+
+    /// 符号链接检测：优先使用 ZIPFoundation 的 entry.type，失败时回落到
+    /// externalFileAttributes 的 Unix mode 位。S_IFLNK = 0xA000 (0120000)，位于
+    /// externalFileAttributes 的高 16 位。部分 ZIP 以 MSDOS OS 类型存储但仍
+    /// 携带 Unix symlink 位，此时 entry.type 会误判为 .file，需此兜底。
+    private func isSymlink(_ entry: Entry) -> Bool {
+        if entry.type == .symlink {
+            return true
+        }
+        // Fallback via externalFileAttributes >> 16 & 0xA000 == 0xA000
+        // centralDirectoryStructure 为 internal，需用 Mirror 反射读取以保持编译兼容
+        // （0.9.19 未公开 externalFileAttributes 属性，直接访问会编译失败）。
+        let mirror = Mirror(reflecting: entry)
+        if let cdsValue = mirror.children.first(where: { $0.label == "centralDirectoryStructure" })?.value {
+            let cdsMirror = Mirror(reflecting: cdsValue)
+            if let raw = cdsMirror.children.first(where: { $0.label == "externalFileAttributes" })?.value {
+                let attrs: UInt32
+                if let v = raw as? UInt32 {
+                    attrs = v
+                } else if let v = raw as? UInt {
+                    attrs = UInt32(v)
+                } else if let v = raw as? Int {
+                    attrs = UInt32(bitPattern: Int32(v))
+                } else {
+                    return false
+                }
+                let mode = attrs >> 16
+                // 0xA000 == S_IFLNK；任务描述要求 ((attrs>>16) & 0xA000) == 0xA000
+                if (mode & 0xA000) == 0xA000 {
+                    return true
+                }
+                // 更严格的 S_IFMT 掩码校验亦视为 symlink（0xF000 == S_IFMT）
+                if (mode & 0xF000) == 0xA000 {
+                    return true
+                }
+            }
+        }
+        return false
     }
 
     func zip(folderURL: URL, outputURL: URL, shouldKeepParent: Bool = false) throws {
@@ -137,7 +205,10 @@ final class ZipManager {
         progress: @escaping (Double) -> Void
     ) throws {
         try validateZipHeader(at: archiveURL)
-        try validateEntryPaths(at: archiveURL)
+        // 单次 Archive 打开完成校验并获取 totalBytes，避免旧代码的
+        // validateEntryPaths（遍历1） + archive.reduce（遍历2） 双重遍历，
+        // 且复用 same Archive 实例直接进入提取循环（单次 open）。
+        let (archive, totalBytes) = try validateAndGetArchive(at: archiveURL)
 
         if fileManager.fileExists(atPath: destinationURL.path) {
             try fileManager.removeItem(at: destinationURL)
@@ -145,10 +216,6 @@ final class ZipManager {
         try fileManager.createDirectory(at: destinationURL, withIntermediateDirectories: true)
 
         do {
-            guard let archive = try? Archive(url: archiveURL, accessMode: .read) else {
-                throw ZipError.corrupted("ZIP 文件无法读取")
-            }
-            let totalBytes = archive.reduce(UInt64(0)) { $0 + $1.uncompressedSize }
             guard totalBytes > 0 else {
                 // 空 zip：直接完成
                 progress(1.0)
@@ -189,7 +256,7 @@ final class ZipManager {
         }
         defer { try? handle.close() }
 
-        let header = [UInt8](handle.readData(ofLength: 4))
+        let header = [UInt8](handle.readData(ofLength: Limits.zipHeaderReadLength))
         let isZipHeader = header == Self.localFileHeaderSignature
             || header == Self.emptyArchiveSignature
 
@@ -212,7 +279,9 @@ final class ZipManager {
             ?? String(data: data, encoding: .isoLatin1))?.lowercased()
         guard let lowercased = text else { return false }
 
-        let markers = ["<!doctype html", "<html", "<head", "not found", "404", "access denied"]
+        // HTML 检测：仅匹配完整标签起首（含括号/换行/空白），避免把"not found"、
+        // "404" 等常见正常文本误判为 HTML 错误页（如 file_not_found.txt、v2.0.4 等）。
+        let markers = ["<!doctype html", "<html", "<head>", "<body", "<!doctype"]
         return markers.contains { lowercased.contains($0) }
     }
 }

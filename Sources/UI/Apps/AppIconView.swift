@@ -26,7 +26,26 @@ struct AppIconView: View {
 
     /// 图标缓存：同一路径只解码一次，避免列表滚动/重绘时反复读盘 + 全尺寸解码。
     /// 特别是详情页大图标与首页行图标共用同一文件时，缓存能显著减少内存与 IO。
-    private static let cache = NSCache<NSString, UIImage>()
+    private static let cache: NSCache<NSString, UIImage> = {
+        let c = NSCache<NSString, UIImage>()
+        c.countLimit = 100
+        c.totalCostLimit = 20 * 1024 * 1024
+        return c
+    }()
+
+    /// 当前屏幕显示倍率：修复 UIScreen.main.scale 在 iOS17+ 的废弃警告，
+    /// 优先取 traitCollection.displayScale，异常时回退到 2.0/3.0 兼容值
+    private static var displayScale: CGFloat {
+        // UIScreen.main.scale deprecated -> traitCollection.displayScale
+        let scale = UIScreen.main.traitCollection.displayScale
+        if scale > 0 { return scale }
+        // 回退：尝试从 windowScene 获取，否则用 3.0（高分屏兜底）
+        if let scene = UIApplication.shared.connectedScenes.first as? UIWindowScene {
+            let s = scene.screen.traitCollection.displayScale
+            if s > 0 { return s }
+        }
+        return 2.0
+    }
 
     /// 用 ImageIO 降采样加载：图标常为 512~1024px，按目标渲染尺寸解码小图，
     /// 避免在内存中保留全分辨率位图。解码失败回退 nil（调用方显示占位图）。
@@ -34,7 +53,8 @@ struct AppIconView: View {
         // 缓存键含文件修改时间：重导入覆盖同名图标文件后内容变化，mtime 变化 → 新键
         // → 强制重新解码，避免 NSCache 一直命中旧图（NSCache 不感知文件内容变化）。
         let mtime = Self.modificationTime(of: path)
-        let cacheKey = NSString(string: "\(path)#\(Int(targetSize * UIScreen.main.scale))#\(mtime)")
+        let scale = Self.displayScale
+        let cacheKey = NSString(string: "\(path)#\(Int(targetSize * scale))#\(mtime)")
         if let cached = cache.object(forKey: cacheKey) {
             return cached
         }
@@ -43,7 +63,7 @@ struct AppIconView: View {
             return nil
         }
         // 目标像素尺寸 = pt * scale，留一点余量（*2）确保缩放后依然清晰
-        let pixelSize = Int(targetSize * UIScreen.main.scale * 2)
+        let pixelSize = Int(targetSize * scale * 2)
         let options: [CFString: Any] = [
             kCGImageSourceCreateThumbnailFromImageAlways: true,
             kCGImageSourceCreateThumbnailWithTransform: true,
@@ -53,7 +73,8 @@ struct AppIconView: View {
             return nil
         }
         let image = UIImage(cgImage: cgImage)
-        cache.setObject(image, forKey: cacheKey)
+        let cost = cgImage.bytesPerRow * cgImage.height
+        cache.setObject(image, forKey: cacheKey, cost: cost > 0 ? cost : Int(targetSize * targetSize * 4))
         return image
     }
 

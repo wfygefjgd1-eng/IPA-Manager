@@ -15,7 +15,7 @@ final class DownloadManager: NSObject {
     private let store = UserDefaultsStore()
 
     /// 同一任务自动重试的次数上限：校验失败（HTML 错误页 / 截断）时最多自动重下 1 次，避免死循环。
-    private let maxRetryCount = 1
+    private let maxRetryCount = Limits.maxRetryCount
     /// 每个任务已自动重试的次数（仅进程内有效；恢复的任务没有活跃下载，不会触发重试）。
     private var retryCounts: [UUID: Int] = [:]
 
@@ -27,7 +27,7 @@ final class DownloadManager: NSObject {
         configuration.allowsCellularAccess = true
         // GitHub releases 等站点对不带浏览器标识的请求会返回 HTML/错误页或 403，
         // 这就是下载到的"文件损坏"（实际是网页）的根因。补上完整浏览器 UA + 常规请求头。
-        configuration.timeoutIntervalForRequest = 120
+        configuration.timeoutIntervalForRequest = Timeouts.request
         configuration.httpAdditionalHeaders = [
             "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1",
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
@@ -386,7 +386,7 @@ final class DownloadManager: NSObject {
     private func classifyDownload(at path: String) -> DownloadContentKind {
         guard let handle = FileHandle(forReadingAtPath: path) else { return .other }
         defer { try? handle.close() }
-        let data = (try? handle.read(upToCount: 4096)) ?? Data()
+        let data = (try? handle.read(upToCount: Limits.downloadProbeLength)) ?? Data()
         if data.isEmpty { return .other }
         // 普通 zip (PK\x03\x04) 与 空 zip (PK\x05\x06) 都算有效压缩包，
         // 与 ZipManager.validateZipHeader 的判断保持一致
@@ -407,7 +407,7 @@ final class DownloadManager: NSObject {
         defer { try? handle.close() }
         let fileSize = (try? handle.seekToEnd()) ?? 0
         guard fileSize > 0 else { return false }
-        let tailLength = min(fileSize, 65_536)
+        let tailLength = min(fileSize, Limits.downloadEOCTailLength)
         try? handle.seek(toOffset: fileSize - tailLength)
         let tail = (try? handle.read(upToCount: Int(tailLength))) ?? Data()
         // EOCD 签名 0x50 0x4B 0x05 0x06（空 zip 也以该签名结尾，与头部校验一致）
@@ -494,13 +494,15 @@ extension DownloadManager: URLSessionDownloadDelegate {
         }
 
         // 断点续传失败整包兜底：续传最常见的失败是服务器不支持 Range / 会话失效 /
-        // resumeData 损坏，此时旧 resumeData 已“毒化”，恢复时必然再次失败。
+        // resumeData 损坏，此时旧 resumeData 已"毒化"，恢复时必然再次失败。
         // 未超重试上限时清空 resumeData 并整包重下（复用 retryDownload，内部
         // retryCounts 计数），防止死循环；超限则按普通失败收尾。
+        // 注意：NSURLErrorCannotConnectToHost(-3004) / NSURLErrorTimedOut(-1001) /
+        // NSURLErrorNetworkConnectionLost(-1005) 等都是网络瞬态错误，**不代表**
+        // resumeData 无效——直接重试 URLSession 即可，盲目整包重下会浪费时间/流量。
         let resumeRelatedCodes: [Int] = [
-            NSURLErrorCannotWriteToFile,      // -3000
-            NSURLErrorDataNotAllowed,
-            NSURLErrorCannotConnectToHost
+            NSURLErrorCannotWriteToFile,      // -3000  文件系统异常，resumeData 可疑
+            NSURLErrorDataNotAllowed          // -1020  策略禁止读取数据
         ]
         if let resumeData = updated.resumeData, !resumeData.isEmpty,
            resumeRelatedCodes.contains(nsError.code),

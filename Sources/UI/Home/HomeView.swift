@@ -20,7 +20,7 @@ struct HomeView: View {
     @State private var batchAutoSignAllowed = true
 
     var body: some View {
-        NavigationView {
+        NavigationStack {
             ScrollView {
                 VStack(spacing: 16) {
                     importBar
@@ -83,9 +83,11 @@ struct HomeView: View {
         .background(GlassBackground().ignoresSafeArea())
         // 导入进度浮层：导入进行中显示黑色胶囊进度卡（与全局 toast 同风格），
         // 用户无需干等——ProgressView 转圈 + 文件名 + 阶段文字 + i/N 进度
+        // Overlay竞争修复：与ContentView的toast同处.bottom，用zIndex确保层级明确，避免重叠遮挡
         .overlay(alignment: .bottom) {
             if let progress = appState.importProgress {
                 importProgressCard(progress)
+                    .zIndex(1)
             }
         }
         .animation(.easeInOut(duration: 0.25), value: appState.importProgress)
@@ -146,16 +148,7 @@ struct HomeView: View {
             }
             .padding(12)
             .frame(maxWidth: .infinity, alignment: .leading)
-            // 卡片形式：与已签应用页/下载页一致的圆角浅色底 + 细描边，
-            // 每个应用整体一块、行间留空，不再是无分隔的"一溜"
-            .background(
-                RoundedRectangle(cornerRadius: 14, style: .continuous)
-                    .fill(Color(.secondarySystemGroupedBackground).opacity(0.85))
-            )
-            .overlay(
-                RoundedRectangle(cornerRadius: 14, style: .continuous)
-                    .stroke(Color.primary.opacity(0.06), lineWidth: 0.5)
-            )
+            .cardStyle()
         }
         // 卡片与卡片之间的间距
         .padding(.bottom, 10)
@@ -188,15 +181,7 @@ struct HomeView: View {
             }
             .padding()
             .frame(maxWidth: .infinity, alignment: .leading)
-            // 与列表卡片同款：圆角浅色底 + 细描边，深浅色自适应
-            .background(
-                RoundedRectangle(cornerRadius: 14, style: .continuous)
-                    .fill(Color(.secondarySystemGroupedBackground).opacity(0.85))
-            )
-            .overlay(
-                RoundedRectangle(cornerRadius: 14, style: .continuous)
-                    .stroke(Color.primary.opacity(0.06), lineWidth: 0.5)
-            )
+            .cardStyle()
         }
     }
 

@@ -36,6 +36,7 @@ struct ContentView: View {
                 .tag(4)
         }
         // 全局轻提示：外部打开文件失败、后台操作结果等无专属 UI 的场景
+        // Overlay竞争修复：与HomeView的进度卡片同处.bottom对齐，用更高zIndex保证toast始终在最上层
         .overlay(alignment: .bottom) {
             if let message = appState.toastMessage {
                 Text(message)
@@ -46,6 +47,7 @@ struct ContentView: View {
                     .foregroundColor(.white)
                     .padding(.bottom, 20)
                     .transition(.opacity.combined(with: .move(edge: .bottom)))
+                    .zIndex(10)
             }
         }
         .animation(.easeInOut(duration: 0.25), value: appState.toastMessage)

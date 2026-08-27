@@ -18,7 +18,7 @@ struct DownloadsView: View {
     @State private var selectedIDs: Set<UUID> = []
 
     var body: some View {
-        NavigationView {
+        NavigationStack {
             Group {
                 if tasks.isEmpty {
                     emptyView
@@ -280,14 +280,7 @@ struct DownloadsView: View {
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 10)
-        .background(
-            RoundedRectangle(cornerRadius: 14, style: .continuous)
-                .fill(Color(.secondarySystemGroupedBackground).opacity(0.85))
-        )
-        .overlay(
-            RoundedRectangle(cornerRadius: 14, style: .continuous)
-                .stroke(Color.primary.opacity(0.05), lineWidth: 0.5)
-        )
+        .cardStyle()
         .contentShape(Rectangle())
         .onTapGesture {
             if isSelecting {

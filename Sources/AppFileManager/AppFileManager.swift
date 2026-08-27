@@ -59,6 +59,18 @@ final class AppFileManager {
         return items
     }
 
+    /// Async variant of `contents(of:)` that keeps sync version for backward compat.
+    /// File system enumeration is dispatched off the main actor so UI remains responsive
+    /// even when `Extracted/` contains many entries.
+    func contentsAsync(of directory: Directory) async -> [URL] {
+        await withCheckedContinuation { continuation in
+            DispatchQueue.global(qos: .userInitiated).async {
+                let result = self.contents(of: directory)
+                continuation.resume(returning: result)
+            }
+        }
+    }
+
     func deleteItem(at url: URL) throws {
         guard fileManager.fileExists(atPath: url.path) else { return }
         try fileManager.removeItem(at: url)

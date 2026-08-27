@@ -30,3 +30,5 @@ Vendor/openssl/
 *.ipa
 # 本地括号校验脚本（硬编码 Windows 路径，仅本地使用）
 cb.py
+# 数据恢复调试目录（analyze.js/fixlog.js/jsonl 原始会话数据，体积 6GB+，仅本地排查用）
+_dsh_recover/

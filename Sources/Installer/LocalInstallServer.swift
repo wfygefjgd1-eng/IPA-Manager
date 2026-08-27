@@ -10,6 +10,12 @@ final class LocalInstallServer {
     private var servingIPA: URL?
     private var manifestData: Data?
 
+    /// 持有并发探测结果的盒子，避免在并发 Task 中直接捕获可变变量（Sendable 警告）。
+    private final class ProbeHolder: @unchecked Sendable {
+        var chosen: String?
+        var logs: [String] = []
+    }
+
     /// 枚举设备全部可路由 IPv4 地址（Wi-Fi en0/en1、蜂窝 pdp_ip0、个人热点
     /// bridge100/172.20.x.x 等，等），排除回环和链路本地。Feather 同款做法。
     private static func allLocalIPAddresses() -> [String] {
@@ -42,7 +48,7 @@ final class LocalInstallServer {
 
     func isReachable() async -> Bool {
         guard let base = lastBaseURL else { return false }
-        var request = URLRequest(url: base, timeoutInterval: 5)
+        var request = URLRequest(url: base, timeoutInterval: Timeouts.isReachable)
         request.httpMethod = "HEAD"
         do {
             let (_, response) = try await URLSession.shared.data(for: request)
@@ -63,7 +69,8 @@ final class LocalInstallServer {
     /// 返回 nil 表示不可达；可达时返回 HTTP 状态码。
     /// 本地回环/局域网响应通常毫秒级，1s 超时足够区分“可达”与“不可达”，
     /// 避免蜂窝网络下不可达地址把安装提示拖慢数秒（此前 4s+1s×N 个候选）。
-    private static func probe(_ url: URL, timeout: TimeInterval = 1) -> Int? {
+    /// 已保留为兼容兜底；新代码优先使用 probeAsync + TaskGroup 并发探测。
+    private static func probe(_ url: URL, timeout: TimeInterval = Timeouts.serverProbe) -> Int? {
         var request = URLRequest(url: url, timeoutInterval: timeout)
         request.httpMethod = "HEAD"
         let semaphore = DispatchSemaphore(value: 0)
@@ -78,15 +85,87 @@ final class LocalInstallServer {
         return result
     }
 
+    /// 异步可取消的探测（Swift Concurrency）：支持 TaskGroup 并发与取消，不阻塞调用线程。
+    /// 使用 URLSession 异步 API，支持 Task 取消与超时；本地回环通常毫秒级返回。
+    private static func probeAsync(_ url: URL, timeout: TimeInterval = Timeouts.serverProbe) async -> Int? {
+        var request = URLRequest(url: url, timeoutInterval: timeout)
+        request.httpMethod = "HEAD"
+        do {
+            // URLSession.shared.data(for:) 支持异步与取消；超时由 timeoutInterval 控制
+            let (_, response) = try await URLSession.shared.data(for: request)
+            if Task.isCancelled { return nil }
+            return (response as? HTTPURLResponse)?.statusCode
+        } catch {
+            // 取消或网络失败均视为不可达，保持与同步版本一致语义
+            if Task.isCancelled { return nil }
+            return nil
+        }
+    }
+
+    /// 并发探测候选列表，返回首个可达的 host 与日志。使用 TaskGroup 实现并发，
+    /// 每个候选使用 0.5s 超时，避免单个蜂窝 CGNAT 地址阻塞；首个成功即取消其余任务。
+    /// - Returns: (chosen, logs) chosen 为首个可达的 host（回环优先），logs 为各候选结果
+    private static func probeCandidatesConcurrently(candidates: [String], port: UInt16) async -> (chosen: String?, logs: [String]) {
+        let perCandidateTimeout: TimeInterval = 0.5
+        var logs = Array(repeating: "", count: candidates.count)
+        var chosen: String? = nil
+
+        await withTaskGroup(of: (Int, String, Int?).self) { group in
+            for (idx, host) in candidates.enumerated() {
+                group.addTask {
+                    let url = URL(string: "http://\(host):\(port)")!
+                    let status = await probeAsync(url, timeout: perCandidateTimeout)
+                    return (idx, host, status)
+                }
+            }
+            // 按完成顺序收集；首个成功即记为 chosen 并取消剩余任务
+            for await (idx, host, status) in group {
+                if Task.isCancelled { break }
+                if let status = status {
+                    logs[idx] = "\(host) -> HTTP \(status) ✅ 可达"
+                    if chosen == nil {
+                        chosen = host
+                        group.cancelAll()
+                        // 仍需让已完成的日志保留，break 前已写入当前项
+                        // 为保持“回环优先”语义，稍后会强制回环覆盖
+                        break
+                    }
+                } else {
+                    logs[idx] = "\(host) -> 不可达 ❌"
+                }
+            }
+        }
+        // 填充被取消未写入的条目
+        for i in 0..<logs.count where logs[i].isEmpty {
+            logs[i] = "\(candidates[i]) -> 未完成/已取消"
+        }
+        // 回环优先：若 127.0.0.1 可达，无论其它地址谁先完成都强制选用回环
+        if let loopbackIdx = candidates.firstIndex(of: "127.0.0.1"),
+           logs[loopbackIdx].contains("✅") {
+            chosen = "127.0.0.1"
+        }
+        let filteredLogs = logs.filter { !$0.isEmpty }
+        return (chosen, filteredLogs)
+    }
+
     func start(ipaLocalURL: URL) throws -> URL {
         stop()
 
         let port = UInt16.random(in: 49152...65535)
-        // 监听全部接口（不限定 loopback），让 SpringBoard 经任意可路由地址可达。
-        // 明文 HTTP 是本地安装器（AltStore 等）的标准，127.0.0.1/局域网流量不出设备；
-        // 不用 https：iPhone Distribution 证书 EKU 缺 serverAuth，系统会拒绝握手。
+        // SECURITY: 默认监听全部接口（0.0.0.0:port，.init(rawValue:) 即 unspecified）
+        // 以便 SpringBoard 经任意本地路由可达；明文 HTTP 是本地安装器（AltStore/Feather/Esign）
+        // 的标准，127.0.0.1/局域网流量不出设备。更安全的替代方案是显式仅绑定回环：
+        //   let endpoint = NWEndpoint.hostPort(host: NWEndpoint.Host("127.0.0.1"), port: NWEndpoint.Port(rawValue: port)!)
+        //   let listener = try NWListener(using: parameters, on: endpoint)
+        // 或 parameters.requiredLocalEndpoint = NWEndpoint.hostPort(host: "127.0.0.1", port: ...)
+        // 当前保留全接口监听以兼容历史链路，但候选探测仅限 127.0.0.1 + 2 个接口 IP，
+        // 默认 chosenHost 回退到 127.0.0.1，避免将 pdp_ip0/utun 等蜂窝地址广泛暴露。
+        // iOS 无传统防火墙，端口仅限本地进程与 SpringBoard 访问，切勿转发到公网。
+        // 不用 https：iPhone Distribution 证书 EKU 缺 serverAuth，系统会拒绝 TLS 握手。
         let parameters = NWParameters.tcp
         parameters.allowLocalEndpointReuse = true
+        // 如需强制仅回环，取消下一行注释并替换 listener 初始化为 hostPort 绑定：
+        // parameters.requiredLocalEndpoint = NWEndpoint.hostPort(host: NWEndpoint.Host("127.0.0.1"), port: NWEndpoint.Port(rawValue: port)!)
 
         let listener = try NWListener(using: parameters, on: .init(rawValue: port)!)
         self.listener = listener
@@ -122,7 +201,7 @@ final class LocalInstallServer {
             }
         }
         listener.start(queue: ServerQueue.shared.queue)
-        let waitResult = readyGroup.wait(timeout: .now() + 5)
+        let waitResult = readyGroup.wait(timeout: .now() + Timeouts.readyWait)
         // 等待超时或最终状态非 .ready（端口占用 / 权限问题 / 一直等待网络路径）：
         // 一律视为启动失败并抛中文错误，绝不继续走"安装假成功"流程。
         guard waitResult == .success, becameReady else {
@@ -145,23 +224,36 @@ final class LocalInstallServer {
         // 候选地址：回环优先，然后是所有接口 IP（Wi-Fi/蜂窝/热点）。
         // 注意：蜂窝 CGNAT 的 10.x IP 在设备上不可自访问（流量路由到运营商 NAT
         // 回不到本机）；个人热点模式下 handoff 接口（bridge100/172.20.x.x）通常
-        // 可自访问。逐一同步探测，自动选第一个能返回 HTTP 响应的地址。
-        // 最多探测 3 个候选（回环 + 前两个接口 IP）：本地安装场景响应毫秒级，
-        // 遍历全部接口在蜂窝不可达时会逐个等超时（每个 2s），拖慢"是否安装"提示。
+        // 可自访问。并发探测首个可达地址，默认 127.0.0.1。
+        // 最多 3 个候选（回环 + 前两个接口 IP），通过 TaskGroup 并发探测（0.5s/候选），
+        // 总耗时约 0.5-1.5s，不再串行阻塞 3×(1+1)s，且支持取消。
         var candidates: [String] = ["127.0.0.1"]
         candidates.append(contentsOf: Self.allLocalIPAddresses().prefix(2))
-        var chosenHost: String? = nil
-        var probeLogs: [String] = []
-        for host in candidates {
-            let url = URL(string: "http://\(host):\(port)")!
-            if let status = Self.probe(url) {
-                chosenHost = host
-                probeLogs.append("\(host) -> HTTP \(status) ✅ 可达")
-                break
-            } else {
-                probeLogs.append("\(host) -> 不可达 ❌")
-            }
+        // 并发探测（TaskGroup）：由于 start 是同步方法，用 semaphore 桥接异步结果，
+        // 等待上限仅 1.5s，远小于串行版本，且可取消；超时或全部不可达则回退到 127.0.0.1 + 同步兜底
+        let holder = ProbeHolder()
+        let probeSemaphore = DispatchSemaphore(value: 0)
+        Task {
+            let result = await Self.probeCandidatesConcurrently(candidates: candidates, port: port)
+            holder.chosen = result.chosen
+            holder.logs = result.logs
+            probeSemaphore.signal()
         }
+        _ = probeSemaphore.wait(timeout: .now() + 1.5)
+        var chosenHost = holder.chosen
+        var probeLogs = holder.logs
+        // Fallback：若并发探测未完成或日志为空（超时/极端调度），同步单点探测 127.0.0.1 兜底
+        if chosenHost == nil && probeLogs.isEmpty {
+            if let status = Self.probe(URL(string: "http://127.0.0.1:\(port)")!, timeout: 0.5) {
+                chosenHost = "127.0.0.1"
+                probeLogs = ["127.0.0.1 -> HTTP \(status) ✅ 可达 (fallback)"]
+            } else {
+                probeLogs = ["127.0.0.1 -> 不可达 ❌ (fallback)"]
+            }
+        } else if probeLogs.isEmpty {
+            probeLogs = candidates.map { "\($0) -> 未探测" }
+        }
+        // SECURITY: 确保默认回环，即使并发结果异常也绝不暴露 0.0.0.0 或未探测地址
         let host = chosenHost ?? "127.0.0.1"
         let baseURL = URL(string: "http://\(host):\(port)")!
         self.lastBaseURL = baseURL
@@ -222,7 +314,10 @@ final class LocalInstallServer {
         }
         connection.start(queue: ServerQueue.shared.queue)
 
-        connection.receive(minimumIncompleteLength: 1, maximumLength: 8192) { [weak self] data, _, isComplete, error in
+        // 64KB 缓冲：HTTP GET 请求（带 Host/UA/Referer 等多 Header）单条请求可能超 8KB，
+        // 旧值 8192 在长 Header 时截断 → requestPath 解析失败 → fallback 到 /manifest.plist，
+        // 表现为"IPA 下载链接没响应"。64KB 单次能覆盖所有真实 HTTP 请求首部。
+        connection.receive(minimumIncompleteLength: 1, maximumLength: 65536) { [weak self] data, _, isComplete, error in
             guard let self = self else { return }
             if let data = data, !data.isEmpty, let request = String(data: data, encoding: .utf8) {
                 self.respond(request: request, connection: connection)

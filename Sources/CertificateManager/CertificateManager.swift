@@ -1,6 +1,6 @@
 import Foundation
 import Security
-
+import CryptoKit
 final class CertificateManager {
     static let shared = CertificateManager()
 
@@ -20,7 +20,20 @@ final class CertificateManager {
                 }
             }
             do {
-                let certificate = try self.readCertificate(from: url, password: password)
+                var certificate = try self.readCertificate(from: url, password: password)
+                // 稳定 keychain ID：基于 P12 文件内容（SHA256 前 8 字节）生成，
+                // 同一证书（同一文件内容）重复导入会得到相同 ID，外层可按 ID
+                // 去重 / 复用私钥，避免"重复导入同一证书产生 N 条记录"的历史 bug。
+                // 旧版本用 UUID().uuidString，每次导入都新生成，重复导入会创建 N 条记录
+                // + N 份 Keychain 私钥副本（按 identifier 各占一条）。
+                if let p12Data = try? Data(contentsOf: url) {
+                    let stableID = Self.stableKeychainID(for: p12Data, password: password, role: "cert")
+                    certificate.keychainIdentifier = stableID
+                    if !password.isEmpty {
+                        certificate.passwordKeychainIdentifier =
+                            Self.stableKeychainID(for: p12Data, password: password, role: "pwd")
+                    }
+                }
                 let storeStatus = self.storePrivateKey(
                     from: url, password: password,
                     identifier: certificate.keychainIdentifier,
@@ -46,6 +59,20 @@ final class CertificateManager {
                 self.deliver(.failure(error), completion: completion)
             }
         }
+    }
+
+    /// 同一份 P12 多次导入应得到同一 keychain account——按"内容 SHA256 前 8 字节 +
+    /// 密码 + 角色（cert / pwd）"做指纹。前 8 字节碰撞概率 1/2^64，密码不同则天然
+    /// 区分（同一 P12 换密码会创建独立条目，不影响原条目）。
+    private static func stableKeychainID(for p12Data: Data, password: String, role: String) -> String {
+        var hasher = SHA256()
+        hasher.update(data: p12Data)
+        hasher.update(data: Data(password.utf8))
+        hasher.update(data: Data(role.utf8))
+        let digest = hasher.finalize()
+        // 8 字节 hex = 16 字符 UUID 风格字符串（Keychain account 无格式约束）
+        let hex = digest.prefix(8).map { String(format: "%02x", $0) }.joined()
+        return "kcid-\(hex)"
     }
 
     /// API 线程契约：completion 统一在主线程回调，调用方无需自行切主。
@@ -381,6 +408,15 @@ final class CertificateManager {
             idx = next
         }
         guard values.count == 5 else { return nil }
+        // ASN.1 时间基本范围校验：拒绝畸形的 month=0/13、day=0/32、hour=24 等无效值，
+        // 避免 DateComponents 静默接受后构造出"1970-01-32"等不存在日期。DateComponents
+        // 不会做语义校验，超界值会循环进位（如 month=14 → 次年 2 月），导致证书过期
+        // 时间计算错误。
+        guard (1...12).contains(values[0]),
+              (1...31).contains(values[1]),
+              (0...23).contains(values[2]),
+              (0...59).contains(values[3]),
+              (0...60).contains(values[4]) else { return nil }
         var components = DateComponents()
         components.year = year
         components.month = values[0]

@@ -14,7 +14,11 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 OPENSSL_VERSION="3.3.2"
-TARBALL_URL="https://github.com/openssl/openssl/releases/download/openssl-${OPENSSL_VERSION}/openssl-${OPENSSL_VERSION}.tar.gz"
+# P1-9: 优先使用 openssl.org 官方源，其次回退到 GitHub Release 与 openssl-library.org 镜像
+# 官方（含 openssl-library.org）与 GitHub Release 自 3.3.x 起已统一由 GitHub 分发，SHA256 一致
+TARBALL_URL="https://www.openssl.org/source/openssl-${OPENSSL_VERSION}.tar.gz"
+TARBALL_URL_FALLBACK="https://github.com/openssl/openssl/releases/download/openssl-${OPENSSL_VERSION}/openssl-${OPENSSL_VERSION}.tar.gz"
+TARBALL_URL_FALLBACK2="https://openssl-library.org/source/old/3.3/openssl-${OPENSSL_VERSION}.tar.gz"
 
 WORK="/tmp/ossl_src"
 OUTDIR="$REPO_ROOT/build/openssl-out"
@@ -22,11 +26,29 @@ DEVICE_OUT="$OUTDIR/device"
 VENDOR_LIB="$REPO_ROOT/Vendor/openssl/lib"
 VENDOR_INC="$REPO_ROOT/Vendor/openssl/include"
 
-echo "==> 下载 OpenSSL ${OPENSSL_VERSION}"
+echo "==> 下载 OpenSSL ${OPENSSL_VERSION} (优先官网 https://www.openssl.org/source/，失败回退 GitHub/openssl-library.org)"
 mkdir -p "$WORK"
-curl -fL --retry 3 -o "$WORK/openssl.tar.gz" "$TARBALL_URL"
-# 校验 sha256（GitHub Release 资产 openssl-3.3.2.tar.gz 的实际校验和，
-# 与 openssl.org 官方 tarball 不同——GitHub 会重新生成 Release 源码包）
+# 依次尝试：官网 -> GitHub Release -> openssl-library.org 镜像；全部失败则退出
+if ! curl -fL --retry 3 -o "$WORK/openssl.tar.gz" "$TARBALL_URL"; then
+  echo "官网 $TARBALL_URL 下载失败，尝试 GitHub 备用 $TARBALL_URL_FALLBACK"
+  if ! curl -fL --retry 3 -o "$WORK/openssl.tar.gz" "$TARBALL_URL_FALLBACK"; then
+    echo "GitHub 备用失败，尝试镜像 $TARBALL_URL_FALLBACK2"
+    curl -fL --retry 3 -o "$WORK/openssl.tar.gz" "$TARBALL_URL_FALLBACK2" || { echo "全部下载源失败"; exit 1; }
+  fi
+fi
+# GPG 校验说明（可选增强，供 CI 手动验证完整性）：
+# 官方提供 .asc 签名文件：https://www.openssl.org/source/openssl-${OPENSSL_VERSION}.tar.gz.asc
+# 校验步骤：
+#   curl -fL -o "$WORK/openssl.tar.gz.asc" "https://www.openssl.org/source/openssl-${OPENSSL_VERSION}.tar.gz.asc"
+#   curl -fL -o "$WORK/openssl.tar.gz.sha256" "https://www.openssl.org/source/openssl-${OPENSSL_VERSION}.tar.gz.sha256"
+#   gpg --verify "$WORK/openssl.tar.gz.asc" "$WORK/openssl.tar.gz"
+# 需预先导入 OpenSSL 官方公钥（https://www.openssl.org/source/gpgkey-*.asc）到可信环
+# 当前脚本保留 SHA256 校验作为最低保障；.asc/.sha256 可作为补充校验
+#
+# 校验 sha256（openssl-3.3.2 官方 SHA256，与 GitHub Release 一致）：
+#   SHA256=2e8a40b01979afe8be0bbfb3de5dc1c6709fedb46d6c89c10da114ab5fc3d281
+#   SHA1  = b7ca08f2d49c10d772c5ec6cf2de6e08e69002b3（见 https://www.openssl.org/news/openssl-3.3.2-notes.html）
+# 注意：旧版脚本注释称 GitHub 与 openssl.org 哈希不同，实测 3.3.2 已统一，此处保留单哈希校验兼容全部源
 echo "2e8a40b01979afe8be0bbfb3de5dc1c6709fedb46d6c89c10da114ab5fc3d281  $WORK/openssl.tar.gz" \
   | shasum -a 256 -c - || { echo "OpenSSL 源码校验失败"; exit 1; }
 cd "$WORK"

@@ -39,6 +39,8 @@ struct AppDetailView: View {
     /// 真实 85% 锚点时刻：zsign 只在 85% 回调"重新打包开始"，此后无中间进度；
     /// 展示进度由 smoother 蠕动（假值），ETA 必须基于此锚点而非假进度线性外推。
     @State private var repackStartTime: Date?
+    /// 抽取的签名进度 ViewModel：承载进度/阶段/ETA 与计时器逻辑，View 仅做展示与事件转发
+    @StateObject private var signVM = SignViewModel()
 
     /// 展示层使用的“实时”AppInfo：
     /// - 签名刚完成 → 以签名输出为准（合并原快照的元数据，isSigned = true，path 指向签名产物）；
@@ -64,95 +66,98 @@ struct AppDetailView: View {
     }
 
     var body: some View {
-        NavigationView {
-            VStack(spacing: 0) {
-                headerSection
-                    .padding()
-
-                Divider()
-
-                infoList
-
-                if isSigning {
-                    signingProgressView
-                }
-
-                actionButtons
-                    .padding()
-            }
-            .navigationTitle("应用详情")
-            .navigationBarTitleDisplayMode(.inline)
-            .toolbar {
-                ToolbarItem(placement: .navigationBarTrailing) {
-                    // 签名进行中禁用“关闭”，避免用户关掉页面后签名完成无任何反馈
-                    Button("关闭") {
-                        dismiss()
-                    }
-                    .disabled(closeLocked)
-                }
-            }
-            .sheet(isPresented: $showSignOptions) {
-                SignOptionsView(app: app) { cert, profile, installAfter in
-                    startSigning(certificate: cert, profile: profile, installAfter: installAfter)
-                }
-            }
-            .sheet(isPresented: $showInstallCertificatePicker) {
-                InstallCertificatePicker { cert in
-                    do {
-                        try appState.installApp(liveApp, certificate: cert)
-                        alertMessage = "安装请求已发出"
-                    } catch {
-                        alertMessage = error.localizedDescription
-                    }
-                    showAlert = true
-                }
-            }
-            .sheet(isPresented: $showShareSheet) {
-                // 用 fileURLWithPath 构造 URL，避免路径含空格/中文时分享失效
-                ShareSheet(items: [URL(fileURLWithPath: liveApp.path)])
-            }
-            .alert("提示", isPresented: $showAlert) {
-                Button("确定", role: .cancel) {}
-            } message: {
-                Text(alertMessage)
-            }
-            /// 签名完成弹窗：内容“签名完成，已发起安装”，旁边“确定”和“返回”两个按钮。
-            // “返回”：关闭当前详情界面、切回首页 Tab，并挂起 App 直接回到 iOS 桌面（主屏幕）。
-            // 若设置“签名完成自动返回桌面”开启（默认开），弹窗出现约 1.5 秒后自动执行
-            // “返回”动作；用户在此期间手动点了“确定”或“返回”则取消自动返回。
-            .alert("签名完成", isPresented: $showSignedAlert) {
-                Button("确定", role: .cancel) {
-                    cancelAutoReturnIfNeeded()
-                }
-                Button("返回") {
-                    cancelAutoReturnIfNeeded()
-                    performReturnHome()
-                }
-            } message: {
-                Text(signedDidInstall ? "签名完成，已发起安装" : "签名完成，未自动安装")
-            }
-            .confirmationDialog(
-                "删除后文件不可恢复，确定删除吗？",
-                isPresented: $showDeleteConfirm,
-                titleVisibility: .visible
-            ) {
-                Button("删除", role: .destructive) {
-                    appState.removeSignedApp(liveApp)
+        VStack(spacing: 0) {
+            // 自定义导航栏：替代 NavigationView（sheet 内嵌 NavigationView 在 iOS16+ 已不推荐），
+            // 保留“关闭”按钮与签名锁定逻辑，样式与原 navigationBar 一致
+            HStack {
+                Text("应用详情")
+                    .font(.headline)
+                Spacer()
+                Button("关闭") {
                     dismiss()
                 }
-                Button("取消", role: .cancel) {}
+                .disabled(closeLocked || signVM.closeLocked)
             }
-            // 签名进行中禁止下滑手势关闭详情页：仅禁用 toolbar 关闭按钮时，
-            // 下滑手势仍可关页，签名完成/失败将无任何反馈
-            .interactiveDismissDisabled(isSigning)
-            // 毛玻璃背景：infoList 已透明化（见 infoList 的 scrollContentBackground(.hidden)），
-            // 详情页（sheet）同样铺渐变 + 半透明材质，与主界面风格统一
-            .background(GlassBackground().ignoresSafeArea())
-            // 视图消失时停止签名时间显示定时器（切页/关闭后不得残留空转）
-            .onDisappear {
-                stopSignTimer()
+            .padding(.horizontal)
+            .padding(.vertical, 12)
+            .background(Color(.systemBackground).opacity(0.0001))
+
+            Divider()
+
+            headerSection
+                .padding()
+
+            Divider()
+
+            infoList
+
+            if isSigning || signVM.isSigning {
+                signingProgressView
+            }
+
+            actionButtons
+                .padding()
+        }
+        .sheet(isPresented: $showSignOptions) {
+            SignOptionsView(app: app) { cert, profile, installAfter in
+                startSigning(certificate: cert, profile: profile, installAfter: installAfter)
+            }
+        }
+        .sheet(isPresented: $showInstallCertificatePicker) {
+            InstallCertificatePicker { cert in
+                do {
+                    try appState.installApp(liveApp, certificate: cert)
+                    alertMessage = "安装请求已发出"
+                } catch {
+                    alertMessage = error.localizedDescription
+                }
+                showAlert = true
+            }
+        }
+        .sheet(isPresented: $showShareSheet) {
+            // 用 fileURLWithPath 构造 URL，避免路径含空格/中文时分享失效
+            ShareSheet(items: [URL(fileURLWithPath: liveApp.path)])
+        }
+        .alert("提示", isPresented: $showAlert) {
+            Button("确定", role: .cancel) {}
+        } message: {
+            Text(alertMessage)
+        }
+        /// 签名完成弹窗：内容“签名完成，已发起安装”，旁边“确定”和“返回”两个按钮。
+        // “返回”：关闭当前详情界面、切回首页 Tab，并挂起 App 直接回到 iOS 桌面（主屏幕）。
+        // 若设置“签名完成自动返回桌面”开启（默认开），弹窗出现约 1.5 秒后自动执行
+        // “返回”动作；用户在此期间手动点了“确定”或“返回”则取消自动返回。
+        .alert("签名完成", isPresented: $showSignedAlert) {
+            Button("确定", role: .cancel) {
                 cancelAutoReturnIfNeeded()
             }
+            Button("返回") {
+                cancelAutoReturnIfNeeded()
+                performReturnHome()
+            }
+        } message: {
+            Text(signedDidInstall ? "签名完成，已发起安装" : "签名完成，未自动安装")
+        }
+        .confirmationDialog(
+            "删除后文件不可恢复，确定删除吗？",
+            isPresented: $showDeleteConfirm,
+            titleVisibility: .visible
+        ) {
+            Button("删除", role: .destructive) {
+                appState.removeSignedApp(liveApp)
+                dismiss()
+            }
+            Button("取消", role: .cancel) {}
+        }
+        // 签名进行中禁止下滑手势关闭详情页
+        .interactiveDismissDisabled(isSigning || signVM.isSigning)
+        // 毛玻璃背景：infoList 已透明化，详情页同样铺渐变 + 半透明材质
+        .background(GlassBackground().ignoresSafeArea())
+        // 视图消失时停止签名时间显示定时器（切页/关闭后不得残留空转）
+        .onDisappear {
+            stopSignTimer()
+            signVM.cleanupOnDisappear()
+            cancelAutoReturnIfNeeded()
         }
     }
 
@@ -327,6 +332,8 @@ struct AppDetailView: View {
         // 启动时间显示：每 0.5s 刷新"已用/预计剩余"（进度由 smoother 推进，
         // 时间必须随真实时钟走，不能只依赖进度回调）
         signStartTime = Date()
+        // 同步到 ViewModel（委托）
+        signVM.start()
         startSignTimer()
         appState.signApp(app, certificate: certificate, profile: profile, progress: { progress, phase in
             // 进度节流：变化 ≥1% 或间隔 ≥0.1s 才更新 @State，避免详情页频繁重算
@@ -343,8 +350,9 @@ struct AppDetailView: View {
             if progress >= 0.85 && repackStartTime == nil {
                 repackStartTime = now
             }
-            // 阶段感知 ETA：zsign 真实进度仅 5/20/85/100 四档，
-            // 用"里程碑锚点 + 阶段经验占比"估算，避免假进度导致的暴涨/虚低。
+            // 同步到 ViewModel
+            signVM.update(progress: progress, phase: phase)
+            // 阶段感知 ETA：委托给 ETACalculator（原逻辑抽取）
             if progress > 0 {
                 if let start = signStartTime {
                     let elapsed = now.timeIntervalSince(start)
@@ -358,6 +366,7 @@ struct AppDetailView: View {
             case .success(let signedPath):
                 isSigning = false
                 closeLocked = false
+                signVM.completeSuccess()
                 // 记录签名产物路径，供 liveApp 实时反映“已签名”状态（installedApps 会在回调前由 refreshInstalledApps 刷新）
                 signedOutputPath = signedPath
                 signedDidInstall = installAfter
@@ -389,6 +398,7 @@ struct AppDetailView: View {
             case .failure(let error):
                 isSigning = false
                 closeLocked = false
+                signVM.completeFailure()
                 alertMessage = signingFailureMessage(for: error)
                 showAlert = true
             }
@@ -397,6 +407,7 @@ struct AppDetailView: View {
 
     /// 启动时间显示定时器：每 0.5s 更新"已用秒数"，并在进度>0 时重算"预计剩余"。
     /// 与 smoother 的进度推进解耦——进度回调只负责推进百分比，这里负责真实时钟。
+    /// 已委托给 SignViewModel 的计时器同步逻辑，保留原定时器以兼容旧路径
     private func startSignTimer() {
         stopSignTimer()
         signTimer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [self] _ in
@@ -415,38 +426,18 @@ struct AppDetailView: View {
     private func stopSignTimer() {
         signTimer?.invalidate()
         signTimer = nil
+        signVM.stopTimer()
     }
 
-    /// 阶段感知的预计剩余秒数估算。
-    ///
-    /// zsign 桥接层真实回调只有 5/20/85/100 四档，平滑器（ProgressSmoother）把
-    /// 真实进度作为目标值用定时器蠕动逼近——85% 之后每 0.5s 只涨 0.3%，是"仍在
-    /// 工作"的假进度，不是真实时间进程。因此旧的 `elapsed × (1-p)/p` 线性外推
-    /// 必然失真：20% 停留阶段（签名主程序，长时间无回调）剩余会随时间暴涨，
-    /// 85% 蠕动阶段又显示"几秒就好"（实际重新打包大 IPA 要几十秒）。
-    ///
-    /// 新算法分段估算（zsign 只有 5/20/85/100 四档真实进度）：
-    /// - 5% ~ 20%（准备/解压）：极快，剩余按已用 ×2 给短期值，封顶 30s；
-    /// - 20% ~ 85%（签名主程序）：无中间回调、进度停死在 20%，无法精确得知
-    ///   剩余，按"剩余 ≈ 已用 × 1.5"保守递增、封顶 80s，避免暴涨成天文数字；
-    /// - 85% ~ 100%（重新打包）：以真实 85% 锚点为基准，总耗时 ≈ 85% 前耗时
-    ///   × 1.6（打包约占 40%），剩余 = 总耗时 − 已用，随时间收敛到真实值。
+    /// 阶段感知的预计剩余秒数估算。已抽取到 ETACalculator，保留方法做委托兼容
     private func estimatedRemainingSeconds(progress: Double, elapsed: TimeInterval, now: Date) -> Int {
-        guard progress > 0 else { return 0 }
-        if progress >= 0.85 {
-            // 重新打包阶段：总耗时 ≈ 85% 前耗时 × 1.6，剩余 = 总耗时 - 已用。
-            // 锚点缺失（异常路径）时退化为当前已用 × 1。
-            let base = repackStartTime.map { $0.timeIntervalSince(signStartTime ?? $0) } ?? elapsed
-            let totalEstimate = max(base, elapsed) * 1.6
-            return max(2, Int(totalEstimate - elapsed))
-        }
-        if progress >= 0.2 {
-            // 签名主程序：进度停死在 20%，"已用"随真实时钟增长而进度不动，
-            // 只能按经验系数递增并封顶，避免显示如"剩余 300 秒"的失真数字。
-            return max(3, min(Int(elapsed * 1.5), 80))
-        }
-        // 5% ~ 20%（准备/解压）：很快，短期估计即可。
-        return max(3, min(Int(elapsed * 2.0), 30))
+        ETACalculator.estimatedRemainingSeconds(
+            progress: progress,
+            elapsed: elapsed,
+            now: now,
+            repackStartTime: repackStartTime,
+            signStartTime: signStartTime
+        )
     }
 
     // MARK: - 签名完成自动返回桌面（设置开关，默认开）
@@ -506,7 +497,7 @@ struct InstallCertificatePicker: View {
     let onConfirm: (CertificateInfo) -> Void
 
     var body: some View {
-        NavigationView {
+        NavigationStack {
             List {
                 Section("选择用于安装的证书") {
                     ForEach(appState.certificates) { cert in
@@ -549,7 +540,7 @@ struct SignOptionsView: View {
     @AppStorage("installAfterSigning") private var installAfterSigning = true
 
     var body: some View {
-        NavigationView {
+        NavigationStack {
             List {
                 Section {
                     Toggle("签名后自动安装", isOn: $installAfterSigning)

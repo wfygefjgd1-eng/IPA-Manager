@@ -160,7 +160,7 @@ final class IPAParser {
         // 解压源压缩包并定位 .app（找不到会抛出“未找到 .app 应用包”）
         let package = try parse(fileURL: fileURL, progress: { p in
             // 解压阶段占整体 0~60%（60% 之后为复制/解析/图标）
-            progress?(p * 0.6)
+            progress?(p * ProgressWeight.convertUnzipWeight)
         })
 
         // 构造干净的临时目录，只包含 Payload/<应用名>.app，

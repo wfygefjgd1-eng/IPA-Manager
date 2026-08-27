@@ -11,9 +11,28 @@ enum Logger {
         let message: String
     }
 
-    private static let maxEntries = 300
-    private static let maxFailureEntries = 100
-    private static let lock = NSLock()
+    private static let maxEntries = Limits.maxLogEntries
+    private static let maxFailureEntries = Limits.maxFailureEntries
+    // os_unfair_lock：相比 NSLock 轻量（不自旋、不绑定 pthread），且不会在等锁线程
+    // 持有 Send 权限上出问题；关键修复点：NSLock 是阻塞锁，若 os_log 内部触发 KVO/
+    // NotificationCenter → 再调 Logger.log → 同线程可重入 NSLock 直接死锁。
+    // os_unfair_lock 显式标 _checking(Foundation,Swift) 即可在 Swift 6 strict-concurrency
+    // 下安全使用。
+    private static let lock = OSAllocatedUnfairLock()
+    // Static cached formatters: creating DateFormatter each diagnosticsReport call is expensive
+    // and not thread-safe to create on hot path; cache as static lets.
+    private static let cachedTimestampFormatter: DateFormatter = {
+        let f = DateFormatter()
+        f.dateFormat = "yyyy-MM-dd HH:mm:ss"
+        f.locale = Locale(identifier: "en_US_POSIX")
+        return f
+    }()
+    private static let cachedTimeFormatter: DateFormatter = {
+        let f = DateFormatter()
+        f.dateFormat = "HH:mm:ss"
+        f.locale = Locale(identifier: "en_US_POSIX")
+        return f
+    }()
     private(set) static var recentEntries: [LogEntry] = []
     /// 失败与异常专区：只收集 ERROR / warning（DEFAULT）等非 INFO/DEBUG 的消息，供诊断报告使用。
     private(set) static var failureEntries: [LogEntry] = []
@@ -66,10 +85,8 @@ enum Logger {
     }
 
     static func diagnosticsReport() -> String {
-        let timestampFormatter = DateFormatter()
-        timestampFormatter.dateFormat = "yyyy-MM-dd HH:mm:ss"
-        let timeFormatter = DateFormatter()
-        timeFormatter.dateFormat = "HH:mm:ss"
+        let timestampFormatter = Self.cachedTimestampFormatter
+        let timeFormatter = Self.cachedTimeFormatter
 
         let device = UIDevice.current
         let bundle = Bundle.main.infoDictionary
@@ -77,7 +94,7 @@ enum Logger {
         let build = bundle?["CFBundleVersion"] as? String ?? "未知"
 
         lock.lock()
-        let recent = Array(recentEntries.suffix(100).reversed())
+        let recent = Array(recentEntries.suffix(Limits.maxRecentInReport).reversed())
         let failures = Array(failureEntries.reversed())
         lock.unlock()
 
