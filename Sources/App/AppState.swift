@@ -1205,9 +1205,6 @@ final class AppState: ObservableObject {
             }
         }
     }
-        saveState()
-        refreshInstalledApps()
-    }
 
     /// 删除 Extracted/ 下所有以指定前缀开头的解压目录（兼容旧版 <baseName> 与新版
     /// <baseName>-<UUID> 两种命名）。已抽取到 `ExtractedDirectoryCleaner`。
