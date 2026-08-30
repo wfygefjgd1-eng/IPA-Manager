@@ -81,15 +81,9 @@ struct HomeView: View {
         // 全局毛玻璃背景层：渐变 + 半透明材质，ScrollView 内容透出其上的玻璃质感。
         // 深浅色模式自适应；配合 ScrollView 默认透明背景，滚动时内容在玻璃上掠过。
         .background(GlassBackground().ignoresSafeArea())
-        // 导入进度浮层：导入进行中显示黑色胶囊进度卡（与全局 toast 同风格），
-        // 用户无需干等——ProgressView 转圈 + 文件名 + 阶段文字 + i/N 进度
-        // Overlay竞争修复：与ContentView的toast同处.bottom，用zIndex确保层级明确，避免重叠遮挡
-        .overlay(alignment: .bottom) {
-            if let progress = appState.importProgress {
-                importProgressCard(progress)
-                    .zIndex(1)
-            }
-        }
+        // 导入进度浮层已上移到 ContentView 的统一 overlay：toast 与进度卡同处
+        // 一个容器垂直排布。旧实现两者分挂不同容器还注释"zIndex 修复"——
+        // zIndex 只在同级兄弟间排序，跨容器必然叠压（黑色胶囊直接叠在一起）。
         .animation(.easeInOut(duration: 0.25), value: appState.importProgress)
     }
 
@@ -154,7 +148,9 @@ struct HomeView: View {
         .padding(.bottom, 10)
     }
 
-    // 首页功能入口：仅保留可用的「导入文件」，显示为整条可点的长条卡片
+    // 首页功能入口：仅保留可用的「导入文件」，显示为整条可点的长条卡片。
+    // 导入进行中禁用：importFile 无串行化——大 zip 导入途中再选第二个文件，
+    // 两路导入会互踩进度卡（来回跳）与批量汇总计数。
     private var importBar: some View {
         Button {
             showFileImporter = true
@@ -183,6 +179,8 @@ struct HomeView: View {
             .frame(maxWidth: .infinity, alignment: .leading)
             .cardStyle()
         }
+        .disabled(appState.importProgress != nil)
+        .opacity(appState.importProgress != nil ? 0.55 : 1)
     }
 
     // 版本号展示：为空时显示"未知"
@@ -196,16 +194,27 @@ struct HomeView: View {
         return formatter
     }()
 
+    /// 时间文案缓存（文件路径 → "导入于 …/时间未知"）：导入进度每次推送都会触发
+    /// body 重算，旧实现每行每次都 stat 磁盘 + 格式化日期（行数 × 刷新次数次 IO）。
+    /// 导入产物使用唯一文件名（同名覆盖场景极少），容忍极端情况下文案不刷新。
+    private static let timeTextCache = NSCache<NSString, NSString>()
+
     // 时间信息：已签名应用显示"签名于"（优先取签名产物文件时间），未签名显示"导入于"；文件不存在则显示"时间未知"
     private func timeText(for app: AppInfo) -> String {
         let path = app.isSigned ? (app.signedPath ?? app.path) : app.path
-        guard !path.isEmpty,
-              let attributes = try? FileManager.default.attributesOfItem(atPath: path),
-              let date = (attributes[.modificationDate] as? Date) ?? (attributes[.creationDate] as? Date) else {
-            return "时间未知"
+        guard !path.isEmpty else { return "时间未知" }
+        let cacheKey = NSString(string: path)
+        if let cached = Self.timeTextCache.object(forKey: cacheKey) {
+            return cached as String
         }
-        let prefix = app.isSigned ? "签名于" : "导入于"
-        return "\(prefix) \(Self.fileDateFormatter.string(from: date))"
+        var result = "时间未知"
+        if let attributes = try? FileManager.default.attributesOfItem(atPath: path),
+           let date = (attributes[.modificationDate] as? Date) ?? (attributes[.creationDate] as? Date) {
+            let prefix = app.isSigned ? "签名于" : "导入于"
+            result = "\(prefix) \(Self.fileDateFormatter.string(from: date))"
+        }
+        Self.timeTextCache.setObject(result as NSString, forKey: cacheKey)
+        return result
     }
 
     private func handleImportedFile(
@@ -267,45 +276,6 @@ struct HomeView: View {
         handleImportedFile(urls[startIndex], index: startIndex + 1, total: urls.count) {
             importRemaining(urls, startIndex: startIndex + 1)
         }
-    }
-
-    /// 导入进度卡片：黑色胶囊 + 进度条（百分比）+ 文件名 + 阶段文字 + i/N，
-    /// 与全局 toast（ContentView）同风格。进度条用当前阶段真实进度加权后的
-    /// 整体百分比（0~1），解压阶段随字节数实时增长，让用户看到明确进展。
-    private func importProgressCard(_ progress: ImportProgress) -> some View {
-        HStack(spacing: 12) {
-            ZStack {
-                // 转圈 + 内圈百分比：双重反馈，进度直观
-                ProgressView()
-                    .progressViewStyle(CircularProgressViewStyle(tint: .white))
-                    .opacity(0.35)
-                Text("\(Int((progress.progress * 100).rounded()))%")
-                    .font(.system(size: 10, weight: .bold))
-                    .foregroundColor(.white)
-            }
-            .frame(width: 40, height: 40)
-            VStack(alignment: .leading, spacing: 3) {
-                Text("正在导入 \(progress.fileName)")
-                    .font(.footnote)
-                    .fontWeight(.medium)
-                    .lineLimit(1)
-                    .truncationMode(.middle)
-                if progress.totalCount > 1 {
-                    Text("正在导入 \(progress.currentIndex)/\(progress.totalCount) · \(progress.phase)")
-                        .font(.caption2)
-                        .opacity(0.85)
-                } else {
-                    Text("\(progress.phase) \(Int((progress.progress * 100).rounded()))%")
-                        .font(.caption2)
-                        .opacity(0.85)
-                }
-            }
-            .foregroundColor(.white)
-        }
-        .padding(.horizontal, 16)
-        .padding(.vertical, 12)
-        .background(Capsule().fill(Color.black.opacity(0.8)))
-        .padding(.bottom, 12)
     }
 
     /// 多选导入结束后的汇总提示（成功/失败个数）；批量选「仅导入」时附加说明，

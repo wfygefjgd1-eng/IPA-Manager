@@ -2,19 +2,14 @@ import Foundation
 
 // MARK: - Centralized constants for the whole project
 
-/// Progress weighting used in import flow (AppState + IPAParser).
-/// Overall import is split into 4 logical stages:
-/// unzip (60%) -> copy (20%) -> parse (15%) -> icon (5%)
+/// Progress weighting used in the import flow (AppState).
+/// Overall import is split into stages: unzip (0-60%) -> copy (60-80%)
+/// -> parse (80-95% or 5-98% for direct .ipa) -> icon (to 100%).
 enum ProgressWeight {
     static let unzip: Double = 0.6
-    static let copy: Double = 0.2
-    static let parse: Double = 0.15
-    static let icon: Double = 0.05
 
     /// Fixed progress checkpoints used when mapping sub-progress into overall progress.
-    static let unzipEnd: Double = 0.6
     static let copyProgress: Double = 0.6
-    static let copyEnd: Double = 0.8
 
     /// Zip import: second parse (re-parse) maps 0.8 -> 0.95
     static let parseStartZip: Double = 0.8
@@ -25,9 +20,6 @@ enum ProgressWeight {
     static let parseStartDirect: Double = 0.05
     static let parseRangeDirect: Double = 0.93
     static let iconProgressDirect: Double = 0.98
-
-    /// IPAParser.convertToIPAIfNeeded: unzip phase is 0 -> 0.6 of total
-    static let convertUnzipWeight: Double = 0.6
 
     /// Throttle threshold for ImportProgress (skip update if delta < 1%)
     static let throttleDelta: Double = 0.01
@@ -45,7 +37,6 @@ enum Limits {
     static let maxRecentInReport: Int = 100
 
     // UserDefaultsStore backup retention
-    static let backupTTLSeconds: TimeInterval = 7 * 24 * 60 * 60 // 7 days
     static let backupTTLInterval: TimeInterval = 7 * 24 * 60 * 60
 
     // DownloadManager retry

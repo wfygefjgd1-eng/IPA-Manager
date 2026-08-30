@@ -39,8 +39,10 @@ struct AppDetailView: View {
     /// 真实 85% 锚点时刻：zsign 只在 85% 回调"重新打包开始"，此后无中间进度；
     /// 展示进度由 smoother 蠕动（假值），ETA 必须基于此锚点而非假进度线性外推。
     @State private var repackStartTime: Date?
-    /// 抽取的签名进度 ViewModel：承载进度/阶段/ETA 与计时器逻辑，View 仅做展示与事件转发
-    @StateObject private var signVM = SignViewModel()
+    /// 源文件是否缺失：仅在 onAppear/签名产物变化时检查一次。
+    /// 旧实现把 FileManager.fileExists 直接写进 body 表达式，签名进度高频回调
+    /// 期间 body 每次重算都 stat 磁盘。
+    @State private var sourceFileMissing = false
 
     /// 展示层使用的“实时”AppInfo：
     /// - 签名刚完成 → 以签名输出为准（合并原快照的元数据，isSigned = true，path 指向签名产物）；
@@ -76,7 +78,7 @@ struct AppDetailView: View {
                 Button("关闭") {
                     dismiss()
                 }
-                .disabled(closeLocked || signVM.closeLocked)
+                .disabled(closeLocked)
             }
             .padding(.horizontal)
             .padding(.vertical, 12)
@@ -91,7 +93,7 @@ struct AppDetailView: View {
 
             infoList
 
-            if isSigning || signVM.isSigning {
+            if isSigning {
                 signingProgressView
             }
 
@@ -150,15 +152,25 @@ struct AppDetailView: View {
             Button("取消", role: .cancel) {}
         }
         // 签名进行中禁止下滑手势关闭详情页
-        .interactiveDismissDisabled(isSigning || signVM.isSigning)
+        .interactiveDismissDisabled(isSigning)
         // 毛玻璃背景：infoList 已透明化，详情页同样铺渐变 + 半透明材质
         .background(GlassBackground().ignoresSafeArea())
+        // 源文件存在性：出现时与签名产物变化时各检查一次（不在 body 内 stat 磁盘）
+        .onAppear {
+            refreshSourceFileExists()
+        }
+        .onChange(of: signedOutputPath) { _ in
+            refreshSourceFileExists()
+        }
         // 视图消失时停止签名时间显示定时器（切页/关闭后不得残留空转）
         .onDisappear {
             stopSignTimer()
-            signVM.cleanupOnDisappear()
             cancelAutoReturnIfNeeded()
         }
+    }
+
+    private func refreshSourceFileExists() {
+        sourceFileMissing = !FileManager.default.fileExists(atPath: liveApp.path)
     }
 
     private var headerSection: some View {
@@ -268,7 +280,7 @@ struct AppDetailView: View {
                 .disabled(isSigning
                           || appState.certificates.isEmpty
                           || appState.profiles.isEmpty
-                          || !FileManager.default.fileExists(atPath: liveApp.path))
+                          || sourceFileMissing)
 
                 if liveApp.isSigned {
                     Button {
@@ -332,8 +344,6 @@ struct AppDetailView: View {
         // 启动时间显示：每 0.5s 刷新"已用/预计剩余"（进度由 smoother 推进，
         // 时间必须随真实时钟走，不能只依赖进度回调）
         signStartTime = Date()
-        // 同步到 ViewModel（委托）
-        signVM.start()
         startSignTimer()
         appState.signApp(app, certificate: certificate, profile: profile, progress: { progress, phase in
             // 进度节流：变化 ≥1% 或间隔 ≥0.1s 才更新 @State，避免详情页频繁重算
@@ -350,9 +360,7 @@ struct AppDetailView: View {
             if progress >= 0.85 && repackStartTime == nil {
                 repackStartTime = now
             }
-            // 同步到 ViewModel
-            signVM.update(progress: progress, phase: phase)
-            // 阶段感知 ETA：委托给 ETACalculator（原逻辑抽取）
+            // 阶段感知 ETA：委托给 ETACalculator
             if progress > 0 {
                 if let start = signStartTime {
                     let elapsed = now.timeIntervalSince(start)
@@ -366,7 +374,6 @@ struct AppDetailView: View {
             case .success(let signedPath):
                 isSigning = false
                 closeLocked = false
-                signVM.completeSuccess()
                 // 记录签名产物路径，供 liveApp 实时反映“已签名”状态（installedApps 会在回调前由 refreshInstalledApps 刷新）
                 signedOutputPath = signedPath
                 signedDidInstall = installAfter
@@ -398,7 +405,6 @@ struct AppDetailView: View {
             case .failure(let error):
                 isSigning = false
                 closeLocked = false
-                signVM.completeFailure()
                 alertMessage = signingFailureMessage(for: error)
                 showAlert = true
             }
@@ -407,7 +413,6 @@ struct AppDetailView: View {
 
     /// 启动时间显示定时器：每 0.5s 更新"已用秒数"，并在进度>0 时重算"预计剩余"。
     /// 与 smoother 的进度推进解耦——进度回调只负责推进百分比，这里负责真实时钟。
-    /// 已委托给 SignViewModel 的计时器同步逻辑，保留原定时器以兼容旧路径
     private func startSignTimer() {
         stopSignTimer()
         signTimer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [self] _ in
@@ -426,7 +431,6 @@ struct AppDetailView: View {
     private func stopSignTimer() {
         signTimer?.invalidate()
         signTimer = nil
-        signVM.stopTimer()
     }
 
     /// 阶段感知的预计剩余秒数估算。已抽取到 ETACalculator，保留方法做委托兼容

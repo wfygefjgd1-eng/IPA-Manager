@@ -15,6 +15,8 @@ final class BackgroundAudioKeepAlive {
     private var heartbeatTimer: Timer?
     /// 最长保活时限任务：本地安装通常在几十秒内完成，超过该时限自动停止，
     /// 避免安装链路异常卡住时静音播放 + 心跳日志永久运行（耗电 + 刷屏）。
+    /// 超时触发时会先检查服务器活动：安装仍在进行则顺延一个周期，绝不挂起
+    /// 进行中的安装（大 IPA / 用户在安装确认弹窗停留的耗时可能远超固定时限）。
     private var autoStopWorkItem: DispatchWorkItem?
     private let autoStopInterval: TimeInterval = 5 * 60
 
@@ -22,9 +24,10 @@ final class BackgroundAudioKeepAlive {
 
     /// 开始保活：激活 playback AudioSession 并无限循环播放 1 秒静音 WAV。
     /// 幂等：已在保活时直接返回。本地服务器可能在后台队列启动（安装重活已移出
-    /// 主线程），AVAudioSession/AVAudioPlayer 的设置统一切回主线程执行。
+    /// 主线程），AVAudioSession/AVAudioPlayer 的设置统一切回主线程执行；
+    /// isActive 幂等判定也在主线程做（旧版在外部线程判定 + 主线程启动，
+    /// 两者竞争时会出现"服务器已停但静音音频空转满时限"的错序）。
     func start() {
-        guard !isActive else { return }
         DispatchQueue.main.async { [weak self] in
             self?.startOnMainThread()
         }
@@ -70,13 +73,21 @@ final class BackgroundAudioKeepAlive {
 
     /// 启动最长时限自动停止（默认 5 分钟）：安装链路异常卡住时兜底停止保活，
     /// stop() 触发时会一并取消该定时任务；重复 start() 会重置计时。
+    /// 到期时若安装仍在活动（最近半周期内有 itms-services 打开/连接/请求），
+    /// 顺延一个周期再检查——固定时限会让 1GB+ 大包在下载中途被挂起、安装静默失败。
     private func scheduleAutoStop() {
         autoStopWorkItem?.cancel()
+        let interval = autoStopInterval
         let work = DispatchWorkItem { [weak self] in
-            // stop() 会 invalidate 主 RunLoop 上的 Timer / 停播放器 / 释放 AudioSession，
-            // 统一切回主线程执行
+            // 状态判定与 autoStopWorkItem 的读写统一回主线程（与 start/stop 一致）
             DispatchQueue.main.async {
-                self?.stop()
+                guard let self = self else { return }
+                if LocalInstallServer.shared.hasRecentInstallActivity(within: interval / 2) {
+                    Logger.info("安装仍在进行，顺延后台保活 \(Int(interval)) 秒")
+                    self.scheduleAutoStop()
+                } else {
+                    self.stop()
+                }
             }
         }
         autoStopWorkItem = work
@@ -85,7 +96,16 @@ final class BackgroundAudioKeepAlive {
     }
 
     /// 停止保活：停掉静音播放并释放 AudioSession。幂等。
+    /// 本方法可能从任意线程被调（服务器 stop 在后台队列、回前台在主线程）：
+    /// Timer 加在主 RunLoop 上必须在主线程 invalidate，状态读写同理，
+    /// 统一切回主线程执行（与 start 的处理对称）。
     func stop() {
+        DispatchQueue.main.async { [weak self] in
+            self?.stopOnMainThread()
+        }
+    }
+
+    private func stopOnMainThread() {
         guard isActive else { return }
         autoStopWorkItem?.cancel()
         autoStopWorkItem = nil

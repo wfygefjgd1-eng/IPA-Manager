@@ -11,9 +11,18 @@ final class InfoPlistParser {
             throw AppError.operationFailed("无法读取 Info.plist")
         }
 
+        // 区分"合法 plist 但顶层不是字典"与"解析失败"：旧实现把前者静默降级为
+        // 空字典（`as? [String: Any] ?? [:]`），产出的应用 bundleID 为空串，导入后
+        // 按空 bundleID 与其它坏包互相静默覆盖。
         let plist: [String: Any]
         do {
-            plist = try PropertyListSerialization.propertyList(from: data, options: [], format: nil) as? [String: Any] ?? [:]
+            let raw = try PropertyListSerialization.propertyList(from: data, options: [], format: nil)
+            guard let dict = raw as? [String: Any] else {
+                throw AppError.operationFailed("Info.plist 格式异常（顶层不是字典），无法提取应用信息")
+            }
+            plist = dict
+        } catch let error as AppError {
+            throw error
         } catch {
             throw AppError.operationFailed("Info.plist 解析失败: \(error.localizedDescription)")
         }

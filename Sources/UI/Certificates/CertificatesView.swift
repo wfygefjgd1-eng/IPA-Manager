@@ -32,7 +32,14 @@ struct CertificatesView: View {
             .safeAreaInset(edge: .bottom, spacing: 0) {
                 importFloatingBar
             }
-            .sheet(isPresented: $showImporter) {
+            .sheet(isPresented: $showImporter, onDismiss: {
+                // p12 选中后先让 picker sheet 完整 dismiss，再在 onDismiss 里弹密码框。
+                // 旧实现在 picker 回调（正在 dismiss）里立刻 present 密码框，
+                // UIKit 对同一 presenter 的"边 dismiss 边 present"会间歇性丢弃新弹窗。
+                if pendingImportURL != nil {
+                    showPasswordSheet = true
+                }
+            }) {
                 // 按导入目标限定文件类型：证书空态只选 p12/pfx/zip，描述文件空态只选 mobileprovision/zip；
                 // 底部「一键导入证书」全类型（zip/p12/pfx/mobileprovision）
                 DocumentPicker(
@@ -374,10 +381,17 @@ struct CertificatesView: View {
         // 纯展示卡片：不设点击手势，证书页供查看，不承担默认选择等交互
     }
 
-    /// 有效期范围文案："yyyy-MM-dd ~ yyyy-MM-dd"，缺失端显示"未知"
-    private func dateSpanText(_ start: Date?, _ end: Date?) -> String {
+    /// 有效期范围文案："yyyy-MM-dd ~ yyyy-MM-dd"，缺失端显示"未知"。
+    /// formatter 缓存为 static（DateFormatter 创建开销毫秒级，旧实现每行每次
+    /// 渲染各建 2 个；证书/描述文件列表随 body 重算反复创建）。
+    private static let dateFormatter: DateFormatter = {
         let f = DateFormatter()
         f.dateFormat = "yyyy-MM-dd"
+        return f
+    }()
+
+    private func dateSpanText(_ start: Date?, _ end: Date?) -> String {
+        let f = Self.dateFormatter
         let startText = start.map { f.string(from: $0) } ?? "未知"
         let endText = end.map { f.string(from: $0) } ?? "未知"
         return "\(startText) ~ \(endText)"
@@ -415,8 +429,9 @@ struct CertificatesView: View {
         case "zip":
             importBundle(url)
         case "p12", "pfx":
+            // 只记录待导入 URL；密码框在 picker sheet 的 onDismiss 里弹出（避免
+            // "边 dismiss 边 present" 竞态），见 body 中 showImporter 的 onDismiss
             pendingImportURL = url
-            showPasswordSheet = true
         case "mobileprovision":
             importProfile(url)
         default:
@@ -446,8 +461,11 @@ struct CertificatesView: View {
         DispatchQueue.global(qos: .userInitiated).async {
             do {
                 let content = try CertificateBundleImporter.shared.extract(from: url)
-                // 记录解压目录：无论成功失败都要删除，避免 bundle-extract-* 明文泄漏堆积
-                extractDir = content.p12URL?.deletingLastPathComponent()
+                // 记录解压目录：importer 直接携带精确根目录。旧实现用 p12URL 的
+                // 直接父目录反推——p12 在子目录时清理推错根（只删子目录，根目录与
+                // 明文 P12 残留）、zip 只含描述文件时直接为 nil（整个解压目录漏清），
+                // 明文私钥材料常驻 Documents（文件 App/备份可导出）。
+                extractDir = content.extractDir
                 let moved = try CertificateBundleImporter.shared.moveToManagedLocation(
                     p12URL: content.p12URL,
                     profileURL: content.profileURL
@@ -502,9 +520,12 @@ struct CertificatesView: View {
             } catch {
                 DispatchQueue.main.async {
                     isImporting = false
-                    // 解压/移动失败：清理解压残留
+                    // 解压/移动失败：清理解压残留（拿不到确切目录时按前缀兜底清扫，
+                    // unzip 可能已创建 bundle-extract-* 且残留部分内容）
                     if let extractDir = extractDir {
                         CertificateBundleImporter.shared.cleanup(extractDir: extractDir)
+                    } else {
+                        ExtractedDirectoryCleaner.sweepBundleExtractDirs()
                     }
                     alertMessage = "导入失败: \(error.localizedDescription)"
                     showAlert = true
@@ -521,13 +542,12 @@ struct CertificatesView: View {
             }
         }
 
-        let destination = AppFileManager.shared.directoryURL(.profiles)
-            .appendingPathComponent(url.lastPathComponent)
-
         do {
-            try AppFileManager.shared.copyItem(from: url, to: destination)
-            // importProfile 检测到源已在 Documents/Profiles 内，会直接复用该路径，无需再覆盖
-            let profile = try ProvisioningManager.shared.importProfile(from: destination)
+            // 直接调 importProfile：内部会解析并把源文件归档到 Documents/Profiles
+            // 的 profile-<uuid>.mobileprovision。旧实现先用原始文件名复制到
+            // Profiles/ 再导入——同名不同 UUID 的新描述文件会先覆盖旧文件再按
+            // uuid 查重，旧记录 path 不变但指向的已是新内容（元数据与磁盘错配）。
+            let profile = try ProvisioningManager.shared.importProfile(from: url)
             // 按 uuid 去重/更新：同一描述文件重复导入不重复添加，原地把 path 更新为最新稳定路径
             // （修复旧 Bundle 内失效路径）；保持记录 id 不变，避免破坏 selectedProfile 等引用
             if let index = appState.profiles.firstIndex(where: { $0.uuid == profile.uuid }) {

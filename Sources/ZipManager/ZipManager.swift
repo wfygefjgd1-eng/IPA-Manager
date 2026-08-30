@@ -33,7 +33,7 @@ final class ZipManager {
         // 挡在解压之前，给出可操作的中文提示（替代底层英文报错）。
         try validateZipHeader(at: archiveURL)
         // 单次 Archive 打开完成 zip-slip + symlink + zip-bomb 校验，并返回可复用的 Archive
-        // （避免 validateEntryPaths 与 unzipItem 各自再开一次 Archive 的 2~3 次遍历）。
+        // （校验与解压共用一次 Archive 打开，避免多次遍历）。
         let (archive, _) = try validateAndGetArchive(at: archiveURL)
 
         if fileManager.fileExists(atPath: destinationURL.path) {
@@ -74,8 +74,8 @@ final class ZipManager {
     }
 
     /// 单次 Archive 打开完成全部条目级安全校验，并返回已校验的 Archive 与总解压体积。
-    /// 合并了原 validateEntryPaths 的 zip-slip / symlink / 数量与体积上限检查，
-    /// 同时计算 totalBytes，避免 unzipWithProgress 再做一次 reduce 遍历。
+    /// 合并 zip-slip / symlink / 数量与体积上限检查，同时计算 totalBytes，
+    /// 避免校验与解压各自再开一次 Archive 的多次遍历。
     private func validateAndGetArchive(at archiveURL: URL) throws -> (Archive, UInt64) {
         guard let archive = try? Archive(url: archiveURL, accessMode: .read) else {
             throw ZipError.corrupted("ZIP 文件无法读取")
@@ -94,6 +94,13 @@ final class ZipManager {
                 throw ZipError.corrupted("ZIP 条目数量超出安全上限，已停止解压")
             }
             let path = entry.path
+            // 少数 Windows 工具用反斜杠作条目分隔符：POSIX 下会解压成一整层
+            // 含 "\" 的平面文件名，解压"成功"但找不到 .app，误报"未找到 .app
+            // 应用包"。直接拒绝并给出可操作的中文提示。
+            if path.contains("\\") {
+                Logger.error("ZIP 条目路径含反斜杠分隔符（非标准打包），已拒绝: \(path)")
+                throw ZipError.corrupted("该 ZIP 使用了非标准的反斜杠路径分隔（Windows 工具打包），请用标准工具重新打包后再试")
+            }
             // 拒绝路径穿越/绝对路径：含 ".." 组件、以 "/" 开头、或含冒号（驱动符）
             let components = path.split(separator: "/").map(String.init)
             if components.contains("..") || path.hasPrefix("/") || path.contains(":") {
@@ -107,19 +114,21 @@ final class ZipManager {
                 Logger.error("ZIP 含符号链接条目，已拒绝: \(path)")
                 throw ZipError.corrupted("ZIP 含符号链接条目，已拦截")
             }
-            totalBytes += entry.uncompressedSize
+            // 用 addingReportingOverflow 防御 zip64：条目未压缩体积是 8 字节字段，
+            // 值完全由压缩包作者控制（ZIPFoundation 0.9.19+ 支持 zip64）。普通加法
+            // 溢出会运行时直接 trap 崩溃；改用回绕检测后溢出即视为超出安全上限
+            // 拒绝解压（若改用 &+ 回绕，体积检查会被绕过，deflate 炸弹可无限解压）。
+            let (newTotal, overflow) = totalBytes.addingReportingOverflow(entry.uncompressedSize)
+            if overflow {
+                Logger.error("ZIP 条目体积合计溢出（zip64 伪造字段），已拒绝")
+                throw ZipError.corrupted("ZIP 解压体积超出安全上限，已停止解压")
+            }
+            totalBytes = newTotal
             if totalBytes > maxTotalBytes {
                 throw ZipError.corrupted("ZIP 解压体积超出安全上限，已停止")
             }
         }
         return (archive, totalBytes)
-    }
-
-    /// zip-slip 防御：逐条目校验路径是否安全（拒绝绝对路径、.. 越界、含冒号驱动符）。
-    /// 已合并到 validateAndGetArchive 单次遍历；此方法保留作兼容入口，内部直接复用
-    /// 单次打开逻辑，避免旧调用方重复开 Archive。
-    private func validateEntryPaths(at archiveURL: URL) throws {
-        _ = try validateAndGetArchive(at: archiveURL)
     }
 
     /// 符号链接检测：优先使用 ZIPFoundation 的 entry.type，失败时回落到
@@ -181,7 +190,8 @@ final class ZipManager {
                 shouldKeepParent: shouldKeepParent
             )
         } catch {
-            throw AppError.operationFailed("打包失败: \(outputURL.lastPathComponent)")
+            // 透传底层原因（对比 unzip 路径），排查"打包失败"时不缺关键信息
+            throw AppError.operationFailed("打包失败: \(outputURL.lastPathComponent)（\(error.localizedDescription)）")
         }
 
         Logger.info("打包完成: \(outputURL.path)")
@@ -205,9 +215,8 @@ final class ZipManager {
         progress: @escaping (Double) -> Void
     ) throws {
         try validateZipHeader(at: archiveURL)
-        // 单次 Archive 打开完成校验并获取 totalBytes，避免旧代码的
-        // validateEntryPaths（遍历1） + archive.reduce（遍历2） 双重遍历，
-        // 且复用 same Archive 实例直接进入提取循环（单次 open）。
+        // 单次 Archive 打开完成校验并获取 totalBytes，避免多次遍历，
+        // 且复用同一 Archive 实例直接进入提取循环（单次 open）。
         let (archive, totalBytes) = try validateAndGetArchive(at: archiveURL)
 
         if fileManager.fileExists(atPath: destinationURL.path) {
@@ -216,11 +225,6 @@ final class ZipManager {
         try fileManager.createDirectory(at: destinationURL, withIntermediateDirectories: true)
 
         do {
-            guard totalBytes > 0 else {
-                // 空 zip：直接完成
-                progress(1.0)
-                return
-            }
             var processed: UInt64 = 0
             for entry in archive {
                 // 关键：ZIPFoundation 的 extract(entry, to:) 中 to 是"条目自身的完整
@@ -237,9 +241,16 @@ final class ZipManager {
                     // 这里显式跳过兜底，不视为归档损坏。
                     Logger.debug("跳过已存在条目（不视为损坏）: \(entry.path)")
                 }
+                // 校验通过后 processed 有界（≤ totalBytes ≤ 4GB），普通加法不会溢出
                 processed += entry.uncompressedSize
-                progress(Double(processed) / Double(totalBytes))
+                // totalBytes 为 0（仅空文件/目录条目的 zip）时跳过除法避免 NaN
+                if totalBytes > 0 {
+                    progress(min(Double(processed) / Double(totalBytes), 1.0))
+                }
             }
+            // 全零字节 zip（仅空文件/目录条目）也要报完成：旧实现直接 return 不解压
+            // 任何条目（目录条目也不建），且进度报 100% 误导调用方"已完成"
+            progress(1.0)
         } catch let error as ZipManager.ZipError {
             try? fileManager.removeItem(at: destinationURL)
             throw error

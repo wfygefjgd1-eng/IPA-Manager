@@ -44,3 +44,31 @@ struct DownloadTask: Identifiable, Codable, Hashable {
         }
     }
 }
+
+extension DownloadTask {
+    private enum CodingKeys: String, CodingKey {
+        case id, url, fileName, destinationPath, totalBytes, receivedBytes, createdAt
+        case resumeData, retryCount, lastRetryDate, status, error, resolvedBundleID
+    }
+
+    /// 自定义解码：全部键用 decodeIfPresent + 默认值。
+    /// Swift 合成 Decodable 不使用属性默认值——历史版本持久化的 JSON 缺少后加的
+    /// 非可选字段（如 retryCount）时，合成解码会整体抛 keyNotFound，导致
+    /// UserDefaultsStore.load 备份后清空，升级安装后全部下载任务记录消失。
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        id = try container.decodeIfPresent(UUID.self, forKey: .id) ?? UUID()
+        url = try container.decodeIfPresent(String.self, forKey: .url) ?? ""
+        fileName = try container.decodeIfPresent(String.self, forKey: .fileName) ?? ""
+        destinationPath = try container.decodeIfPresent(String.self, forKey: .destinationPath) ?? ""
+        totalBytes = try container.decodeIfPresent(Int64.self, forKey: .totalBytes) ?? 0
+        receivedBytes = try container.decodeIfPresent(Int64.self, forKey: .receivedBytes) ?? 0
+        createdAt = try container.decodeIfPresent(Date.self, forKey: .createdAt) ?? Date()
+        resumeData = try container.decodeIfPresent(Data.self, forKey: .resumeData)
+        retryCount = try container.decodeIfPresent(Int.self, forKey: .retryCount) ?? 0
+        lastRetryDate = try container.decodeIfPresent(Date.self, forKey: .lastRetryDate)
+        status = try container.decodeIfPresent(Status.self, forKey: .status) ?? .waiting
+        error = try container.decodeIfPresent(String.self, forKey: .error)
+        resolvedBundleID = try container.decodeIfPresent(String.self, forKey: .resolvedBundleID)
+    }
+}

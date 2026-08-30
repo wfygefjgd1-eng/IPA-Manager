@@ -22,7 +22,6 @@ struct SigningTask: Identifiable, Codable, Hashable {
     /// 供签名过程页与历史记录展示"正在干什么"。
     var phase: String = ""
     var error: String?
-    var log: [String] = []
 
     var statusDescription: String {
         switch status {

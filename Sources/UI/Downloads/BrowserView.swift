@@ -11,6 +11,9 @@ struct BrowserView: View {
     @State private var showBookmarks = false
     @State private var showToast = false
     @State private var toastMessage = ""
+    /// 当前 toast 的自动隐藏任务：新 toast 先取消旧的，避免前一条的计时器
+    /// 提前把新 toast 藏掉（裸 asyncAfter 互不取消的互踩问题）
+    @State private var toastWorkItem: DispatchWorkItem?
 
     /// 外部传入的初始 URL（例如从书签跳转）；为 nil 时加载默认主页。
     let initialURL: URL?
@@ -80,7 +83,7 @@ struct BrowserView: View {
             .padding(.vertical, 8)
 
             WebView(
-                url: $urlString,
+                initialURL: initialURL,
                 isLoading: $isLoading,
                 canGoBack: $canGoBack,
                 canGoForward: $canGoForward,
@@ -88,12 +91,14 @@ struct BrowserView: View {
                     // 命中下载链接：不再弹确认框，直接开始下载并切到“下载”标签页
                     startDownload(url)
                 },
+                onURLChanged: { pageURL in
+                    // 页面加载完成回写地址栏（WebView 不再监听 urlString 绑定：
+                    // 旧实现地址栏逐键输入都会改变绑定并触发 updateUIView 的真实
+                    // 导航——每个字符一次网络请求，还会覆盖用户正在输入的文本）
+                    urlString = pageURL
+                },
                 onLoadFailed: { message in
-                    toastMessage = message
-                    showToast = true
-                    DispatchQueue.main.asyncAfter(deadline: .now() + 3) {
-                        showToast = false
-                    }
+                    showToastMessage(message, duration: 3)
                 }
             )
             .ignoresSafeArea(edges: .bottom)
@@ -122,6 +127,8 @@ struct BrowserView: View {
             BookmarkView { url in
                 urlString = url.absoluteString
                 showBookmarks = false
+                // 显式导航走通知（与后退/前进/刷新同一通道），不再依赖绑定变化
+                NotificationCenter.default.post(name: .browserNavigate, object: url)
             }
         }
         // 轻提示：收藏当前页面等操作结果
@@ -142,6 +149,19 @@ struct BrowserView: View {
             showToast = false
         }
         } // NavigationView
+    }
+
+    /// 统一的 toast 展示：新 toast 取消上一个的隐藏计时器（避免互踩——
+    /// 裸 asyncAfter 互不取消时，前一条的 3s 计时器会提前把新 toast 藏掉）。
+    private func showToastMessage(_ message: String, duration: TimeInterval) {
+        toastMessage = message
+        showToast = true
+        toastWorkItem?.cancel()
+        let work = DispatchWorkItem {
+            self.showToast = false
+        }
+        toastWorkItem = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + duration, execute: work)
     }
 
     private var toolbar: some View {
@@ -229,11 +249,7 @@ struct BrowserView: View {
     private func startDownload(_ url: URL) {
         // 只允许 http/https；其它 scheme（data:/file:/javascript: 等）不建下载任务
         guard let scheme = url.scheme?.lowercased(), scheme == "http" || scheme == "https" else {
-            toastMessage = "仅支持 http/https 链接下载"
-            showToast = true
-            DispatchQueue.main.asyncAfter(deadline: .now() + 2) {
-                self.showToast = false
-            }
+            showToastMessage("仅支持 http/https 链接下载", duration: 2)
             return
         }
         Logger.info("开始下载: \(url.absoluteString)")
@@ -259,12 +275,8 @@ struct BrowserView: View {
                 ) { _ in
                     Logger.info("下载任务已创建")
                 }
-                // 轻提示（可选）：直接开始下载，不再弹任何确认框
-                self.toastMessage = "开始下载：\(url.lastPathComponent)"
-                self.showToast = true
-                DispatchQueue.main.asyncAfter(deadline: .now() + 2) {
-                    self.showToast = false
-                }
+                // 不再设置"开始下载：xxx"toast：紧随其后的 dismiss 会销毁本视图，
+                // toast 根本来不及显示（切到下载 Tab + 任务出现即是反馈）
                 // 下载已加入队列：关闭浏览器并切到“下载”标签页
                 self.appState.selectedTab = 2
                 self.dismiss()
@@ -273,7 +285,9 @@ struct BrowserView: View {
     }
 
     /// 地址栏提交：规范化 URL 并导航（补全缺省 https:// 前缀；只接受 http/https）。
-    /// 修改 urlString 会触发 WebView.updateUIView 中的 load。
+    /// 导航走 .browserNavigate 通知（与后退/前进/刷新同一通道）——地址栏文本变化
+    /// 本身绝不触发 WebView 导航（逐键导航是历史缺陷：每敲一个字符发一次真实
+    /// 网络请求，还会把中间态 URL 加载成 404 并覆盖正在输入的文本）。
     private func navigate(to raw: String) {
         var candidate = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !candidate.isEmpty else { return }
@@ -287,24 +301,21 @@ struct BrowserView: View {
         guard let url = URL(string: candidate),
               let scheme = url.scheme?.lowercased(),
               scheme == "http" || scheme == "https" else {
-            toastMessage = "仅支持 http/https 网址"
-            showToast = true
-            DispatchQueue.main.asyncAfter(deadline: .now() + 2) {
-                self.showToast = false
-            }
+            showToastMessage("仅支持 http/https 网址", duration: 2)
             return
         }
         urlString = url.absoluteString
+        NotificationCenter.default.post(name: .browserNavigate, object: url)
     }
 
     private func addCurrentPageToBookmarks() {
         let ok = BookmarkStore.shared.addCurrentPage(urlString)
-        toastMessage = ok ? "已添加到我的书签" : "当前页面无法收藏"
-        showToast = true
-        DispatchQueue.main.asyncAfter(deadline: .now() + 2) {
-            showToast = false
-        }
+        showToastMessage(ok ? "已添加到我的书签" : "当前页面无法收藏", duration: 2)
     }
+}
+
+extension Notification.Name {
+    static let browserNavigate = Notification.Name("browserNavigate")
 }
 
 extension Notification.Name {
@@ -316,11 +327,16 @@ extension Notification.Name {
 }
 
 private struct WebView: UIViewRepresentable {
-    @Binding var url: String
+    /// 初始 URL（仅 makeUIView 时加载一次）。导航统一走 .browserNavigate 通知，
+    /// 不再持有 urlString 绑定——绑定会让地址栏每次键入都触发 updateUIView
+    /// 里的真实导航（历史缺陷）。
+    let initialURL: URL?
     @Binding var isLoading: Bool
     @Binding var canGoBack: Bool
     @Binding var canGoForward: Bool
     var onDownloadDetected: (URL) -> Void
+    /// 页面加载完成后回写地址栏文本（页面 URL 与地址栏同步）
+    var onURLChanged: (String) -> Void
     /// 加载失败回调（向用户展示中文提示，替代仅写日志的静默失败）
     var onLoadFailed: (String) -> Void
 
@@ -333,7 +349,8 @@ private struct WebView: UIViewRepresentable {
         webView.uiDelegate = context.coordinator
         webView.allowsBackForwardNavigationGestures = true
 
-        if let url = URL(string: url) {
+        // 初始页：外部传入的 URL，无传入时回落默认主页（与 urlString 的初始值一致）
+        if let url = initialURL ?? URL(string: "https://github.com") {
             context.coordinator.currentURL = url
             webView.load(URLRequest(url: url))
         }
@@ -343,10 +360,8 @@ private struct WebView: UIViewRepresentable {
     }
 
     func updateUIView(_ uiView: WKWebView, context: Context) {
-        guard let target = URL(string: url),
-              target.absoluteString != context.coordinator.currentURL?.absoluteString else { return }
-        uiView.load(URLRequest(url: target))
-        context.coordinator.currentURL = target
+        // 导航不在这里触发：地址栏编辑文本与导航请求已分离（.browserNavigate
+        // 通知），body 重算时不再对比 URL 发起 load
     }
 
     func makeCoordinator() -> Coordinator {
@@ -425,6 +440,23 @@ private struct WebView: UIViewRepresentable {
                     self?.openInBrowser()
                 }
             )
+            notificationTokens.append(
+                NotificationCenter.default.addObserver(
+                    forName: .browserNavigate,
+                    object: nil,
+                    queue: .main
+                ) { [weak self] notification in
+                    // 地址栏提交/书签选择的显式导航入口
+                    guard let url = notification.object as? URL else { return }
+                    self?.navigateTo(url)
+                }
+            )
+        }
+
+        /// 显式导航：更新 currentURL 并加载（仅由 .browserNavigate 通知触发）
+        func navigateTo(_ url: URL) {
+            currentURL = url
+            webView?.load(URLRequest(url: url))
         }
 
         func goBack() {
@@ -461,7 +493,9 @@ private struct WebView: UIViewRepresentable {
                 self.parent.isLoading = false
                 self.parent.canGoBack = webView.canGoBack
                 self.parent.canGoForward = webView.canGoForward
-                self.parent.url = webView.url?.absoluteString ?? ""
+                // 页面最终地址回写地址栏（地址栏编辑不再触发导航，覆盖输入的
+                // 风险仅剩"输入时页面恰好加载完成"的极小窗口）
+                self.parent.onURLChanged(webView.url?.absoluteString ?? "")
             }
         }
 

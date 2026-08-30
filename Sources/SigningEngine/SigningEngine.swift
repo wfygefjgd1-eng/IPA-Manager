@@ -57,6 +57,47 @@ final class SigningEngine: SigningEngineProtocol {
             throw AppError.signFailed(reason)
         }
 
+        // 证书凭据检查（Keychain 标识 / 密码读取 / p12 与 PEM 导出）全部前移到
+        // 结构规范化之前：规范化是大 IO（整包解压 + 重打包，大 IPA 数十秒），
+        // 证书不可用时先做完规范化纯属白费（fail-fast）。
+        guard let keychainID = certificate.keychainIdentifier else {
+            let reason = "证书缺少 Keychain 标识"
+            Logger.error("签名失败: \(reason)")
+            throw AppError.signFailed(reason)
+        }
+
+        // Keychain 密码读取失败与"无密码"不可区分的问题：受密码保护的证书读不到
+        // 密码时（典型：设备锁定，WhenUnlockedThisDeviceOnly 条目锁屏不可读），
+        // 旧实现用空密码静默继续，最终报 zsign 的"证书或私钥文件无效"，误导排障。
+        let certPassword: String
+        if certificate.isPasswordProtected {
+            guard let stored = certManager.readPassword(for: certificate) else {
+                let reason = "无法读取证书密码（设备可能已锁定），请解锁设备后重试"
+                Logger.error("签名失败: \(reason)")
+                throw AppError.signFailed(reason)
+            }
+            certPassword = stored
+        } else {
+            certPassword = ""
+        }
+
+        let p12URL = try exportP12(identifier: keychainID)
+        defer {
+            try? fileManager.deleteItem(at: p12URL)
+        }
+
+        // 首选：把 p12 里的私钥导出为 PEM 私钥文件（绕开 iOS 静态 OpenSSL 对
+        // PBES2/AES p12 的 PKCS12_parse 失败问题）；返回 nil（EC 曲线不支持/
+        // 解析失败）则回退直接用 p12 文件。zsign 的 ZSignAsset::Init 在 certPath
+        // 为空时会自动从描述文件的 DeveloperCertificates 里找与私钥配对的证书。
+        let keyFileURL = (try? exportPrivateKeyPEM(from: p12URL, password: certPassword)) ?? nil
+        defer {
+            if let keyFileURL = keyFileURL {
+                try? fileManager.deleteItem(at: keyFileURL)
+            }
+        }
+        let keyPath = (keyFileURL ?? p12URL).path
+
         // 源 IPA 结构规范化：标准 IPA 顶层必须是 Payload/<App>.app/。
         // 历史 CI 产物（ditto --keepParent 会把 .app 直接放压缩包根）和某些
         // 第三方来源的包不符合该结构，zsign 解压后报 "Can't find payload directory"。
@@ -65,6 +106,7 @@ final class SigningEngine: SigningEngineProtocol {
         // 注意：规范化失败（非标准结构且修复失败）不再静默回退到原路径签名
         // （那样会直接撞上 zsign 的英文报错），而是抛出中文错误直接终止签名；
         // nil 返回值只表示"已是标准结构"（含 Payload/），直接使用源文件。
+        progress(0.02, "校验应用包结构…")
         let signingSourcePath: String
         var normalizedWorkDir: URL?
         var normalizedOutputURL: URL?
@@ -86,31 +128,6 @@ final class SigningEngine: SigningEngineProtocol {
 
         Logger.info("开始签名: \(sourcePath)")
         progress(0.05, "准备证书与描述文件…")
-
-        guard let keychainID = certificate.keychainIdentifier else {
-            let reason = "证书缺少 Keychain 标识"
-            Logger.error("签名失败: \(reason)")
-            throw AppError.signFailed(reason)
-        }
-
-        let certPassword = certManager.readPassword(for: certificate) ?? ""
-
-        let p12URL = try exportP12(identifier: keychainID)
-        defer {
-            try? fileManager.deleteItem(at: p12URL)
-        }
-
-        // 首选：把 p12 里的私钥导出为 PEM 私钥文件（绕开 iOS 静态 OpenSSL 对
-        // PBES2/AES p12 的 PKCS12_parse 失败问题）；失败则回退直接用 p12 文件。
-        // zsign 的 ZSignAsset::Init 在 certPath 为空时会自动从描述文件的
-        // DeveloperCertificates 里找与私钥配对的证书。
-        let keyFileURL = try? exportPrivateKeyPEM(from: p12URL, password: certPassword)
-        defer {
-            if let keyFileURL = keyFileURL {
-                try? fileManager.deleteItem(at: keyFileURL)
-            }
-        }
-        let keyPath = (keyFileURL ?? p12URL).path
 
         let outputURL = fileManager.directoryURL(.signed)
             .appendingPathComponent("\(URL(fileURLWithPath: sourcePath).deletingPathExtension().lastPathComponent)-signed-\(UUID().uuidString.prefix(8)).ipa")
@@ -175,7 +192,11 @@ final class SigningEngine: SigningEngineProtocol {
 
     /// 用系统 Security 框架（SecPKCS12Import）解开 p12 并把私钥导出为 PEM 文件。
     /// iOS 静态 OpenSSL 对 PBES2/AES p12 的 PKCS12_parse 可能失败，而系统实现可靠。
-    private func exportPrivateKeyPEM(from p12URL: URL, password: String) throws -> URL {
+    /// - Returns: PEM 文件 URL；nil 表示该私钥类型无法安全导出为合法 PEM
+    ///   （未知曲线/未知 keyType），调用方应回退直接用 p12 文件。
+    ///   绝不产出"头尾对但内容非法"的 PEM——旧实现把 EC 的 X9.63 原始字节
+    ///   直接包上 SEC1 头尾，OpenSSL 解析必败，ECC 证书签名必然失败。
+    private func exportPrivateKeyPEM(from p12URL: URL, password: String) throws -> URL? {
         guard let data = try? Data(contentsOf: p12URL) else {
             let reason = "无法读取证书数据"
             Logger.error("导出 PEM 私钥失败: \(reason)")
@@ -220,8 +241,6 @@ final class SigningEngine: SigningEngineProtocol {
             throw AppError.signFailed(reason)
         }
 
-        // ECC 私钥是 SEC1 格式（BEGIN EC PRIVATE KEY）；RSA 是 PKCS#1 格式（BEGIN RSA PRIVATE KEY）
-        var pemBlock = "-----BEGIN PRIVATE KEY-----\n"
         var isEC = false
         var isRSA = false
         if let attrs = SecKeyCopyAttributes(key) as? [String: Any],
@@ -232,30 +251,100 @@ final class SigningEngine: SigningEngineProtocol {
                 isRSA = true
             }
         }
+
         if isEC {
-            pemBlock = "-----BEGIN EC PRIVATE KEY-----\n"
-        } else if isRSA {
-            pemBlock = "-----BEGIN RSA PRIVATE KEY-----\n"
+            // SecKeyCopyExternalRepresentation 对 EC 返回 ANSI X9.63 原始字节
+            // （04 || X || Y || privateScalar），不是任何 PEM 结构的载荷；
+            // 必须重组为 PKCS#8（PrivateKeyInfo）DER 才能用 "BEGIN PRIVATE KEY"。
+            guard let pkcs8 = Self.pkcs8DER(fromECRaw: keyData) else {
+                Logger.warning("EC 私钥无法重组为 PKCS#8（曲线不支持或数据异常），回退 p12 路径")
+                return nil
+            }
+            let url = try Self.writePEMFile(
+                der: pkcs8,
+                header: "-----BEGIN PRIVATE KEY-----",
+                footer: "-----END PRIVATE KEY-----"
+            )
+            Logger.info("已导出 PEM 私钥: ECC (PKCS#8)")
+            return url
+        }
+        if isRSA {
+            // RSA 的 SecKeyCopyExternalRepresentation 就是 PKCS#1 DER，
+            // 与 "BEGIN RSA PRIVATE KEY" 头直接匹配
+            let url = try Self.writePEMFile(
+                der: keyData,
+                header: "-----BEGIN RSA PRIVATE KEY-----",
+                footer: "-----END RSA PRIVATE KEY-----"
+            )
+            Logger.info("已导出 PEM 私钥: RSA (PKCS#1)")
+            return url
+        }
+        // 其它/未知 keyType：外部表示与任何标准 PEM 结构都不对应，
+        // 直接回退 p12 路径（zsign 的 OpenSSL 能解析 p12 时自行处理）
+        Logger.info("私钥类型未知，跳过 PEM 导出，回退 p12 路径")
+        return nil
+    }
+
+    /// 把 SecKeyCopyExternalRepresentation 的 EC 私钥原始数据（ANSI X9.63：
+    /// 未压缩点 0x04 || X || Y || privateScalar，三段等长）重组为 PKCS#8
+    /// PrivateKeyInfo DER。OpenSSL 的 PEM_read_bio_PrivateKey 可直接解析。
+    private static func pkcs8DER(fromECRaw keyData: Data) -> Data? {
+        // 常用曲线的 OID 内容字节（DER 编码去掉 tag/length 后的部分）
+        func curveOIDContent(coordinateBytes: Int) -> [UInt8]? {
+            switch coordinateBytes {
+            case 32: return [0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x03, 0x01, 0x07] // P-256: 1.2.840.10045.3.1.7
+            case 48: return [0x2B, 0x81, 0x04, 0x00, 0x22]                   // P-384: 1.3.132.0.34
+            case 66: return [0x2B, 0x81, 0x04, 0x00, 0x23]                   // P-521: 1.3.132.0.35
+            default: return nil
+            }
+        }
+        // X9.63 = 未压缩点标志(0x04) + X(n) + Y(n) + 私钥标量(n)
+        guard keyData.count > 2, keyData[keyData.startIndex] == 0x04 else { return nil }
+        let n = (keyData.count - 1) / 3
+        guard n > 0, keyData.count == 1 + 3 * n,
+              let curveOID = curveOIDContent(coordinateBytes: n) else { return nil }
+        let scalar = keyData.suffix(n)
+
+        func derLength(_ length: Int) -> Data {
+            if length < 0x80 { return Data([UInt8(length)]) }
+            var bytes: [UInt8] = []
+            var value = length
+            while value > 0 {
+                bytes.insert(UInt8(value & 0xFF), at: 0)
+                value >>= 8
+            }
+            return Data([UInt8(0x80 | bytes.count)] + bytes)
+        }
+        func tlv(_ tag: UInt8, _ content: Data) -> Data {
+            Data([tag]) + derLength(content.count) + content
+        }
+        func oid(_ content: [UInt8]) -> Data {
+            tlv(0x06, Data(content))
         }
 
-        let base64Lines = keyData.base64EncodedString()
-        var pem = pemBlock
+        // SEC1 ECPrivateKey: SEQUENCE { INTEGER 1, OCTET STRING scalar, [0] 曲线 OID }
+        let sec1 = tlv(0x30,
+                       tlv(0x02, Data([0x01]))
+                        + tlv(0x04, Data(scalar))
+                        + tlv(0xA0, oid(curveOID)))
+        // AlgorithmIdentifier: SEQUENCE { OID id-ecPublicKey(1.2.840.10045.2.1), OID curve }
+        let algorithm = tlv(0x30, oid([0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x02, 0x01]) + oid(curveOID))
+        // PrivateKeyInfo: SEQUENCE { INTEGER 0, AlgorithmIdentifier, OCTET STRING sec1 }
+        return tlv(0x30, tlv(0x02, Data([0x01])) + algorithm + tlv(0x04, sec1))
+    }
+
+    /// DER → base64 分行（64 字符/行）→ 包 PEM 头尾写盘（0600 权限）。
+    private static func writePEMFile(der: Data, header: String, footer: String) throws -> URL {
+        let base64 = der.base64EncodedString()
+        var pem = header + "\n"
         var index = 0
         let step = 64
-        while index < base64Lines.count {
-            let end = min(index + step, base64Lines.count)
-            pem += base64Lines[base64Lines.index(base64Lines.startIndex, offsetBy: index)..<base64Lines.index(base64Lines.startIndex, offsetBy: end)] + "\n"
+        while index < base64.count {
+            let end = min(index + step, base64.count)
+            pem += base64[base64.index(base64.startIndex, offsetBy: index)..<base64.index(base64.startIndex, offsetBy: end)] + "\n"
             index = end
         }
-        let footer: String
-        if isEC {
-            footer = "-----END EC PRIVATE KEY-----\n"
-        } else if isRSA {
-            footer = "-----END RSA PRIVATE KEY-----\n"
-        } else {
-            footer = "-----END PRIVATE KEY-----\n"
-        }
-        pem += footer
+        pem += footer + "\n"
 
         let outputURL = URL(fileURLWithPath: NSTemporaryDirectory())
             .appendingPathComponent("sign-key-\(UUID().uuidString).pem")
@@ -267,11 +356,9 @@ final class SigningEngine: SigningEngineProtocol {
                 ofItemAtPath: outputURL.path
             )
         } catch {
-            let reason = "无法写入 PEM 私钥文件 (\(error.localizedDescription))"
-            Logger.error("导出 PEM 私钥失败: \(reason)")
-            throw AppError.signFailed(reason)
+            Logger.error("导出 PEM 私钥失败: 无法写入 PEM 私钥文件 (\(error.localizedDescription))")
+            throw AppError.signFailed("无法写入 PEM 私钥文件 (\(error.localizedDescription))")
         }
-        Logger.info("已导出 PEM 私钥: \(isEC ? "ECC" : isRSA ? "RSA" : "PKCS8")")
         return outputURL
     }
 
@@ -474,12 +561,18 @@ private final class ProgressSmoother {
     /// 签名流程完成时的显式收尾：归正到 100% 并停止蠕动定时器。
     /// zsign 不保证回调 100%（可能 85% 后直接返回），调用方在成功后必须调用，
     /// 否则定时器空转（闭包引用 smoother 造成轻度泄漏 + UI 空转）。
+    /// 注意：sign() 在后台线程被调用（AppState 把签名派发到全局队列），而
+    /// receive/蠕动定时器事件都在主线程执行——complete() 也必须切回主线程，
+    /// 旧版在调用线程直接写 target/displayed/timer，与主线程定时器并发读写
+    /// 属数据竞争。强捕获 self：sign() 返回后由本闭包延续生命周期直到执行完毕。
     func complete() {
-        stopSlither()
-        target = 1.0
-        displayed = 1.0
-        currentPhase = "签名完成"
-        rawHandler(1.0, currentPhase)
+        DispatchQueue.main.async { [self] in
+            stopSlither()
+            target = 1.0
+            displayed = 1.0
+            currentPhase = "签名完成"
+            rawHandler(1.0, currentPhase)
+        }
     }
 
     /// 85% 后启动蠕动定时器：每 0.5s 展示进度 +0.3%，最高逼近 98%。

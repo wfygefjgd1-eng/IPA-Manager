@@ -360,6 +360,17 @@ final class AppState: ObservableObject {
         // 初始阶段（调用方通常在主线程；updateImportProgress 内部仍会切回主线程赋值）
         updateImportProgress(fileName: fileName, index: index, total: total, phase: "准备导入…")
 
+        // 后台闭包要读 importedApps 做同名冲突判断：先取一份主线程快照。
+        // Swift Array 非线程安全——旧实现直接在后台队列遍历 @Published 数组，
+        // 与主线程（删除应用 / 另一条导入完成时 append/替换）并发读写，
+        // 可能读到 CoW 中间态直接崩溃。
+        let importedAppsSnapshot: [AppInfo]
+        if Thread.isMainThread {
+            importedAppsSnapshot = importedApps
+        } else {
+            importedAppsSnapshot = DispatchQueue.main.sync { importedApps }
+        }
+
         DispatchQueue.global(qos: .userInitiated).async {
             // 安全作用域必须在真正执行 I/O 的后台闭包内持有（defer 作用域 = 闭包）：
             // 若在进入队列前就 start/stop，文件 App 外部打开（LSSupportsOpeningDocumentsInPlace
@@ -388,7 +399,8 @@ final class AppState: ObservableObject {
                 let importURL: URL
                 if url.pathExtension.lowercased() == "zip" {
                     // 阶段：解压源压缩包并重新打包成 .ipa（可能耗时最长）。
-                    // 权重 0~60%：convertToIPAIfNeeded 内部按解压字节上报 p*0.6
+                    // 权重 0~60%：convertToIPAIfNeeded 回传裸解压字节进度（0~1），
+                    // 由这里统一映射到整体权重（解析/图标阶段的权重同理集中在本层）
                     self.updateImportProgress(fileName: fileName, index: index, total: total, phase: "解压转换中…", progress: 0)
                     importURL = try self.parser.convertToIPAIfNeeded(fileURL: url, progress: { p in
                         self.updateImportProgress(fileName: fileName, index: index, total: total, phase: "解压转换中…", progress: p * ProgressWeight.unzip)
@@ -408,7 +420,7 @@ final class AppState: ObservableObject {
                     //    出现“元数据与磁盘内容错配”）。
                     var isSameApp = false
                     if FileManager.default.fileExists(atPath: destination.path) {
-                        let existing = self.importedApps.first { $0.path == destination.path }
+                        let existing = importedAppsSnapshot.first { $0.path == destination.path }
                         isSameApp = existing != nil
                             && existing?.bundleID == (try? self.parser.parseAppInfo(fileURL: importURL).bundleID)
                         if !isSameApp {
@@ -479,7 +491,7 @@ final class AppState: ObservableObject {
                 // 已被其它 bundleID 的记录引用（如旧记录指向已丢失的文件、或转换输出恰好
                 // 撞上残留同名文件），把产物改名到唯一后缀，杜绝新旧两条记录指向同一文件。
                 if importURL.path == destination.path {
-                    if let existing = self.importedApps.first(where: { $0.path == destination.path }),
+                    if let existing = importedAppsSnapshot.first(where: { $0.path == destination.path }),
                        existing.bundleID != app.bundleID,
                        FileManager.default.fileExists(atPath: destination.path) {
                         let base = destination.deletingPathExtension().lastPathComponent
@@ -514,7 +526,10 @@ final class AppState: ObservableObject {
                     app.iconPath = stablePath
                 }
                 DispatchQueue.main.async {
-                    if let index = self.importedApps.firstIndex(where: { $0.bundleID == app.bundleID }) {
+                    // bundleID 为空（Info.plist 损坏/顶层非字典等异常）时不按空串去重：
+                    // 否则第二个坏包会静默覆盖上一个坏包的记录且无任何提示
+                    if !app.bundleID.isEmpty,
+                       let index = self.importedApps.firstIndex(where: { $0.bundleID == app.bundleID }) {
                         self.importedApps[index] = app
                     } else {
                         self.importedApps.append(app)
@@ -820,12 +835,6 @@ final class AppState: ObservableObject {
         }
     }
 
-    /// 从解压产物 URL 向上回溯到 bundle-extract-<uuid> 解压目录根：
-    /// 已抽取到 `ExtractedDirectoryCleaner`。
-    private func bundleExtractRoot(from fileURL: URL?) -> URL? {
-        ExtractedDirectoryCleaner.bundleExtractRoot(from: fileURL)
-    }
-
     /// 兜底清理：删除 Certificates/ 下所有 bundle-extract-* 解压目录。
     /// 仅在 extract 抛错（拿不到确切解压目录 URL）时使用；正常路径一律用精确 URL 清理。
     /// 已抽取到 `ExtractedDirectoryCleaner`。
@@ -862,12 +871,12 @@ final class AppState: ObservableObject {
                         url.stopAccessingSecurityScopedResource()
                     }
                 }
-                // 解压目录：无论成功失败都必须清理（内含明文 P12 材料）
+                // 解压目录：importer 现在直接携带精确根目录（bundle-extract-<uuid>），
+                // 不再靠文件 URL 反推
                 var extractDir: URL? = nil
                 do {
                     let content = try importer.extract(from: url)
-                    extractDir = self.bundleExtractRoot(from: content.p12URL)
-                        ?? self.bundleExtractRoot(from: content.profileURL)
+                    extractDir = content.extractDir
                     let moved = try importer.moveToManagedLocation(
                         p12URL: content.p12URL,
                         profileURL: content.profileURL
@@ -946,7 +955,9 @@ final class AppState: ObservableObject {
         relocateProfilePaths()
         relocateImportedAppPaths()
         relocateImportedAppIconPaths()
-        // 孤儿清扫：清理不再被任何记录引用的解析临时目录（避免 Extracted/ 无限膨胀）
+        // 孤儿清扫：清理不再被任何记录引用的解析临时目录（避免 Extracted/ 无限膨胀）。
+        // 上次会话的残留可能达数 GB，主线程同步递归删除会卡启动数秒——丢后台执行
+        // （清扫与首次 UI 无依赖；引用列表在本方法内先做主线程快照）。
         sweepOrphanExtractDirs()
 
         // 选中项不持久化，恢复后必须重新挑选，避免首页显示“未选择证书”
@@ -1118,9 +1129,23 @@ final class AppState: ObservableObject {
     }
 
     func addCertificate(_ certificate: CertificateInfo) {
-        certificates.append(certificate)
-        if selectedCertificate == nil {
-            selectedCertificate = certificates.first { $0.status == .valid } ?? certificate
+        // 同一证书（同一 keychainIdentifier）重复导入时更新既有记录而非追加：
+        // 两条记录指向同一 Keychain 条目时，删除其中一条会把另一条的私钥与密码
+        // 一并删除（deleteCertificate 按共享 identifier 清理），另一条沦为死记录，
+        // 选中它签名时报"未找到私钥数据"且用户无从理解。
+        if let identifier = certificate.keychainIdentifier,
+           let index = certificates.firstIndex(where: { $0.keychainIdentifier == identifier }) {
+            let replacedID = certificates[index].id
+            certificates[index] = certificate
+            // 被替换的记录若是当前默认选中项，把选中项同步指向新记录
+            if selectedCertificate?.id == replacedID {
+                selectedCertificate = certificate
+            }
+        } else {
+            certificates.append(certificate)
+            if selectedCertificate == nil {
+                selectedCertificate = certificates.first { $0.status == .valid } ?? certificate
+            }
         }
         saveState()
     }
@@ -1219,8 +1244,13 @@ final class AppState: ObservableObject {
     /// 启动时孤儿清扫：删除 Extracted/ 下不被任何记录引用的解析目录
     /// （parseAppInfo 每次解压都生成 <baseName>-<UUID> 临时目录，路径会随 UUID 变化，
     /// 无法像 Icons/ 图标那样重定位，必须定期清理避免磁盘无限膨胀）。
-    /// 已抽取到 `ExtractedDirectoryCleaner`。
+    /// 已抽取到 `ExtractedDirectoryCleaner`。残留目录可能达数 GB，递归删除较慢，
+    /// 丢到后台执行；引用列表先在主线程快照，避免清扫期间数组被并发修改。
     private func sweepOrphanExtractDirs() {
-        ExtractedDirectoryCleaner.sweepOrphanExtractDirs(importedApps: importedApps, installedApps: installedApps)
+        let imported = importedApps
+        let installed = installedApps
+        DispatchQueue.global(qos: .utility).async {
+            ExtractedDirectoryCleaner.sweepOrphanExtractDirs(importedApps: imported, installedApps: installed)
+        }
     }
 }

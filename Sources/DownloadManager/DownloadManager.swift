@@ -15,9 +15,21 @@ final class DownloadManager: NSObject {
     private let store = UserDefaultsStore()
 
     /// 同一任务自动重试的次数上限：校验失败（HTML 错误页 / 截断）时最多自动重下 1 次，避免死循环。
+    /// 重试计数持久化在 DownloadTask.retryCount（跨会话累计，超 24 小时自动重置）。
+    /// 旧实现用进程内字典计数——重启即清零，失效链接（返回 HTML 错误页）每个新会话
+    /// 都会重新获得一次"整包下载错误页 + 自动重下"的机会，跨会话限制形同虚设。
     private let maxRetryCount = Limits.maxRetryCount
-    /// 每个任务已自动重试的次数（仅进程内有效；恢复的任务没有活跃下载，不会触发重试）。
-    private var retryCounts: [UUID: Int] = [:]
+
+    /// 任务当前生效的重试计数：超过 24 小时未重试则重新计数
+    ///（对应 DownloadTask.lastRetryDate "24 小时自动重置" 的设计语义）。
+    private func effectiveRetryCount(for task: DownloadTask) -> Int {
+        guard task.retryCount > 0 else { return 0 }
+        if let last = task.lastRetryDate,
+           Date().timeIntervalSince(last) >= 24 * 60 * 60 {
+            return 0
+        }
+        return task.retryCount
+    }
 
     var onDownloadComplete: ((URL) -> Void)?
 
@@ -113,7 +125,6 @@ final class DownloadManager: NSObject {
             }
         }
         taskModels.removeValue(forKey: id)
-        retryCounts.removeValue(forKey: id)
         persistTasks()
     }
 
@@ -188,27 +199,41 @@ final class DownloadManager: NSObject {
     /// 在 Downloads 目录查找该任务的已完成产物。
     /// 命中条件：同名文件，或「基础名-8位十六进制.扩展名」（finishDownload 的同名唯一化产物）。
     /// 用于还原被中断/重试残留成 .downloading 但其实已下载完成的任务。
+    /// 大小校验：中断前已通过 didWriteData 持久化过总大小时，文件大小必须一致才认领——
+    /// 不同任务同名（GitHub release 泛型名极常见）时，旧实现会把别的任务的产物
+    /// 错认领为本任务完成态（resumeData 被丢弃、显示的产物内容张冠李戴）。
     private func existingCompletedFile(for task: DownloadTask) -> URL? {
         guard !task.fileName.isEmpty else { return nil }
         let dir = AppFileManager.shared.directoryURL(.downloads)
         guard let files = try? FileManager.default.contentsOfDirectory(
-            at: dir, includingPropertiesForKeys: nil
+            at: dir, includingPropertiesForKeys: [.fileSizeKey]
         ) else { return nil }
         for file in files {
             let name = file.lastPathComponent
+            var matched: URL?
             if name == task.fileName {
-                return file
-            }
-            let base = (task.fileName as NSString).deletingPathExtension
-            let ext = (task.fileName as NSString).pathExtension
-            // unique 后缀为 UUID().uuidString.prefix(8)（8 位 hex）
-            let prefix = "\(base)-"
-            if name.hasPrefix(prefix) && name.hasSuffix(".\(ext)") {
-                let mid = name.dropFirst(prefix.count).dropLast(ext.count + 1)
-                if mid.count == 8, mid.allSatisfy({ $0.isHexDigit }) {
-                    return file
+                matched = file
+            } else {
+                let base = (task.fileName as NSString).deletingPathExtension
+                let ext = (task.fileName as NSString).pathExtension
+                // unique 后缀为 UUID().uuidString.prefix(8)（8 位 hex）
+                let prefix = "\(base)-"
+                if name.hasPrefix(prefix) && name.hasSuffix(".\(ext)") {
+                    let mid = name.dropFirst(prefix.count).dropLast(ext.count + 1)
+                    if mid.count == 8, mid.allSatisfy({ $0.isHexDigit }) {
+                        matched = file
+                    }
                 }
             }
+            guard let candidate = matched else { continue }
+            if task.totalBytes > 0 {
+                let size = (try? candidate.resourceValues(forKeys: [.fileSizeKey]))?.fileSize ?? 0
+                guard Int64(size) == task.totalBytes else {
+                    Logger.info("同名文件大小与任务总大小不符，跳过认领: \(name)")
+                    continue
+                }
+            }
+            return candidate
         }
         return nil
     }
@@ -332,13 +357,11 @@ final class DownloadManager: NSObject {
                 self.persistTasks()
 
                 if updated.status == .completed {
-                    self.retryCounts.removeValue(forKey: id)
                     self.onDownloadComplete?(destination)
-                } else if retryableFailure && (self.retryCounts[id] ?? 0) < self.maxRetryCount {
+                } else if retryableFailure,
+                          self.effectiveRetryCount(for: updated) < self.maxRetryCount {
                     Logger.warning("下载内容校验失败，自动重试一次: \(updated.fileName)")
                     self.retryDownload(id: id, model: updated)
-                } else {
-                    self.retryCounts.removeValue(forKey: id)
                 }
             }
         }
@@ -353,16 +376,13 @@ final class DownloadManager: NSObject {
             failed.error = "无效 URL"
             taskModels[id] = failed
             tasks.removeValue(forKey: id)
-            retryCounts.removeValue(forKey: id)
             persistTasks()
             return
         }
 
-        retryCounts[id, default: 0] += 1
-
         var retrying = model
-        // 重试计数现在使用 DownloadTask.retryCount 持久化字段，不再依赖内存 retryCounts
-        retrying.retryCount = model.retryCount + 1
+        // 重试计数持久化在 DownloadTask.retryCount（跨会话累计，超 24 小时自动重置）
+        retrying.retryCount = effectiveRetryCount(for: model) + 1
         retrying.lastRetryDate = Date()
         retrying.status = .downloading
         retrying.error = nil
@@ -474,7 +494,10 @@ extension DownloadManager: URLSessionDownloadDelegate {
         didFinishDownloadingTo location: URL
     ) {
         guard let id = taskID(for: downloadTask) else { return }
-        let model = taskModels[id] ?? DownloadTask()
+        // 幽灵任务守卫（与 didCompleteWithError 的守卫对称）：任务已被主动删除时
+        // 忽略回调，避免用占位模型（fileName 为空）把临时文件移动成 Downloads/download
+        // 垃圾文件（临时文件由 URLSession 回收）。
+        guard let model = taskModels[id] else { return }
         finishDownload(id: id, model: model, location: location)
     }
 
@@ -508,8 +531,8 @@ extension DownloadManager: URLSessionDownloadDelegate {
 
         // 断点续传失败整包兜底：续传最常见的失败是服务器不支持 Range / 会话失效 /
         // resumeData 损坏，此时旧 resumeData 已"毒化"，恢复时必然再次失败。
-        // 未超重试上限时清空 resumeData 并整包重下（复用 retryDownload，内部
-        // retryCounts 计数），防止死循环；超限则按普通失败收尾。
+        // 未超重试上限时清空 resumeData 并整包重下（复用 retryDownload，计数持久化
+        // 在 DownloadTask.retryCount），防止死循环；超限则按普通失败收尾。
         // 注意：NSURLErrorCannotConnectToHost(-3004) / NSURLErrorTimedOut(-1001) /
         // NSURLErrorNetworkConnectionLost(-1005) 等都是网络瞬态错误，**不代表**
         // resumeData 无效——直接重试 URLSession 即可，盲目整包重下会浪费时间/流量。
@@ -519,7 +542,7 @@ extension DownloadManager: URLSessionDownloadDelegate {
         ]
         if let resumeData = updated.resumeData, !resumeData.isEmpty,
            resumeRelatedCodes.contains(nsError.code),
-           (retryCounts[id] ?? 0) < maxRetryCount {
+           effectiveRetryCount(for: updated) < maxRetryCount {
             updated.resumeData = nil
             Logger.warning("断点续传失败(\(nsError.code))，整包重新下载: \(updated.fileName)")
             taskModels[id] = updated
@@ -533,7 +556,6 @@ extension DownloadManager: URLSessionDownloadDelegate {
         Logger.error("下载失败: \(error.localizedDescription)")
         taskModels[id] = updated
         tasks.removeValue(forKey: id)
-        retryCounts.removeValue(forKey: id)
         persistTasks()
     }
 }

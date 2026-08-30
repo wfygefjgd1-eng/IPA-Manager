@@ -38,12 +38,21 @@ struct AnyCodable: Codable, Hashable {
         var container = encoder.singleValueContainer()
         switch value {
         case is NSNull: try container.encodeNil()
-        case let bool as Bool: try container.encode(bool)
-        case let int as Int: try container.encode(int)
-        case let uint as UInt: try container.encode(uint)
-        case let int64 as Int64: try container.encode(int64)
-        case let uint64 as UInt64: try container.encode(uint64)
-        case let double as Double: try container.encode(double)
+        case let num as NSNumber:
+            // Foundation 桥接中任意 NSNumber 的 `as? Bool` 都会成功（按 boolValue
+            // 转换）——旧实现把 Bool 分支放在数值之前，PropertyListSerialization
+            // 解出的数值 2 会被编码成 true、1.5 编码成 true（值丢失、类型改变）。
+            // 用 CFBoolean 类型判断精确区分布尔；数值再按 objCType 保真编码。
+            if CFGetTypeID(num) == CFBooleanGetTypeID() {
+                try container.encode(num.boolValue)
+            } else {
+                switch String(cString: num.objCType) {
+                case "i", "l", "q": try container.encode(num.intValue)
+                case "I", "L", "Q": try container.encode(num.uintValue)
+                case "f": try container.encode(num.floatValue)
+                default: try container.encode(num.doubleValue)
+                }
+            }
         case let string as String: try container.encode(string)
         case let array as [Any]: try container.encode(array.map(AnyCodable.init))
         case let dict as [String: Any]: try container.encode(dict.mapValues(AnyCodable.init))
@@ -79,22 +88,21 @@ struct AnyCodable: Codable, Hashable {
     }
 
     func hash(into hasher: inout Hasher) {
-        // 与 == 保持一致：数值统一按 NSNumber 哈希，字符串/布尔/数组/字典各自哈希
+        // 与 == 的数值语义（NSNumber isEqualToNumber 跨类型数值相等）保持一致：
+        // 统一按 doubleValue 哈希（1 / 1.0 / true 哈希一致）。NSNumber.hash 不保证
+        // 跨类型一致，等值对象可能哈希不同，违反 Hashable 不变式。
         if let number = value as? NSNumber {
-            hasher.combine(number)
+            hasher.combine(number.doubleValue)
         } else if let string = value as? String {
             hasher.combine(string)
-        } else if let bool = value as? Bool {
-            hasher.combine(bool)
         } else if let array = value as? [Any] {
             hasher.combine(array.map(AnyCodable.init))
         } else if let dict = value as? [String: Any] {
-            var h = Hasher()
-            for (k, v) in dict {
-                h.combine(k)
-                h.combine(AnyCodable(v))
+            // 按键排序后 combine：字典迭代顺序不定，相等的两个字典必须产生相同哈希
+            for key in dict.keys.sorted() {
+                hasher.combine(key)
+                hasher.combine(AnyCodable(dict[key] ?? NSNull()))
             }
-            hasher.combine(h.finalize())
         } else {
             hasher.combine(ObjectIdentifier(NSNull.self))
         }

@@ -108,7 +108,9 @@ final class IPAParser {
     }
 
     private func isInsideAppBundle(_ url: URL) -> Bool {
-        url.pathComponents.contains { $0.hasSuffix(".app") }
+        // 小写比较：与 findEmbeddedIPA / AppState.classifyArchivedContent 一致，
+        // 兼容 Payload/MyApp.APP 大写扩展名
+        url.pathComponents.contains { $0.lowercased().hasSuffix(".app") }
     }
 
     /// 校验 .app 内 Info.plist 存在并构造 ParsedPackage（普通 .app 与内嵌 .ipa 解析共用统一出口）。
@@ -157,11 +159,11 @@ final class IPAParser {
         let ext = fileURL.pathExtension.lowercased()
         if ext == "ipa" { return fileURL }
 
-        // 解压源压缩包并定位 .app（找不到会抛出“未找到 .app 应用包”）
-        let package = try parse(fileURL: fileURL, progress: { p in
-            // 解压阶段占整体 0~60%（60% 之后为复制/解析/图标）
-            progress?(p * ProgressWeight.convertUnzipWeight)
-        })
+        // 解压源压缩包并定位 .app（找不到会抛出“未找到 .app 应用包”）。
+        // 进度回传裸值（0~1 解压字节进度），由调用方统一映射整体权重——
+        // 旧实现在这里乘一次 0.6、调用方（AppState.importFile）又乘一次 0.6，
+        // zip 导入的解压阶段最多只显示到 36% 就长期停滞。
+        let package = try parse(fileURL: fileURL, progress: progress)
 
         // 构造干净的临时目录，只包含 Payload/<应用名>.app，
         // 保证打包出的 .ipa 无论源结构（Payload/、Archive/ 或裸 .app）都合法
@@ -189,6 +191,10 @@ final class IPAParser {
             }
         }
         try zipManager.zip(folderURL: stagingRoot, outputURL: outputURL)
+        // 转换完成后源解压目录（Extracted/<base>-<UUID>，含外层 zip 全部内容与
+        // 内嵌 ipa 原件，轻松数百 MB）已无用：成功路径就地清理，不再留到下次
+        // 冷启动才被孤儿清扫（zip 导入的峰值磁盘占用直接降一半以上）。
+        try? fileManager.removeItem(at: package.rootURL)
         return outputURL
     }
 
@@ -203,7 +209,9 @@ final class IPAParser {
             guard let items = try? fileManager.contentsOfDirectory(at: candidate, includingPropertiesForKeys: nil) else {
                 continue
             }
-            if let app = items.first(where: { $0.pathExtension == "app" }) {
+            // 统一小写比较：部分 Windows 打包工具产出 Payload/MyApp.APP 大写扩展名，
+            // 大小写敏感匹配会与分类器（lowercased）结果自相矛盾，报"未找到 .app"
+            if let app = items.first(where: { $0.pathExtension.lowercased() == "app" }) {
                 return app
             }
         }

@@ -125,17 +125,25 @@ final class Installer: Installing {
                     Logger.info("公网 manifest: \(finalManifestURL.absoluteString)")
                 }
                 UIApplication.shared.open(installURL) { success in
-                    if !success {
+                    if success {
+                        // 记录"安装已发起"活动：回前台/保活超时据此识别安装仍在进行，
+                        // 不停服务器（用户在系统安装弹窗停留时切回 App 是常见操作）
+                        LocalInstallServer.shared.noteInstallOpened()
+                    } else {
                         Logger.error("无法打开 itms-services 链接")
+                        // 后台失败同步抛不回去，补一条用户可见反馈
+                        AppState.shared.showToast("安装失败：无法打开安装链接")
                         self?.stopServer()
                     }
                 }
             }
         } catch {
             // 后台失败无法在此时同步抛给调用方（调用方在异步完成前已显示"安装请求已发出"），
-            // 停掉本地服务器并记录详细错误，避免 NWListener/音频保活残留。
+            // 停掉本地服务器并记录详细错误，避免 NWListener/音频保活残留；
+            // 同时用全局 toast 补一条用户可见反馈，避免"点了安装毫无反应"。
             LocalInstallServer.shared.stop()
             Logger.error("本地安装失败: \(error.localizedDescription)")
+            AppState.shared.showToast("安装失败：\(error.localizedDescription)")
         }
     }
 

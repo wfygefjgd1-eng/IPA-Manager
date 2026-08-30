@@ -83,12 +83,18 @@ struct DownloadsView: View {
                     BrowserView()
                 }
             }
-            .sheet(isPresented: $showBookmarks) {
+            .sheet(isPresented: $showBookmarks, onDismiss: {
+                // 点书签 → 关书签 sheet → onDismiss 里再开浏览器 sheet。
+                // 旧实现在书签回调里同时 showBookmarks=false + showBrowser=true：
+                // UIKit 不允许同一 presenter 在 dismiss 动画进行中再 present，
+                // 会间歇性丢掉第二次呈现（书签关了浏览器没出现）。
+                if initialBrowserURL != nil {
+                    showBrowser = true
+                }
+            }) {
                 BookmarkView { url in
-                    // 点书签 → 关闭书签 sheet → 记录待打开 URL → 打开浏览器
                     initialBrowserURL = url
                     showBookmarks = false
-                    showBrowser = true
                 }
             }
             .sheet(item: $selectedApp) { app in
@@ -696,6 +702,10 @@ struct DownloadsView: View {
     }
 
     private func refreshTasks() {
+        // sheet 覆盖期间暂停轮询刷新：sheet 不会触发被覆盖视图的 onDisappear，
+        // 浏览器/详情页停留的整个期间旧实现仍每 0.5s 做快照排序 + 全量比较，
+        // 有活动下载时还在背后整表重绘。sheet 关闭后下一轮 tick 自动恢复刷新。
+        if showBrowser || showBookmarks || selectedApp != nil { return }
         // 排序保证顺序稳定；仅当快照确实变化时才替换数组，避免 0.5s 轮询造成无谓重绘
         let snapshot = DownloadManager.shared.snapshotTasks()
             .sorted { $0.createdAt < $1.createdAt }
@@ -705,6 +715,7 @@ struct DownloadsView: View {
     }
 
     private func startTimer() {
+        stopTimer()
         timer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { _ in
             refreshTasks()
         }

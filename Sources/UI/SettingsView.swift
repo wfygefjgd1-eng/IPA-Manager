@@ -254,12 +254,20 @@ struct SettingsView: View {
 
     /// 把诊断报告写入临时 .txt 文件再分享（直接分享 String 时，
     /// 系统"存储到文件"会保存成 NSKeyedArchiver 二进制 plist，无法阅读）。
+    /// 每次导出先删除上一次的临时报告：旧实现每次新建带时间戳的文件且从不删除，
+    /// 多次导出会在 tmp 目录无限堆积。
+    private static var lastReportURL: URL?
+
     private func prepareReportForSharing() {
         let report = Logger.diagnosticsReport()
+        if let last = Self.lastReportURL {
+            try? FileManager.default.removeItem(at: last)
+        }
         let tempURL = FileManager.default.temporaryDirectory
             .appendingPathComponent("IPA-Manager-诊断报告-\(Int(Date().timeIntervalSince1970)).txt")
         do {
             try report.write(to: tempURL, atomically: true, encoding: .utf8)
+            Self.lastReportURL = tempURL
             // 写成功后赋值为非 nil 才弹 sheet，避免分享空内容
             shareItem = ShareItem(url: tempURL)
         } catch {

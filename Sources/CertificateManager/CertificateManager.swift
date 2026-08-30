@@ -91,7 +91,17 @@ final class CertificateManager {
         guard let data = self.readP12Data(identifier: identifier) else {
             throw AppError.certificateInvalid("未找到私钥数据")
         }
-        try data.write(to: url)
+        do {
+            try data.write(to: url, options: .atomic)
+            // 与 SigningEngine 的 PEM 私钥文件一致：0600 仅当前用户可读写
+            //（私钥材料不因导出路径不同而放宽权限）
+            try? FileManager.default.setAttributes(
+                [.posixPermissions: 0o600],
+                ofItemAtPath: url.path
+            )
+        } catch {
+            throw AppError.certificateInvalid("私钥导出失败 (\(error.localizedDescription))")
+        }
     }
 
     func readPassword(for certificate: CertificateInfo) -> String? {
@@ -320,6 +330,11 @@ final class CertificateManager {
             let (start, expire) = parseValidity(for: cert)
             info.startDate = start
             info.expireDate = expire
+            // 回退路径补齐 Team ID：OpenSSL 路径由桥接层从证书 OU 取，这里从证书
+            // subject 的 OU（OID 2.5.4.11）解析。缺失会让 SigningEngine 的 Team ID
+            // 匹配前置校验被静默架空（两侧都非空才比对，空 teamID 直接放行），
+            // Team 不匹配的证书+描述文件组合一路签到底，产物安装失败且无明确提示。
+            info.teamID = Self.parseTeamID(for: cert)
         }
 
         if !info.teamID.isEmpty {
@@ -333,6 +348,62 @@ final class CertificateManager {
         // iOS 无 SecCertificateCopyValues（macOS only），改为从证书 DER 中解析有效期
         let data = SecCertificateCopyData(certificate) as Data
         return Self.parseValidity(fromDER: data)
+    }
+
+    /// 从 X.509 证书 subject 的 OU 字段（OID 2.5.4.11）提取 Team ID
+    /// （Apple 签发的分发证书 subject 形如 CN=…, O=…, OU=<TEAMID>）。
+    private static func parseTeamID(for certificate: SecCertificate) -> String {
+        let data = SecCertificateCopyData(certificate) as Data
+        var offset = 0
+        guard let top = readDERElement(data, at: &offset), top.tag == 0x30 else { return "" }
+        let topContent = top.content
+
+        var inner = 0
+        // [0] version（可选）
+        if inner < topContent.count, topContent[topContent.startIndex + inner] == 0xA0 {
+            _ = readDERElement(topContent, at: &inner)
+        }
+        // INTEGER serial / SEQUENCE signatureAlgorithm / SEQUENCE issuer / SEQUENCE validity
+        guard readDERElement(topContent, at: &inner) != nil else { return "" }
+        guard readDERElement(topContent, at: &inner) != nil else { return "" }
+        guard readDERElement(topContent, at: &inner) != nil else { return "" }
+        guard readDERElement(topContent, at: &inner) != nil else { return "" }
+        // SEQUENCE subject（tbsCertificate 中 validity 的下一个元素）
+        guard let subject = readDERElement(topContent, at: &inner), subject.tag == 0x30 else { return "" }
+        return Self.parseOU(fromRDNSequence: subject.content)
+    }
+
+    /// 在 RDNSequence（SEQUENCE OF SET { SEQUENCE { OID, value } }）中查找 OU 的值。
+    /// 解析失败时强制推进游标，杜绝畸形 DER 导致的死循环。
+    private static func parseOU(fromRDNSequence rdnData: Data) -> String {
+        var rdnOffset = 0
+        while rdnOffset < rdnData.count {
+            let rdnBefore = rdnOffset
+            guard let set = readDERElement(rdnData, at: &rdnOffset), set.tag == 0x31 else {
+                rdnOffset = max(rdnOffset, rdnBefore + 1)
+                continue
+            }
+            var attrOffset = 0
+            while attrOffset < set.content.count {
+                let attrBefore = attrOffset
+                guard let attribute = readDERElement(set.content, at: &attrOffset), attribute.tag == 0x30 else {
+                    attrOffset = max(attrOffset, attrBefore + 1)
+                    continue
+                }
+                var fieldOffset = 0
+                if let oidElement = readDERElement(attribute.content, at: &fieldOffset), oidElement.tag == 0x06,
+                   let value = readDERElement(attribute.content, at: &fieldOffset) {
+                    // OU = 2.5.4.11 → DER 编码内容字节 55 04 0B
+                    if oidElement.content == Data([0x55, 0x04, 0x0B]) {
+                        if let text = String(data: value.content, encoding: .utf8)
+                            ?? String(data: value.content, encoding: .ascii) {
+                            return text.trimmingCharacters(in: .whitespaces)
+                        }
+                    }
+                }
+            }
+        }
+        return ""
     }
 
     /// 最小 DER 解析：从 X.509 证书中提取 notBefore / notAfter（UTCTime / GeneralizedTime）

@@ -48,17 +48,23 @@ final class ProvisioningManager {
         let canonicalUUID = UUID(uuidString: info.uuid)?.uuidString ?? UUID().uuidString
         let destination = profilesDir.appendingPathComponent("profile-\(canonicalUUID).mobileprovision")
 
+        // 与 AppState.importFile 同 bundleID 覆盖相同的防丢失模式：先复制到临时名、
+        // 完整落盘后再换位。copyItem 是"先删后拷"——同一描述文件（同 UUID）重新
+        // 导入时若删除后复制失败，旧文件已丢、既有记录 path 悬空。
+        let tempURL = profilesDir.appendingPathComponent(".tmp-\(UUID().uuidString)-\(destination.lastPathComponent)")
         do {
-            // copyItem 内部会先移除同名目标再复制，天然处理文件名冲突
-            try AppFileManager.shared.copyItem(from: url, to: destination)
+            try AppFileManager.shared.copyItem(from: url, to: tempURL)
         } catch {
-            // 首次复制失败：清理可能残留的目标后重试一次
-            try? AppFileManager.shared.deleteItem(at: destination)
-            do {
-                try AppFileManager.shared.copyItem(from: url, to: destination)
-            } catch {
-                throw AppError.profileInvalid("描述文件复制到 Documents/Profiles 失败: \(error.localizedDescription)")
-            }
+            try? AppFileManager.shared.deleteItem(at: tempURL)
+            throw AppError.profileInvalid("描述文件复制到 Documents/Profiles 失败: \(error.localizedDescription)")
+        }
+        try? AppFileManager.shared.deleteItem(at: destination)
+        do {
+            try AppFileManager.shared.moveItem(from: tempURL, to: destination)
+        } catch {
+            // 换位失败（极罕见）：尽力把新文件恢复到目标位后抛错
+            try? AppFileManager.shared.moveItem(from: tempURL, to: destination)
+            throw AppError.profileInvalid("描述文件替换失败: \(error.localizedDescription)")
         }
         return destination.path
     }
@@ -84,9 +90,7 @@ final class ProvisioningManager {
         }
 
         let entitlements = plist["Entitlements"] as? [String: Any] ?? [:]
-        if let entitlementsDict = entitlements as? [String: Any] {
-            info.entitlements = entitlementsDict.mapValues { AnyCodable($0) }
-        }
+        info.entitlements = entitlements.mapValues { AnyCodable($0) }
 
         // Application identifier lives in Entitlements (may be missing at top level)
         if let appID = entitlements["application-identifier"] as? String {

@@ -62,8 +62,10 @@ struct AppIconView: View {
         guard let source = CGImageSourceCreateWithURL(URL(fileURLWithPath: path) as CFURL, nil) else {
             return nil
         }
-        // 目标像素尺寸 = pt * scale，留一点余量（*2）确保缩放后依然清晰
-        let pixelSize = Int(targetSize * scale * 2)
+        // 目标像素尺寸 = pt * scale：配合 .resizable() 已经足够清晰。
+        // 旧实现再 *2 过采样（详情页 80pt@3x → 480px 位图），缓存 cost 直接翻倍，
+        // 在 countLimit=100 + 20MB 上限下等于白占一半缓存。
+        let pixelSize = Int(targetSize * scale)
         let options: [CFString: Any] = [
             kCGImageSourceCreateThumbnailFromImageAlways: true,
             kCGImageSourceCreateThumbnailWithTransform: true,

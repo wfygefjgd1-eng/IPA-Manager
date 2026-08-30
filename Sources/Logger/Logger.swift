@@ -19,20 +19,6 @@ enum Logger {
     // os_unfair_lock 显式标 _checking(Foundation,Swift) 即可在 Swift 6 strict-concurrency
     // 下安全使用。
     private static let lock = OSAllocatedUnfairLock()
-    // Static cached formatters: creating DateFormatter each diagnosticsReport call is expensive
-    // and not thread-safe to create on hot path; cache as static lets.
-    private static let cachedTimestampFormatter: DateFormatter = {
-        let f = DateFormatter()
-        f.dateFormat = "yyyy-MM-dd HH:mm:ss"
-        f.locale = Locale(identifier: "en_US_POSIX")
-        return f
-    }()
-    private static let cachedTimeFormatter: DateFormatter = {
-        let f = DateFormatter()
-        f.dateFormat = "HH:mm:ss"
-        f.locale = Locale(identifier: "en_US_POSIX")
-        return f
-    }()
     private(set) static var recentEntries: [LogEntry] = []
     /// 失败与异常专区：只收集 ERROR / warning（DEFAULT）等非 INFO/DEBUG 的消息，供诊断报告使用。
     private(set) static var failureEntries: [LogEntry] = []
@@ -83,14 +69,16 @@ enum Logger {
         log(message, level: .debug, file: file, line: line)
     }
 
-    /// 记录一条失败信息（等价于 error 级记录，同时进入普通日志与失败专区）。
-    static func recordFailure(_ message: String, file: String = #file, line: Int = #line) {
-        log(message, level: .error, file: file, line: line)
-    }
-
     static func diagnosticsReport() -> String {
-        let timestampFormatter = Self.cachedTimestampFormatter
-        let timeFormatter = Self.cachedTimeFormatter
+        // 诊断报告导出是低频操作（设置页手动触发）：在这里新建局部 formatter，
+        // 不与其它路径共享 DateFormatter 实例（DateFormatter 非线程安全，
+        // 共享实例在报告生成与并发日志写入之间是潜伏的数据竞争）。
+        let timestampFormatter = DateFormatter()
+        timestampFormatter.dateFormat = "yyyy-MM-dd HH:mm:ss"
+        timestampFormatter.locale = Locale(identifier: "en_US_POSIX")
+        let timeFormatter = DateFormatter()
+        timeFormatter.dateFormat = "HH:mm:ss"
+        timeFormatter.locale = Locale(identifier: "en_US_POSIX")
 
         let device = UIDevice.current
         let bundle = Bundle.main.infoDictionary

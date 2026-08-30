@@ -35,21 +35,65 @@ struct ContentView: View {
                 }
                 .tag(4)
         }
-        // 全局轻提示：外部打开文件失败、后台操作结果等无专属 UI 的场景
-        // Overlay竞争修复：与HomeView的进度卡片同处.bottom对齐，用更高zIndex保证toast始终在最上层
+        // 统一浮层：导入进度卡与全局 toast 同挂一个容器、垂直排布。
+        // 旧实现分挂 ContentView / HomeView 两个容器还互设 zIndex——zIndex 只在
+        // 同级兄弟间排序，跨容器必然叠压（批量导入时黑色胶囊直接叠在一起）。
         .overlay(alignment: .bottom) {
-            if let message = appState.toastMessage {
-                Text(message)
-                    .font(.footnote)
-                    .padding(.horizontal, 16)
-                    .padding(.vertical, 10)
-                    .background(Capsule().fill(Color.black.opacity(0.8)))
-                    .foregroundColor(.white)
-                    .padding(.bottom, 20)
-                    .transition(.opacity.combined(with: .move(edge: .bottom)))
-                    .zIndex(10)
+            VStack(spacing: 8) {
+                if let progress = appState.importProgress {
+                    importProgressCard(progress)
+                }
+                if let message = appState.toastMessage {
+                    Text(message)
+                        .font(.footnote)
+                        .padding(.horizontal, 16)
+                        .padding(.vertical, 10)
+                        .background(Capsule().fill(Color.black.opacity(0.8)))
+                        .foregroundColor(.white)
+                        .padding(.bottom, 12)
+                        .transition(.opacity.combined(with: .move(edge: .bottom)))
+                }
             }
+            .padding(.bottom, 12)
         }
         .animation(.easeInOut(duration: 0.25), value: appState.toastMessage)
+        .animation(.easeInOut(duration: 0.25), value: appState.importProgress)
+    }
+
+    /// 导入进度卡片：黑色胶囊 + 转圈/内圈百分比 + 文件名 + 阶段文字 + i/N。
+    /// 整体百分比 0~1 由 AppState 各阶段加权后给出，解压阶段随字节数实时增长。
+    private func importProgressCard(_ progress: ImportProgress) -> some View {
+        HStack(spacing: 12) {
+            ZStack {
+                // 转圈 + 内圈百分比：双重反馈，进度直观
+                ProgressView()
+                    .progressViewStyle(CircularProgressViewStyle(tint: .white))
+                    .opacity(0.35)
+                Text("\(Int((progress.progress * 100).rounded()))%")
+                    .font(.system(size: 10, weight: .bold))
+                    .foregroundColor(.white)
+            }
+            .frame(width: 40, height: 40)
+            VStack(alignment: .leading, spacing: 3) {
+                Text("正在导入 \(progress.fileName)")
+                    .font(.footnote)
+                    .fontWeight(.medium)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                if progress.totalCount > 1 {
+                    Text("正在导入 \(progress.currentIndex)/\(progress.totalCount) · \(progress.phase)")
+                        .font(.caption2)
+                        .opacity(0.85)
+                } else {
+                    Text("\(progress.phase) \(Int((progress.progress * 100).rounded()))%")
+                        .font(.caption2)
+                        .opacity(0.85)
+                }
+            }
+            .foregroundColor(.white)
+        }
+        .padding(.horizontal, 16)
+        .padding(.vertical, 12)
+        .background(Capsule().fill(Color.black.opacity(0.8)))
     }
 }
