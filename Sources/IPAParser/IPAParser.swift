@@ -190,7 +190,15 @@ final class IPAParser {
                 outputURL = ipaDir.appendingPathComponent("\(baseName)-\(UUID().uuidString.prefix(8)).ipa")
             }
         }
-        try zipManager.zip(folderURL: stagingRoot, outputURL: outputURL)
+        // 打包中途失败（磁盘写满/被杀）会残留部分写成的 .ipa：就地清理半成品。
+        // IPA 目录没有任何孤儿清扫，且失败后再次导入会因 exists 检查改用唯一
+        // 后缀名，旧半成品永远不会被覆盖或引用。
+        do {
+            try zipManager.zip(folderURL: stagingRoot, outputURL: outputURL)
+        } catch {
+            try? fileManager.removeItem(at: outputURL)
+            throw error
+        }
         // 转换完成后源解压目录（Extracted/<base>-<UUID>，含外层 zip 全部内容与
         // 内嵌 ipa 原件，轻松数百 MB）已无用：成功路径就地清理，不再留到下次
         // 冷启动才被孤儿清扫（zip 导入的峰值磁盘占用直接降一半以上）。

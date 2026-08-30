@@ -224,19 +224,29 @@ struct HomeView: View {
         completion: (() -> Void)? = nil
     ) {
         let isZip = (url.pathExtension.lowercased() == "zip")
-        // progressContext 传入序号/总数，导入进度卡片据此显示 "正在导入 i/N"
-        appState.importFile(from: url, progressContext: (index: index, total: total)) { importResult in
+        // progressContext 传入序号/总数，导入进度卡片据此显示 "正在导入 i/N"；
+        // autoSign 透传"仅导入，不自动安装"的用户选择（AppState 统一出口按它决定
+        // 是否入队自动签名——只靠本 completion 拦截会被无视）
+        appState.importFile(from: url, progressContext: (index: index, total: total), autoSign: batchAutoSignAllowed) { importResult in
             // 无论成功/失败/提前 return 都通知串行导入器继续下一个文件
             defer { completion?() }
             switch importResult {
             case .success(let app):
-                importSuccessCount += 1
-                // 导入成功且是应用（bundleID 非空）
+                // 无法识别 Bundle ID 的坏包：多选模式计入失败并走汇总（与其它失败
+                // 一致，不逐个弹 alert 打断）；单文件模式单独说明
                 guard !app.bundleID.isEmpty else {
-                    alertMessage = "导入成功，但无法识别该应用的 Bundle ID"
-                    showAlert = true
+                    importFailureCount += 1
+                    if pendingImportCount > 1 {
+                        if importSuccessCount + importFailureCount >= pendingImportCount {
+                            showImportSummary()
+                        }
+                    } else {
+                        alertMessage = "导入成功，但无法识别该应用的 Bundle ID"
+                        showAlert = true
+                    }
                     return
                 }
+                importSuccessCount += 1
                 // 自动签名接管（设置开启 + 默认证书有效 + 本次批量允许）：不再打开签名详情页，
                 // 直接后台签名并安装，完成后自动回桌面等 iOS 弹安装提示。
                 // 批量选「仅导入」时 batchAutoSignAllowed=false，跳过自动签名，仅入未签名列表。

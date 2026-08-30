@@ -33,6 +33,9 @@ final class DownloadManager: NSObject {
 
     var onDownloadComplete: ((URL) -> Void)?
 
+    /// 总大小已持久化过的任务 id 集合（每个任务仅持久化一次，见 didWriteData）
+    private var sizePersistedTasks: Set<UUID> = []
+
     override init() {
         super.init()
         let configuration = URLSessionConfiguration.default
@@ -483,9 +486,17 @@ extension DownloadManager: URLSessionDownloadDelegate {
         totalBytesWritten: Int64,
         totalBytesExpectedToWrite: Int64
     ) {
-        guard let id = taskID(for: downloadTask) else { return }
+        guard let id = taskID(for: downloadTask), taskModels[id] != nil else { return }
         taskModels[id]?.receivedBytes = totalBytesWritten
         taskModels[id]?.totalBytes = totalBytesExpectedToWrite
+        // 总大小首次已知（>0；未知 Content-Length 为 -1）时持久化一次：崩溃恢复的
+        // "产物认领"大小校验依赖持久化的 totalBytes——进度本身由内存模型承载
+        // （UI 0.5s 轮询），但 didWriteData 从不落盘的话，恢复出来的任务
+        // totalBytes 恒为 0，校验在最需要它的崩溃恢复场景形同虚设。
+        if totalBytesExpectedToWrite > 0, !sizePersistedTasks.contains(id) {
+            sizePersistedTasks.insert(id)
+            persistTasks()
+        }
     }
 
     func urlSession(

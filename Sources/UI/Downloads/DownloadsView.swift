@@ -372,9 +372,12 @@ struct DownloadsView: View {
         .frame(height: 4)
     }
 
-    /// 已下载 / 总大小的紧凑文案。
+    /// 已下载 / 总大小的紧凑文案。服务器未返回 Content-Length 时总大小为 -1
+    /// （或 0）：只显示已下载量，避免出现 "X MB / −1 字节" 的畸形文案。
     private func sizeSummary(for task: DownloadTask) -> String {
-        "\(ByteCountFormatter.string(fromByteCount: task.receivedBytes, countStyle: .file)) / \(ByteCountFormatter.string(fromByteCount: task.totalBytes, countStyle: .file))"
+        let received = ByteCountFormatter.string(fromByteCount: task.receivedBytes, countStyle: .file)
+        guard task.totalBytes > 0 else { return received }
+        return "\(received) / \(ByteCountFormatter.string(fromByteCount: task.totalBytes, countStyle: .file))"
     }
 
     /// 记录任务解析出的 bundleID：回填到本地 tasks 副本（随后由 DownloadManager

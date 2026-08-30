@@ -155,6 +155,14 @@ final class UserDefaultsStore {
     }
 
     private func save<T: Codable>(_ value: T, key: String) {
+        // 降级保护落地：高版本 App 写入的数据在 init 中已声明"只读保留"，
+        // 任何一次 saveState 都会用旧 schema 整体覆盖写回（新字段静默丢失）——
+        // 这里直接跳过写入兑现该承诺。
+        let storedVersion = defaults.integer(forKey: Keys.schemaVersion)
+        if storedVersion > Self.currentSchemaVersion {
+            Logger.warning("持久化数据版本高于当前 App（\(storedVersion)），跳过写入: \(key)")
+            return
+        }
         do {
             let data = try encoder.encode(value)
             defaults.set(data, forKey: key)

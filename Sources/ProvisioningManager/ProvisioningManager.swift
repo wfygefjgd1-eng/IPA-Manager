@@ -62,8 +62,9 @@ final class ProvisioningManager {
         do {
             try AppFileManager.shared.moveItem(from: tempURL, to: destination)
         } catch {
-            // 换位失败（极罕见）：尽力把新文件恢复到目标位后抛错
-            try? AppFileManager.shared.moveItem(from: tempURL, to: destination)
+            // 换位失败（同卷 rename 双失败，极罕见）：清理临时残留，
+            // 避免 Profiles 目录堆积 .tmp-* 文件
+            try? AppFileManager.shared.deleteItem(at: tempURL)
             throw AppError.profileInvalid("描述文件替换失败: \(error.localizedDescription)")
         }
         return destination.path

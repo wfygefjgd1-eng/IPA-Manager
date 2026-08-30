@@ -15,14 +15,19 @@ final class AppDelegate: NSObject, UIApplicationDelegate {
     }
 
     func applicationDidBecomeActive(_ application: UIApplication) {
-        // 安装链路生命周期收尾：回前台时若安装仍在进行（最近 4 分钟内有安装活动：
-        // itms-services 打开成功 / SpringBoard 拉取 manifest/ipa 的连接），保留本地
-        // 服务器与音频保活——用户在安装确认弹窗停留或大包下载期间切回 App 查看进度
-        // 是常见操作，此时停服务器会掐断正在进行的安装且无任何提示（历史缺陷）。
-        // 无安装活动时立即停止，避免 NWListener + 音频永久驻留后台（耗电 + 心跳刷屏）。
+        // 安装链路生命周期收尾：回前台时若安装仍在进行则保留本地服务器与音频保活，
+        // 判定依据两个（任一满足即保留）：
+        // ① 最近 4 分钟内有安装活动（itms-services 打开 / SpringBoard 拉取
+        //    manifest/ipa 的连接或分块传输）——覆盖弹窗已确认、下载进行中的场景；
+        // ② 服务器启动未满 10 分钟（安装会话仍在进行）——覆盖用户在系统安装确认
+        //    弹窗停留较久（期间无任何活动事件）后切回 App 的场景。
+        // 用户在安装确认弹窗停留或大包下载期间切回 App 查看进度是常见操作，
+        // 此时停服务器会掐断正在进行的安装且无任何提示（历史缺陷）。
+        // 会话上限 10 分钟兜底：放弃安装后服务器/音频最迟 10 分钟清理（耗电可控）。
         // stop 均幂等，未启动时调用无害。
-        if LocalInstallServer.shared.hasRecentInstallActivity(within: 240) {
-            Logger.info("回前台：检测到近期安装活动，保留本地服务器与保活（不打断安装）")
+        if LocalInstallServer.shared.hasRecentInstallActivity(within: 240)
+            || LocalInstallServer.shared.isInstallSessionActive(within: 600) {
+            Logger.info("回前台：检测到近期安装活动/进行中的安装会话，保留本地服务器与保活（不打断安装）")
         } else {
             LocalInstallServer.shared.stop()
             BackgroundAudioKeepAlive.shared.stop()

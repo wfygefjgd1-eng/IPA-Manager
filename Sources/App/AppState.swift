@@ -39,6 +39,12 @@ final class AppState: ObservableObject {
     private let store = UserDefaultsStore()
     private let parser = IPAParser()
 
+    /// 归档导入串行队列：zip 分类扫描/转换/复制/整包解析都是重 IO（大包可达数 GB），
+    /// 两个下载几乎同时完成时若并发处理，会双倍内存/磁盘峰值、进度卡来回跳。
+    /// 同一时间只处理一个归档；队列内闭包绝不同步等待自身（无死锁路径），
+    /// 完成回调统一 main.async，UI 线程不受影响。
+    private let importQueue = DispatchQueue(label: "com.ipamanager.appstate.import", qos: .userInitiated)
+
     /// 已签名应用刷新串行队列：parseAppInfo 会解压整个 IPA（较慢），且
     /// refreshInstalledApps 可能在主线程被多次触发（签名完成 / 删除应用 / 启动），
     /// 用串行队列保证多次解析互不重叠、不阻塞主线程；@Published 赋值仍回主线程。
@@ -97,7 +103,14 @@ final class AppState: ObservableObject {
 
     init() {
         loadPersistedState()
-        refreshInstalledApps()
+        // 启动孤儿清扫放在首次“已签应用”扫描完成之后执行：refreshInstalledApps
+        // 的解析会创建新的解压目录，且 installedApps 到此刻才就绪——若清扫与
+        // 解析并发（引用列表还是启动时的快照），可能把解析中/新生成的解压目录
+        // 当孤儿删掉。放进完成回调既保证时序（清扫快照包含刷新后的引用），
+        // 又保持清扫本身在后台执行、不占主线程。
+        refreshInstalledApps { [weak self] in
+            self?.sweepOrphanExtractDirs()
+        }
         DownloadManager.shared.onDownloadComplete = { [weak self] url in
             self?.handleDownloadedFile(at: url)
         }
@@ -136,8 +149,9 @@ final class AppState: ObservableObject {
         // 安全作用域在后台流程入口持有、defer 在闭包内释放，覆盖 classifyArchivedContent
         // 解压扫描与 convertToIPAIfNeeded 读取外部文件的全过程（文件 App 打开的
         // in-place 安全作用域 URL 若未授权访问，解压会 EPERM）。
+        // 归档处理统一走 importQueue 串行队列（重 IO 不并发）。
         let accessed = url.startAccessingSecurityScopedResource()
-        DispatchQueue.global(qos: .userInitiated).async {
+        importQueue.async {
             defer {
                 if accessed {
                     url.stopAccessingSecurityScopedResource()
@@ -345,20 +359,21 @@ final class AppState: ObservableObject {
 
     /// 导入单个文件。progressContext 携带多选导入时的序号/总数（单文件调用可省略，
     /// 默认按 total=1 处理），用于首页进度卡片显示"正在导入 i/N"。
+    /// autoSign：导入成功后是否自动签名并安装。多选导入的"仅导入，不自动安装"
+    /// 选项必须经此参数传入——统一出口在本方法内部，若只靠视图层在 completion
+    /// 里拦截，本方法仍会无条件入队自动签名（用户选择被无视的历史缺陷）。
     /// 进度状态在后台各阶段间更新（内部切回主线程赋值 @Published），
     /// 成功/失败均会清除进度，失败仍走既有 completion(.failure) 错误提示逻辑。
     func importFile(
         from url: URL,
         progressContext: (index: Int, total: Int)? = nil,
+        autoSign: Bool = true,
         completion: @escaping (Result<AppInfo, Error>) -> Void
     ) {
         // 进度上下文：未传时按单文件处理（index/total = 1）
         let index = progressContext?.index ?? 1
         let total = progressContext?.total ?? 1
         let fileName = url.lastPathComponent
-
-        // 初始阶段（调用方通常在主线程；updateImportProgress 内部仍会切回主线程赋值）
-        updateImportProgress(fileName: fileName, index: index, total: total, phase: "准备导入…")
 
         // 后台闭包要读 importedApps 做同名冲突判断：先取一份主线程快照。
         // Swift Array 非线程安全——旧实现直接在后台队列遍历 @Published 数组，
@@ -371,7 +386,11 @@ final class AppState: ObservableObject {
             importedAppsSnapshot = DispatchQueue.main.sync { importedApps }
         }
 
-        DispatchQueue.global(qos: .userInitiated).async {
+        importQueue.async {
+            // 初始进度放在串行块内：排队中的导入不会立刻顶掉正在进行的导入的
+            // 进度卡（前一个导入完成后进度清空，下一个导入开始时再亮卡）。
+            self.updateImportProgress(fileName: fileName, index: index, total: total, phase: "准备导入…")
+
             // 安全作用域必须在真正执行 I/O 的后台闭包内持有（defer 作用域 = 闭包）：
             // 若在进入队列前就 start/stop，文件 App 外部打开（LSSupportsOpeningDocumentsInPlace
             // 生效的 in-place 安全作用域 URL）的后台解压/复制/解析会处于未授权状态 → EPERM。
@@ -539,8 +558,11 @@ final class AppState: ObservableObject {
                     self.clearImportProgress()
                     completion(.success(app))
                     // 导入/下载/外部打开统一出口：一条龙自动签名并安装
-                    // （开关默认开；默认证书/描述文件无效时自动跳过，不打扰用户）
-                    self.enqueueAutoSignAndInstall(app)
+                    // （开关默认开；默认证书/描述文件无效时自动跳过，不打扰用户；
+                    // autoSign=false 供批量导入"仅导入"选项使用）
+                    if autoSign {
+                        self.enqueueAutoSignAndInstall(app)
+                    }
                 }
             } catch {
                 DispatchQueue.main.async {
@@ -687,31 +709,49 @@ final class AppState: ObservableObject {
             Logger.warning("自动签名跳过：无有效默认描述文件（\(app.name)）")
             return false
         }
-        // 已入队/正在签名的跳过（防重复入队）
+        // 已入队/正在签名的跳过（防重复入队）。注意：同 bundleID 重导入会生成
+        // 新 UUID，id 去重会失效——追加 bundleID 维度（排队中/正在签名中的
+        // 同 bundleID 不再入队，避免同一应用签两次、已签列表出重复项）
         guard !autoSigningAppIDs.contains(app.id) else { return false }
+        if !app.bundleID.isEmpty {
+            guard currentAutoSignBundleID != app.bundleID,
+                  !autoSignQueue.contains(where: { $0.bundleID == app.bundleID }) else {
+                return false
+            }
+        }
         autoSignQueue.append(app)
         autoSigningAppIDs.insert(app.id)
         pumpAutoSignQueue()
         return true
     }
 
+    /// 当前正在自动签名的应用 bundleID（供同 bundleID 去重；完成/失败即清空）
+    private var currentAutoSignBundleID: String?
+
     /// 串行出队执行自动签名+安装；队空或已有任务在跑则直接返回。
     private func pumpAutoSignQueue() {
         guard !isAutoSigning, !autoSignQueue.isEmpty else { return }
         let app = autoSignQueue.removeFirst()
-        isAutoSigning = true
-        guard let cert = selectedCertificate,
-              let profile = selectedProfile else {
-            // 证书被并发删除等竞态：移除标记，继续处理下一个
+        // 出队时复验（与 enqueue 的校验对齐）：批量签名期间用户可能删除默认
+        // 证书/描述文件（Keychain 私钥一并删除）、换成其它 Team 的组合、或关闭
+        // 自动签名开关——用失效组合继续签会产出无法安装的包，直接放弃该项推进。
+        guard store.autoSignAndInstallEnabled(),
+              let cert = selectedCertificate, cert.status == .valid,
+              certificates.contains(where: { $0.id == cert.id }),
+              let profile = selectedProfile, profile.status == .valid,
+              profiles.contains(where: { $0.id == profile.id }) else {
             autoSigningAppIDs.remove(app.id)
-            isAutoSigning = false
+            Logger.warning("自动签名跳过（默认证书/描述文件已失效或开关已关闭）: \(app.name)")
             pumpAutoSignQueue()
             return
         }
+        isAutoSigning = true
+        currentAutoSignBundleID = app.bundleID
         Logger.info("自动签名开始: \(app.name)")
         signApp(app, certificate: cert, profile: profile, progress: { _, _ in }) { [weak self] result in
             guard let self = self else { return }
             self.isAutoSigning = false
+            self.currentAutoSignBundleID = nil
             self.autoSigningAppIDs.remove(app.id)
             switch result {
             case .success(let signedPath):
@@ -730,7 +770,11 @@ final class AppState: ObservableObject {
         do {
             try installSignedPath(signedPath, certificate: certificate)
             Logger.info("自动签名并安装已发起: \(app.name)")
-            if store.autoReturnHomeAfterSigningEnabled() {
+            // 批量队列未清空时不回桌面：App 退后台后 UIApplication.open 发出的
+            // itms-services 链接系统不保证响应（后台态 open 常被忽略），第 2 个
+            // 之后的安装会在后台静默失败。保持前台逐个弹系统安装确认，最后一个
+            // 安装发起后才回桌面。
+            if store.autoReturnHomeAfterSigningEnabled() && autoSignQueue.isEmpty {
                 DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) { [weak self] in
                     // 延迟让用户看到"签名完成"的过渡，再回桌面等 iOS 弹安装提示
                     self?.minimizeToHomeScreen()
@@ -760,10 +804,12 @@ final class AppState: ObservableObject {
         Logger.info("外部打开文件: \(url.lastPathComponent)")
 
         switch ext {
-        case "zip":
-            // zip 统一走下载完成的分类导入（证书包 / 应用包 / zip 内嵌 ipa / 未知），
+        case "zip", "tgz", "tar", "gz":
+            // 压缩包统一走下载完成的分类导入（证书包 / 应用包 / zip 内嵌 ipa / 未知），
             // 修复“文件 App 打开 zip 包着 ipa”时一律被当证书包导入、内嵌 .ipa 无法识别的问题。
             // 分类为 .certificateBundle 时其内部仍会调 importCertificateBundleOrFile，证书包不受影响。
+            // tgz/tar/gz 与下载链路保持同一分发（此前只认 zip，外部打开的 tgz 会落
+            // default 分支报解析错误）。
             handleDownloadedFile(at: url)
         case "p12", "pfx", "mobileprovision":
             // 单个证书相关文件保持原逻辑（zip 才是证书包载体）
@@ -864,8 +910,9 @@ final class AppState: ObservableObject {
             let importer = CertificateBundleImporter.shared
             // 安全作用域：zip 证书包的后台解压/复制/清理全程必须处于授权状态，
             // start/stop 需成对；defer 在后台闭包内释放，覆盖所有错误路径。
+            // 处理走 importQueue 串行队列（解压是重 IO，不与其它归档导入并发）。
             let accessed = url.startAccessingSecurityScopedResource()
-            DispatchQueue.global(qos: .userInitiated).async {
+            importQueue.async {
                 defer {
                     if accessed {
                         url.stopAccessingSecurityScopedResource()
@@ -898,14 +945,19 @@ final class AppState: ObservableObject {
                                         Logger.info("zip 证书包证书导入成功: \(cert.name)")
                                     case .failure(let error):
                                         Logger.warning("zip 证书包证书需手动导入: \(error.localizedDescription)")
+                                        // 常见密码 "1" 不匹配也必须给用户可见反馈（否则
+                                        // 导入像没发生一样）；提示改走证书页手动输密码
+                                        self.showToast("证书导入失败（密码可能不是常见密码）：\(error.localizedDescription)，请到证书页手动导入")
                                     }
                                     // 证书导入处理完毕（无论成败）后清理托管 P12 与解压目录
                                     self.cleanupManagedCertBundle(importer: importer, moved: moved, extractDir: extractDir)
                                 }
                             }
                         } else {
-                            // 无证书：描述文件已归档到 Profiles，直接清理
+                            // 无证书：描述文件已归档到 Profiles，直接清理；
+                            // 给用户可见反馈（只导入到一半的包也该说清楚）
                             self.cleanupManagedCertBundle(importer: importer, moved: moved, extractDir: extractDir)
+                            self.showToast("已导入描述文件；压缩包内未找到证书 (.p12)")
                         }
                         Logger.info("zip 证书包导入完成")
                     }
@@ -919,6 +971,9 @@ final class AppState: ObservableObject {
                         self.sweepBundleExtractDirs()
                     }
                     Logger.error("zip 证书包导入失败: \(error)")
+                    // 失败给用户可见反馈（旧实现只写日志——从文件 App/下载链路进来时
+                    // 界面毫无反应，用户以为导入成功但列表为空）
+                    self.showToast("证书包导入失败：\(error.localizedDescription)")
                 }
             }
         default:
@@ -955,10 +1010,9 @@ final class AppState: ObservableObject {
         relocateProfilePaths()
         relocateImportedAppPaths()
         relocateImportedAppIconPaths()
-        // 孤儿清扫：清理不再被任何记录引用的解析临时目录（避免 Extracted/ 无限膨胀）。
-        // 上次会话的残留可能达数 GB，主线程同步递归删除会卡启动数秒——丢后台执行
-        // （清扫与首次 UI 无依赖；引用列表在本方法内先做主线程快照）。
-        sweepOrphanExtractDirs()
+        // 孤儿清扫已移至 AppState.init 中首次 refreshInstalledApps 完成后执行：
+        // 既要后台执行（残留可能数 GB，主线程同步删会卡启动），又要保证在
+        // 首次已签应用扫描之后跑（清扫期间引用列表才完整，不会误删解析中的目录）。
 
         // 选中项不持久化，恢复后必须重新挑选，避免首页显示“未选择证书”
         if selectedCertificate == nil {
@@ -1186,27 +1240,47 @@ final class AppState: ObservableObject {
     /// 与持久化仍在主线程，避免并发修改 @Published。
     func removeSignedApps(_ apps: [AppInfo]) {
         guard !apps.isEmpty else { return }
-        // 1) 主线程：先从两条列表 + 签名任务中移除（避免并发读取时仍看到已删记录）
+        // 1) 主线程：维护两条列表 + 签名任务，并收集"关联的源导入记录"。
+        // 已签应用页传入的记录由 makeInstalledAppInfo 现解析（全新 UUID、path 指向
+        // 签名产物），importedApps 里的原始导入记录按 id/path 都匹配不上——须按
+        // signedPath 关联，否则：记录永久残留（isSigned=true 不再显示于首页，无任何
+        // UI 入口可清），且源 IPA 与解析/图标目录数 GB 级泄漏。
+        var relatedImports: [AppInfo] = []
         for app in apps {
-            importedApps.removeAll { $0.id == app.id || $0.path == app.path }
-            installedApps.removeAll { $0.path == app.path }
-            signingTasks.removeAll { $0.sourceFile == app.path || $0.outputPath == app.path }
+            let matched = importedApps.filter {
+                $0.id == app.id || $0.path == app.path || $0.signedPath == app.path
+            }
+            importedApps.removeAll { record in matched.contains(where: { $0.id == record.id }) }
+            installedApps.removeAll { $0.path == app.path || $0.signedPath == app.path }
+            relatedImports.append(contentsOf: matched)
         }
-        // 2) 并行 IO：按 baseName 收集要删的目录 / 文件，concurrentPerform 并行删除。
-        // 历史 N 个应用串行 N 次 fileManager.removeItem 在 SSD 上仍需数秒，
-        // 并发后 1 个 50~100ms 量级，UI 完全无感。
+        let relatedSourcePaths = relatedImports.map { $0.path }
+            + relatedImports.compactMap { $0.signedPath }
+        let relatedSignedPaths = apps.map { $0.path }
+        signingTasks.removeAll { task in
+            relatedSignedPaths.contains(task.outputPath ?? "")
+                || relatedSourcePaths.contains(task.sourceFile)
+                || relatedSignedPaths.contains(task.sourceFile)
+        }
+        // 2) 并行 IO：签名产物 + 关联源 IPA 两类文件都删（按 baseName 分桶并行删除）。
+        // 历史 N 个应用串行 N 次 removeItem 在 SSD 上仍需数秒，并发后 UI 完全无感。
         let extractedRoot = fileManager.directoryURL(.extracted)
-        let urlsToDelete: [(ipa: URL, baseName: String, iconsDir: URL)] = apps.map { app in
-            let url = URL(fileURLWithPath: app.path)
+        func entry(for path: String) -> (ipa: URL, baseName: String, iconsDir: URL) {
+            let url = URL(fileURLWithPath: path)
             let baseName = url.deletingPathExtension().lastPathComponent
             let iconsDir = extractedRoot
                 .appendingPathComponent("Icons", isDirectory: true)
                 .appendingPathComponent(baseName, isDirectory: true)
             return (url, baseName, iconsDir)
         }
-        DispatchQueue.global(qos: .userInitiated).async { [extractedRoot, urlsToDelete] in
-            DispatchQueue.concurrentPerform(iterations: urlsToDelete.count) { idx in
-                let item = urlsToDelete[idx]
+        var entries = relatedSignedPaths.map { entry(for: $0) }
+        entries += relatedSourcePaths.map { entry(for: $0) }
+        // 同一源可能对应多个签名产物（重签）：按 ipa 路径去重避免并发重删
+        var seen = Set<String>()
+        entries = entries.filter { seen.insert($0.ipa.path).inserted }
+        DispatchQueue.global(qos: .userInitiated).async { [extractedRoot, entries] in
+            DispatchQueue.concurrentPerform(iterations: entries.count) { idx in
+                let item = entries[idx]
                 try? AppFileManager.shared.deleteItem(at: item.ipa)
                 // 按前缀清理解析目录（兼容旧版 <baseName> 与新版 <baseName>-<UUID>）
                 Self.cleanupExtractDirs(matching: item.baseName, in: extractedRoot)

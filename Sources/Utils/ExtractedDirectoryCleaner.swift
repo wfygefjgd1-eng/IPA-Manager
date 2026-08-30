@@ -45,14 +45,23 @@ final class ExtractedDirectoryCleaner {
 
     /// Startup orphan sweep: delete `Extracted/` subdirectories not referenced by any
     /// known app path or icon path. Always preserves `Icons/`.
+    /// Additionally preserves recently-modified directories: 并发导入（下载恢复后
+    /// 自动导入）正在解压写入的目录不在引用快照里，且解析耗时可达数十秒——
+    /// mtime 在 10 分钟内的目录一律视为"可能正在使用"，绝不能删。
     static func sweepOrphanExtractDirs(referencedPaths: [String]) {
         let extractedRoot = AppFileManager.shared.directoryURL(.extracted)
         guard let entries = try? FileManager.default.contentsOfDirectory(
-            at: extractedRoot, includingPropertiesForKeys: [.isDirectoryKey]
+            at: extractedRoot, includingPropertiesForKeys: [.isDirectoryKey, .contentModificationDateKey]
         ) else { return }
+        let now = Date()
         for entry in entries {
             let isDirectory = (try? entry.resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory ?? false
             guard isDirectory, entry.lastPathComponent != "Icons" else { continue }
+            // 进行中的解析/导入保护：刚创建或仍在写入的目录 mtime 很新
+            if let modified = try? entry.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate,
+               now.timeIntervalSince(modified) < 600 {
+                continue
+            }
             let isReferenced = referencedPaths.contains { $0.hasPrefix(entry.path) }
             if !isReferenced {
                 try? AppFileManager.shared.deleteItem(at: entry)

@@ -89,6 +89,12 @@ final class CertificateBundleImporter {
         ) else { return nil }
         let target = ext.lowercased()
         while let element = enumerator.nextObject() as? URL {
+            // 与分类器语义对齐：.app 包内部的 embedded.mobileprovision 不算证书
+            // 材料（每个已签应用都带一份；"应用包+顶层描述文件"混合包的深度优先
+            // 枚举可能在顶层描述文件之前先命中 Payload 内嵌的那份，抓错文件）
+            if element.pathComponents.contains(where: { $0.lowercased().hasSuffix(".app") }) {
+                continue
+            }
             let isRegular = (try? element.resourceValues(forKeys: [.isRegularFileKey]))?.isRegularFile ?? false
             guard isRegular else { continue }
             if element.pathExtension.lowercased() == target {

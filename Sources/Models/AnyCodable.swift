@@ -46,9 +46,10 @@ struct AnyCodable: Codable, Hashable {
             if CFGetTypeID(num) == CFBooleanGetTypeID() {
                 try container.encode(num.boolValue)
             } else {
+                // 用 64 位读写避免 "q"/"Q"（long long）等类型被 32 位 intValue/uintValue 截断
                 switch String(cString: num.objCType) {
-                case "i", "l", "q": try container.encode(num.intValue)
-                case "I", "L", "Q": try container.encode(num.uintValue)
+                case "i", "l", "q": try container.encode(num.int64Value)
+                case "I", "L", "Q": try container.encode(num.uint64Value)
                 case "f": try container.encode(num.floatValue)
                 default: try container.encode(num.doubleValue)
                 }

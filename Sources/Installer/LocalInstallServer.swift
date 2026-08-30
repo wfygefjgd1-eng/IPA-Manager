@@ -18,6 +18,10 @@ final class LocalInstallServer {
     private var lastBaseURL: URL?
     /// 服务器是否处于运行状态（start 就绪到 stop 之间）：stop 的幂等判定与日志降噪
     private var isRunning = false
+    /// 本次服务器启动时刻：安装确认弹窗可能停留任意久（期间无任何连接活动），
+    /// 回前台/保活超时除活动时间外还看会话时长，避免弹窗停留较久的用户
+    /// 回 App 后服务器被误停
+    private var startedDate: Date?
     /// 最近一次安装活动时间（itms-services 打开成功 / 新连接 / 收到请求）：
     /// 回前台与保活超时据此判断安装是否仍在进行，绝不打断进行中的安装下载
     private var lastActivityDate: Date?
@@ -227,6 +231,7 @@ final class LocalInstallServer {
         ServerQueue.shared.queue.sync {
             self.lastBaseURL = baseURL
             self.isRunning = true
+            self.startedDate = Date()
         }
         Logger.info("本地安装服务器已启动: \(host):\(port) (协议=HTTP明文) | 候选探测: \(probeLogs.joined(separator: ", "))")
         // itms-services 打开后 App 将立即退到后台：启动静音音频保活，
@@ -257,12 +262,22 @@ final class LocalInstallServer {
         ServerQueue.shared.queue.sync { lastActivityDate = Date() }
     }
 
-    /// 最近 interval 秒内是否有安装相关活动（itms-services 打开 / 新连接 / 收到请求）。
-    /// 供回前台生命周期与保活超时判断：安装链路进行中绝不能停服务器。
+    /// 最近 interval 秒内是否有安装相关活动（itms-services 打开 / 新连接 / 收到请求 /
+    /// 分块传输）。供回前台生命周期与保活超时判断：安装链路进行中绝不能停服务器。
     func hasRecentInstallActivity(within interval: TimeInterval) -> Bool {
         ServerQueue.shared.queue.sync {
             guard let last = lastActivityDate else { return false }
             return Date().timeIntervalSince(last) < interval
+        }
+    }
+
+    /// 服务器是否处于"安装会话"中（已就绪且本次 start 距今不超过 window）：
+    /// 与 hasRecentInstallActivity 互补——安装确认弹窗停留期间没有任何活动事件，
+    /// 仅靠活动窗口会掐断"弹窗停留较久后用户才回 App"的场景。
+    func isInstallSessionActive(within window: TimeInterval) -> Bool {
+        ServerQueue.shared.queue.sync {
+            guard isRunning, let started = startedDate else { return false }
+            return Date().timeIntervalSince(started) < window
         }
     }
 
@@ -278,6 +293,7 @@ final class LocalInstallServer {
             manifestData = nil
             lastBaseURL = nil
             isRunning = false
+            startedDate = nil
         }
         if wasRunning {
             Logger.info("本地安装服务器已停止")
@@ -405,6 +421,11 @@ final class LocalInstallServer {
     }
 
     private func sendFileChunks(from handle: FileHandle, connection: NWConnection) {
+        // 流式发送也是安装活动：SpringBoard 对 .ipa 只发一次 GET，整个下载期间
+        // 不再产生任何新请求——不在分块循环里刷新活动时间戳的话，超过活动窗口
+        // 的大包传输会被回前台判定/保活超时误判为"无活动"而中断（多 GB 包、
+        // 慢速磁盘即可超过 150/240 秒）。本方法运行在服务器串行队列，直接写。
+        lastActivityDate = Date()
         let chunkSize = 256 * 1024
         let data = handle.readData(ofLength: chunkSize)
         if data.isEmpty {

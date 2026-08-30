@@ -69,6 +69,10 @@ make install_dev
 
 echo "==> 复制产物到 Vendor/openssl"
 mkdir -p "$VENDOR_INC" "$VENDOR_LIB"
+# 先清掉旧头文件目录再复制：本地重复运行时 BSD cp -R 会把 include/openssl
+# 嵌套成 include/openssl/openssl，HEADER_SEARCH_PATHS 随之失效（CI 全新
+# checkout 无此问题，本地复跑会踩）
+rm -rf "$VENDOR_INC/openssl"
 cp -R "$DEVICE_OUT/include/openssl" "$VENDOR_INC/openssl"
 cp "$DEVICE_OUT/lib/libcrypto.a" "$VENDOR_LIB/libcrypto-device.a"
 cp "$DEVICE_OUT/lib/libssl.a" "$VENDOR_LIB/libssl-device.a"

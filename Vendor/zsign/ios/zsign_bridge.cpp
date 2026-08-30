@@ -3,6 +3,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
 #include <string>
 #include <vector>
 
@@ -96,22 +97,37 @@ int zsign_sign(const ZSignOptions* options) {
         if (!ZFile::IsFileExists(strPKeyFile.c_str())) {
             strDiagnostics += "| 私钥文件不存在";
         } else {
-            // zsign_p12_info 成功时会清空 g_lastError，故调用前先暂存、调用后取回；
-            // 其失败返回 -1（格式/打开失败）或 -2（密码/格式错误）前会写入具体原因。
-            std::string strSavedError = g_lastError;
-            ZSignP12Info p12Info;
-            int nP12Ret = zsign_p12_info(strPKeyFile.c_str(), strPassword.c_str(), &p12Info);
-            std::string strP12Reason = g_lastError;
-            g_lastError = strSavedError;
-
-            if (nP12Ret != 0) {
-                std::string strDetail = strP12Reason;
-                if (strDetail.empty()) {
-                    strDetail = (nP12Ret == -2) ? "密码错误或格式不支持" : "证书/私钥文件无效";
+            // PEM 私钥（Swift 侧 SecKey 导出路径产出 sign-key-*.pem）不能按 p12 诊断：
+            // 拿 p12 解析器读 PEM 必然失败，会把"描述文件问题"误报成"证书/私钥问题"
+            bool bPEMKey = false;
+            {
+                std::ifstream ifsKey(strPKeyFile, std::ios::binary);
+                if (ifsKey) {
+                    char szHead[16] = {0};
+                    ifsKey.read(szHead, sizeof(szHead) - 1);
+                    bPEMKey = (ifsKey.gcount() >= 10 && strncmp(szHead, "-----BEGIN", 10) == 0);
                 }
-                strDiagnostics += "| 证书/私钥加载失败：" + strDetail;
+            }
+            if (bPEMKey) {
+                strDiagnostics += "| 私钥为 PEM 格式（跳过 p12 解析诊断）";
             } else {
-                strDiagnostics += "| 证书与私钥可正常解析";
+                // zsign_p12_info 成功时会清空 g_lastError，故调用前先暂存、调用后取回；
+                // 其失败返回 -1（格式/打开失败）或 -2（密码/格式错误）前会写入具体原因。
+                std::string strSavedError = g_lastError;
+                ZSignP12Info p12Info;
+                int nP12Ret = zsign_p12_info(strPKeyFile.c_str(), strPassword.c_str(), &p12Info);
+                std::string strP12Reason = g_lastError;
+                g_lastError = strSavedError;
+
+                if (nP12Ret != 0) {
+                    std::string strDetail = strP12Reason;
+                    if (strDetail.empty()) {
+                        strDetail = (nP12Ret == -2) ? "密码错误或格式不支持" : "证书/私钥文件无效";
+                    }
+                    strDiagnostics += "| 证书/私钥加载失败：" + strDetail;
+                } else {
+                    strDiagnostics += "| 证书与私钥可正常解析";
+                }
             }
         }
 
@@ -147,10 +163,13 @@ int zsign_sign(const ZSignOptions* options) {
     ZBundle bundle;
     bundle.m_bEnableDocuments = (options->enableDocuments != 0);
 
+    // bEnableCache=false：签名缓存 JSON 会写到进程 CWD 的 ./.zsign_cache（iOS 下
+    // CWD 通常是只读的 /，静默失败无害；CWD 可写时会在沙箱根部累积文件）。
+    // 本工程恒定 force=true，缓存读取本就永不生效，关闭写入只减益处。
     bool bRet = bundle.SignFolder(&zsa, strTempFolder,
         strBundleId, strBundleVersion, strBundleName,
         std::vector<std::string>(), std::vector<std::string>(),
-        (options->force != 0), false, true, false);
+        (options->force != 0), false, false, false);
 
     if (!bRet) {
         g_lastError = "Signing failed";

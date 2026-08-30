@@ -82,7 +82,11 @@ final class BackgroundAudioKeepAlive {
             // 状态判定与 autoStopWorkItem 的读写统一回主线程（与 start/stop 一致）
             DispatchQueue.main.async {
                 guard let self = self else { return }
-                if LocalInstallServer.shared.hasRecentInstallActivity(within: interval / 2) {
+                // 安装仍在进行的两种判定：近期有活动（传输/请求/打开），或
+                // 安装会话本身未超时（确认弹窗停留期间无活动事件）。任一满足
+                // 即顺延，绝不挂起进行中的安装。
+                if LocalInstallServer.shared.hasRecentInstallActivity(within: interval / 2)
+                    || LocalInstallServer.shared.isInstallSessionActive(within: 600) {
                     Logger.info("安装仍在进行，顺延后台保活 \(Int(interval)) 秒")
                     self.scheduleAutoStop()
                 } else {

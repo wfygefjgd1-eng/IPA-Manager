@@ -61,8 +61,9 @@ struct PasswordPromptView: View {
             .toolbar {
                 ToolbarItem(placement: .navigationBarLeading) {
                     Button("取消") {
-                        // 取消前通知父级清理托管 P12 明文副本与解压目录，
+                        // 取消前清空密码并通知父级清理托管 P12 明文副本与解压目录，
                         // 不留私钥材料常驻 Documents；父级另有 onDismiss 兜底
+                        password = ""
                         onCancel?()
                         dismiss()
                     }

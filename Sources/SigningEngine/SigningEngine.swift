@@ -175,6 +175,10 @@ final class SigningEngine: SigningEngineProtocol {
             // 签名失败：先清理 Signed/ 下的半成品 .ipa，避免 refreshInstalledApps
             // 全量扫描时把残缺文件当成"已签应用"。
             try? fileManager.deleteItem(at: outputURL)
+            // 失败也要停蠕动定时器：85% 后失败是大 IPA 最常见的失败点（重新打包
+            // 阶段），无人调用 complete/abort 会在主队列留下每 0.5s 空转一次、
+            // 永不释放的定时器源（每次这类失败累积一个）。
+            smoother.abort()
 
             let rawMessage = CertificateManager.safeZSignError(limit: 512)
             let userMessage = Self.localizedSignFailure(rawMessage, code: result)
@@ -396,6 +400,20 @@ final class SigningEngine: SigningEngineProtocol {
         let workRoot = URL(fileURLWithPath: NSTemporaryDirectory())
             .appendingPathComponent("IPA-Normalize-\(UUID().uuidString)", isDirectory: true)
 
+        // 失败清理：调用方的 defer 只清"成功返回后"才赋值的变量——本函数内任何
+        // throw 路径（解压失败 / 找不到 .app / 换位失败 / 打包失败）都必须自行
+        // 清理 workRoot（整包解压副本，可达数百 MB）与部分写成的半成品 outputURL
+        //（tmp 目录无孤儿清扫，重试签名会持续累积）
+        var success = false
+        let outputURL = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("normalized-\(UUID().uuidString).ipa")
+        defer {
+            if !success {
+                try? disk.removeItem(at: workRoot)
+                try? disk.removeItem(at: outputURL)
+            }
+        }
+
         do {
             // 解压源 IPA 到临时目录（校验 + zip-slip 防御由 ZipManager 统一负责）
             let extractDir = workRoot.appendingPathComponent("extract", isDirectory: true)
@@ -417,10 +435,10 @@ final class SigningEngine: SigningEngineProtocol {
             // 输出文件放在 workRoot 之外：zipItem 打包输入文件夹时若输出也在其中，
             // 会把自己当作待打包内容（异常/递归）。workRoot 与 outputURL 由调用方统一清理。
             try? disk.removeItem(at: extractDir)
-            let outputURL = URL(fileURLWithPath: NSTemporaryDirectory())
-                .appendingPathComponent("normalized-\(UUID().uuidString).ipa")
-            try zipManager.zip(folderURL: workRoot, outputURL: outputURL, shouldKeepParent: false)
+            try zipManager.zip(folderURL: workRoot, outputURL: outputURL)
 
+            // 成功：workRoot 与 outputURL 移交调用方（签名结束后统一删除）
+            success = true
             Logger.info("源 IPA 已规范化为标准结构（含 Payload/）: \(outputURL.path)")
             return (workRoot, outputURL)
         } catch let error as AppError {
@@ -575,6 +593,14 @@ private final class ProgressSmoother {
         }
     }
 
+    /// 签名失败时的收尾：只停蠕动定时器，不改进度/阶段（失败态由调用方以
+    /// alert 展示具体错误）。与 complete() 的区别：不把进度归正到 100%。
+    func abort() {
+        DispatchQueue.main.async { [self] in
+            stopSlither()
+        }
+    }
+
     /// 85% 后启动蠕动定时器：每 0.5s 展示进度 +0.3%，最高逼近 98%。
     /// 收到真实 100%（receive(1.0)）即停表并归正。
     private func startSlitherIfNeeded() {
@@ -599,6 +625,12 @@ private final class ProgressSmoother {
     private func stopSlither() {
         timer?.cancel()
         timer = nil
+    }
+
+    deinit {
+        // 双保险：libdispatch 要求 resume 过的 source 必须 cancel 才能释放，
+        // 漏停的蠕动定时器（异常路径）在析构时兜底取消
+        timer?.cancel()
     }
 }
 
