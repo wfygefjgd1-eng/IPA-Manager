@@ -418,8 +418,9 @@ final class LocalInstallServer {
                 // 发送失败（用户在系统弹窗取消安装 / 连接被 stop() 取消 / 网络切换）：
                 // 立即停止读取。旧实现忽略 error 继续递归，会把整个 IPA 从磁盘读完、
                 // 发起几百次注定失败的 send（耗 IO/CPU/电量，句柄也迟迟不关）。
+                // 注意：此处 self 可能已释放，不触碰 connections（连接取消后由
+                // stateUpdateHandler 的 .cancelled 分支在服务器队列上移除）。
                 try? handle.close()
-                self.connections.removeAll { $0 === connection }
                 connection.cancel()
                 return
             }
