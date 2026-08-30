@@ -709,9 +709,9 @@ struct DownloadsView: View {
         // 浏览器/详情页停留的整个期间旧实现仍每 0.5s 做快照排序 + 全量比较，
         // 有活动下载时还在背后整表重绘。sheet 关闭后下一轮 tick 自动恢复刷新。
         if showBrowser || showBookmarks || selectedApp != nil { return }
-        // 排序保证顺序稳定；仅当快照确实变化时才替换数组，避免 0.5s 轮询造成无谓重绘
+        // 排序保证顺序稳定（最新任务在最上）；仅当快照确实变化时才替换数组，避免 0.5s 轮询造成无谓重绘
         let snapshot = DownloadManager.shared.snapshotTasks()
-            .sorted { $0.createdAt < $1.createdAt }
+            .sorted { $0.createdAt > $1.createdAt }
         if snapshot != tasks {
             tasks = snapshot
         }

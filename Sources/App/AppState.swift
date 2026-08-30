@@ -1121,8 +1121,16 @@ final class AppState: ObservableObject {
     func refreshInstalledApps(completion: (() -> Void)? = nil) {
         isRefreshingInstalledApps = true
         installedAppsRefreshQueue.async {
-            let signedURLs = self.fileManager.contents(of: .signed)
-            let apps = signedURLs.map { self.makeInstalledAppInfo(from: $0) }
+            // 列表按签名产物的修改时间倒序：最新签名的排最前；contents(of:) 已预取
+            // contentModificationDateKey，此处读 resourceValues 不产生额外磁盘 IO
+            let datedURLs = self.fileManager.contents(of: .signed).map { url -> (URL, Date) in
+                let date = (try? url.resourceValues(forKeys: [.contentModificationDateKey]))?
+                    .contentModificationDate ?? .distantPast
+                return (url, date)
+            }
+            let apps = datedURLs
+                .sorted { $0.1 > $1.1 }
+                .map { self.makeInstalledAppInfo(from: $0.0) }
             DispatchQueue.main.async {
                 self.installedApps = apps
                 self.isRefreshingInstalledApps = false
