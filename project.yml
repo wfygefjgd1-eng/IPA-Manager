@@ -90,7 +90,13 @@ targets:
         # 丢失无任何兜底手段。本 App 对外部文件只做导入复制、从不原位编辑，in-place
         # 无实际收益。
         LSSupportsOpeningDocumentsInPlace: false
-        UISupportsDocumentBrowser: true
+        # 分享路由修正（v1.0.122）：UISupportsDocumentBrowser 声明本 App 为"文档浏览器"
+        # 应用，与 UIFileSharingEnabled（文件共享）是 Apple 定位中两种互斥的文件暴露
+        # 模式，组合声明矛盾。实测 iOS 27 分享面板出现"无载荷入口"（直接分享到、点开
+        # App 却不拷贝文件——分享后毫无反应）的头号嫌疑即此：系统按文档浏览器语义路由
+        # 分享而不走拷贝投递。本 App 从不使用 UIDocumentBrowserViewController，
+        # Documents 在文件 App 的可见性由 UIFileSharingEnabled 单独提供，关闭此 key。
+        UISupportsDocumentBrowser: false
         # ATS（P0-5 安全加固）：移除 NSAllowsArbitraryLoads 全局放行，改为精细化控制
         # - NSAllowsArbitraryLoads: false  默认禁止明文 HTTP
         # - NSAllowsLocalNetworking: true  允许本地回环/局域网明文（127.0.0.1 安装服务器自检、局域网 manifest/ipa）

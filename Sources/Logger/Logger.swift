@@ -121,6 +121,10 @@ enum Logger {
         }
 
         lines.append("")
+        lines.append("===== 外部投递追踪（持久化，跨启动保留，最多 \(ExternalDeliveryJournal.maxEntries) 条）=====")
+        lines.append(ExternalDeliveryJournal.reportText())
+
+        lines.append("")
         lines.append("由 IPA Manager 诊断功能导出")
 
         return lines.joined(separator: "\n")

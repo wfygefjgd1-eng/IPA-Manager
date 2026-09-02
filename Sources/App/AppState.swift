@@ -851,20 +851,43 @@ final class AppState: ObservableObject {
     /// 防 open 事件 × 回前台扫描 × 冷启动 launchOptions 对同一文件并发/重复触发导入。
     private var pendingInboxImports: Set<String> = []
 
-    /// 回前台扫描分享投递目录（AppDelegate.applicationDidBecomeActive 调用）：
+    /// 可自动导入的散落投递扩展名（Documents 根目录扫描用；Inbox 内不做扩展名过滤
+    /// ——系统投递什么处理什么）。Documents 根下只认应用/证书文件，避免把用户经
+    /// 文件 App 放进来的其它文件误当投递。
+    private static let deliveryExtensions: Set<String> = ["ipa", "zip", "p12", "pfx", "mobileprovision"]
+
+    /// 分享投递路径识别：Documents/Inbox 内（系统拷贝投递）或 Documents 根目录下的
+    /// 可导入应用/证书文件（document-browser 式"保存到 App"投递 / 用户经文件 App 放入）。
+    private func isDeliveryPath(_ url: URL) -> Bool {
+        if url.path.hasPrefix(inboxURL.path + "/") { return true }
+        guard Self.deliveryExtensions.contains(url.pathExtension.lowercased()) else { return false }
+        return url.deletingLastPathComponent().path == fileManager.documentsURL.path
+    }
+
+    /// 回前台扫描待处理投递（AppDelegate.applicationDidBecomeActive 调用）：
+    /// 扫描 Documents/Inbox（系统拷贝投递）与 Documents 根目录（document-browser 式
+    /// "保存到 App"投递 / 用户经文件 App 放入的应用文件）：
     /// - 已结算且文件不存在：清掉失效登记（防集合无限增长）；
     /// - 已结算但文件仍存在（删除失败等残留）：超过 24h 直接删除并清登记；
     /// - 未登记：视为 open 事件丢失的投递，补走完整导入链路（handleFileOpenedFromOutside
     ///   内部登记在途 + 结算自删 + 既有自动签名一条龙）。
-    /// 仅主线程调用；Inbox 不存在/为空时开销仅一次目录探测。
+    /// 仅主线程调用；目录不存在/为空时开销仅一次目录探测。
     func processInboxFilesIfNeeded() {
-        let inbox = inboxURL
-        guard let files = try? FileManager.default.contentsOfDirectory(
-            at: inbox, includingPropertiesForKeys: [.contentModificationDateKey]
-        ), !files.isEmpty else { return }
+        let inboxFiles = (try? FileManager.default.contentsOfDirectory(
+            at: inboxURL, includingPropertiesForKeys: [.contentModificationDateKey],
+            options: [.skipsHiddenFiles])) ?? []
+        ExternalDeliveryJournal.record(inboxFiles.isEmpty
+            ? "回前台扫描：Inbox 无文件"
+            : "回前台扫描：Inbox \(inboxFiles.count) 项 [\(inboxFiles.map { $0.lastPathComponent }.joined(separator: "、"))]")
+
+        let documentsRootFiles = ((try? FileManager.default.contentsOfDirectory(
+            at: fileManager.documentsURL, includingPropertiesForKeys: [.contentModificationDateKey],
+            options: [.skipsHiddenFiles])) ?? [])
+            .filter { !$0.hasDirectoryPath }
+            .filter { Self.deliveryExtensions.contains($0.pathExtension.lowercased()) }
 
         // 剪枝：源文件已不存在的已结算登记（正常结算即删文件）顺带清掉
-        let alive = Set(files.map { $0.path })
+        let alive = Set((inboxFiles + documentsRootFiles).map { $0.path })
         let settledAndGone = processedInboxPaths.subtracting(alive)
         if !settledAndGone.isEmpty {
             processedInboxPaths.subtract(settledAndGone)
@@ -872,7 +895,7 @@ final class AppState: ObservableObject {
         }
 
         let now = Date()
-        for file in files {
+        for file in inboxFiles.filter({ !$0.hasDirectoryPath }) + documentsRootFiles {
             let path = file.path
             if processedInboxPaths.contains(path) {
                 // 已结算但源文件仍在（删除失败等残留）：超期清扫
@@ -888,7 +911,7 @@ final class AppState: ObservableObject {
             }
             // 未登记 = open 事件丢失（正常投递的文件在结算时已自删，不会留到这里）。
             // 在途登记与重复投递拦截都在 handleFileOpenedFromOutside 内部完成。
-            Logger.info("Inbox 兜底导入（open 事件丢失）: \(file.lastPathComponent)")
+            Logger.info("兜底导入（open 事件丢失）: \(file.lastPathComponent)")
             handleFileOpenedFromOutside(file)
         }
     }
@@ -910,15 +933,17 @@ final class AppState: ObservableObject {
         let ext = url.pathExtension.lowercased()
         Logger.info("外部打开文件: \(url.lastPathComponent)")
 
-        // 分享面板「拷贝到 App」投递识别（文件位于 Documents/Inbox）：在途登记 +
+        // 分享/投递识别（Documents/Inbox 或 Documents 根目录的可导入文件）：在途登记 +
         // 结算落盘，open 事件与回前台扫描/冷启动 launchOptions 对同一文件的重复投递
         //（超出 2 秒去重窗口的）在此丢弃，杜绝双重导入。
         // - pendingInboxImports（内存）：开始处理即登记、结算后移除；
         // - processedInboxPaths（持久化）：结算（成功/失败）时才写入——进程在导入
         //   中途被杀时投递未结算，下次启动仍会重新导入（若投递即落盘，该文件会
         //   永远不再导入、只能等 24h 清扫）。
-        var inboxSettlement: (() -> Void)? = nil
-        if url.path.hasPrefix(inboxURL.path + "/") {
+        let isInboxDelivery = isDeliveryPath(url)
+        ExternalDeliveryJournal.record("处理外部文件: \(url.lastPathComponent)（ext=\(ext)，投递识别=\(isInboxDelivery ? "是" : "否")）")
+        var inboxSettlement: ((String) -> Void)? = nil
+        if isInboxDelivery {
             // 已结算（此前导入成功/失败并落盘标记）：文件残留场景由扫描清扫，不再导入
             guard !processedInboxPaths.contains(url.path) else {
                 Logger.info("分享投递已结算，跳过: \(url.lastPathComponent)")
@@ -929,15 +954,16 @@ final class AppState: ObservableObject {
                 Logger.info("分享投递已在途，跳过: \(url.lastPathComponent)")
                 return
             }
-            // 结算闭包：导入链路（成功/失败）走完后调用——删除 Inbox 源文件（文件已
+            // 结算闭包：导入链路（成功/失败）走完后调用——删除投递源文件（文件已
             // 复制进 IPA 目录/入库，源文件保留只会被重复导入并占用空间；删除失败极罕见，
             // 由回前台扫描的 24h 残留清扫兜底）并持久化已结算标记。
-            inboxSettlement = { [weak self] in
+            inboxSettlement = { [weak self] note in
                 guard let self = self else { return }
                 self.pendingInboxImports.remove(url.path)
                 self.processedInboxPaths.insert(url.path)
                 self.store.saveProcessedInboxPaths(Array(self.processedInboxPaths))
                 try? FileManager.default.removeItem(at: url)
+                ExternalDeliveryJournal.record("投递结算: \(url.lastPathComponent)（\(note)；源文件已删）")
             }
         }
 
@@ -952,13 +978,15 @@ final class AppState: ObservableObject {
             // 证书包分支经 onSettled 回调结算（completion 对证书包不回调，既有行为）。
             handleDownloadedFile(
                 at: url,
-                completion: { _ in inboxSettlement?() },
-                onSettled: { inboxSettlement?() }
+                completion: { result in
+                    inboxSettlement?(result.isSuccess ? "导入完成" : "导入失败")
+                },
+                onSettled: { inboxSettlement?("证书包导入完成") }
             )
         case "p12", "pfx", "mobileprovision":
             // 单个证书相关文件保持原逻辑（zip 才是证书包载体）；onSettled 由证书
-            // 导入收尾回调（含失败），用于 Inbox 投递的源文件删除与已结算落盘。
-            importCertificateBundleOrFile(url, onSettled: inboxSettlement)
+            // 导入收尾回调（含失败），用于投递的源文件删除与已结算落盘。
+            importCertificateBundleOrFile(url, onSettled: { inboxSettlement?("证书导入完成") })
         default:
             importFile(from: url) { result in
                 switch result {
@@ -966,12 +994,12 @@ final class AppState: ObservableObject {
                     // 外部打开的应用导入成功后，切到首页并提示（用户可进详情签名）
                     self.selectedTab = 0
                     Logger.info("外部打开文件导入成功: \(app.name)")
+                    inboxSettlement?("导入成功: \(app.name)")
                 case .failure(let error):
                     // 外部打开失败必须给反馈（否则用户在文件 App 里点了毫无反应）
                     self.showToast("导入失败: \(error.localizedDescription)")
+                    inboxSettlement?("导入失败")
                 }
-                // Inbox 投递结算：导入成功/失败后删除 Inbox 源文件
-                inboxSettlement?()
             }
         }
     }
