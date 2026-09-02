@@ -856,17 +856,24 @@ final class AppState: ObservableObject {
     /// 文件 App 放进来的其它文件误当投递。
     private static let deliveryExtensions: Set<String> = ["ipa", "zip", "p12", "pfx", "mobileprovision"]
 
-    /// 分享投递路径识别：Documents/Inbox 内（系统拷贝投递）或 Documents 根目录下的
-    /// 可导入应用/证书文件（document-browser 式"保存到 App"投递 / 用户经文件 App 放入）。
+    /// 分享投递路径识别：Documents/Inbox 内（系统拷贝投递）、Documents 根目录下的
+    /// 可导入应用/证书文件（document-browser 式"保存到 App"投递 / 用户经文件 App 放入）、
+    /// 或 App Group 共享收件箱内（分享扩展接收的文件）。
     private func isDeliveryPath(_ url: URL) -> Bool {
         if url.path.hasPrefix(inboxURL.path + "/") { return true }
+        if let groupInbox = AppGroup.inboxURLIfPresent,
+           url.path.hasPrefix(groupInbox.path + "/") {
+            return true
+        }
         guard Self.deliveryExtensions.contains(url.pathExtension.lowercased()) else { return false }
         return url.deletingLastPathComponent().path == fileManager.documentsURL.path
     }
 
-    /// 回前台扫描待处理投递（AppDelegate.applicationDidBecomeActive 调用）：
-    /// 扫描 Documents/Inbox（系统拷贝投递）与 Documents 根目录（document-browser 式
-    /// "保存到 App"投递 / 用户经文件 App 放入的应用文件）：
+    /// 回前台扫描待处理投递（触发点：SwiftUI scenePhase == .active 与
+    /// applicationDidBecomeActive 双挂——iOS 27 实测不再回调 application 级
+    /// didBecomeActive，SwiftUI scenePhase 是可靠触发点；两者并存，扫描内部去重）：
+    /// 扫描 Documents/Inbox（系统拷贝投递）、App Group 共享收件箱（分享扩展接收）、
+    /// Documents 根目录（document-browser 式"保存到 App"投递 / 用户经文件 App 放入）：
     /// - 已结算且文件不存在：清掉失效登记（防集合无限增长）；
     /// - 已结算但文件仍存在（删除失败等残留）：超过 24h 直接删除并清登记；
     /// - 未登记：视为 open 事件丢失的投递，补走完整导入链路（handleFileOpenedFromOutside
@@ -880,6 +887,15 @@ final class AppState: ObservableObject {
             ? "回前台扫描：Inbox 无文件"
             : "回前台扫描：Inbox \(inboxFiles.count) 项 [\(inboxFiles.map { $0.lastPathComponent }.joined(separator: "、"))]")
 
+        let groupInboxFiles = AppGroup.inboxURLIfPresent.map { inbox -> [URL] in
+            (try? FileManager.default.contentsOfDirectory(
+                at: inbox, includingPropertiesForKeys: [.contentModificationDateKey],
+                options: [.skipsHiddenFiles])) ?? []
+        } ?? []
+        if !groupInboxFiles.isEmpty {
+            ExternalDeliveryJournal.record("回前台扫描：共享 Inbox \(groupInboxFiles.count) 项 [\(groupInboxFiles.map { $0.lastPathComponent }.joined(separator: "、"))]")
+        }
+
         let documentsRootFiles = ((try? FileManager.default.contentsOfDirectory(
             at: fileManager.documentsURL, includingPropertiesForKeys: [.contentModificationDateKey],
             options: [.skipsHiddenFiles])) ?? [])
@@ -887,7 +903,7 @@ final class AppState: ObservableObject {
             .filter { Self.deliveryExtensions.contains($0.pathExtension.lowercased()) }
 
         // 剪枝：源文件已不存在的已结算登记（正常结算即删文件）顺带清掉
-        let alive = Set((inboxFiles + documentsRootFiles).map { $0.path })
+        let alive = Set((inboxFiles + groupInboxFiles + documentsRootFiles).map { $0.path })
         let settledAndGone = processedInboxPaths.subtracting(alive)
         if !settledAndGone.isEmpty {
             processedInboxPaths.subtract(settledAndGone)
@@ -895,7 +911,9 @@ final class AppState: ObservableObject {
         }
 
         let now = Date()
-        for file in inboxFiles.filter({ !$0.hasDirectoryPath }) + documentsRootFiles {
+        for file in inboxFiles.filter({ !$0.hasDirectoryPath })
+            + groupInboxFiles.filter({ !$0.hasDirectoryPath })
+            + documentsRootFiles {
             let path = file.path
             if processedInboxPaths.contains(path) {
                 // 已结算但源文件仍在（删除失败等残留）：超期清扫
@@ -930,6 +948,15 @@ final class AppState: ObservableObject {
         }
         lastOpenedExternalURL = url.absoluteString
         lastOpenedExternalDate = now
+
+        // 分享扩展「打开 App」信号（ipamanager://import）：文件已由扩展存入共享
+        // 收件箱，这里直接触发回前台扫描完成导入；不做文件导入路由
+        if url.scheme == "ipamanager" {
+            ExternalDeliveryJournal.record("收到主 App 唤起 URL: \(url.absoluteString)")
+            processInboxFilesIfNeeded()
+            return
+        }
+
         let ext = url.pathExtension.lowercased()
         Logger.info("外部打开文件: \(url.lastPathComponent)")
 

@@ -27,6 +27,10 @@ targets:
     platform: iOS
     sources:
       - path: Sources
+        # 分享扩展的源码属于扩展 target，主 App 不编译（避免 ShareViewController
+        # 重复符号）；Sources/Shared（AppGroup 共享常量）两个 target 各编一份
+        excludes:
+          - ShareExtension/**
       - path: Vendor/zsign/src
         excludes:
           - zsign.cpp
@@ -52,6 +56,15 @@ targets:
       - path: Vendor/zsign/ios
     dependencies:
       - package: ZIPFoundation
+      # 分享扩展：嵌入 PlugIns/，分享面板「IPA Manager」入口接收文件后经
+      # App Group 共享容器交给主 App（见 Sources/Shared/AppGroup.swift）
+      - target: "IPA Manager Share"
+        embed: true
+    entitlements:
+      path: IPAManager.entitlements
+      properties:
+        com.apple.security.application-groups:
+          - group.com.ipamanager.app
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.ipamanager.app
@@ -138,6 +151,13 @@ targets:
               - public.zip-archive
               - public.data
             CFBundleTypeRole: Viewer
+        # 自定义 scheme：分享扩展保存文件后尝试 ipamanager://import 拉起主 App
+        #（历史系统版本对分享扩展不支持 open，失败无副作用；主 App 收到后直接
+        # 触发共享收件箱扫描）
+        CFBundleURLTypes:
+          - CFBundleURLName: com.ipamanager.app
+            CFBundleURLSchemes:
+              - ipamanager
         # .ipa 在 iOS 无系统 UTI，不声明时系统按动态 UTI（仅 conforms public.data）
         # 匹配；显式声明后按扩展名精确映射，分享面板/打开方式的匹配更可靠。
         UTImportedTypeDeclarations:
@@ -149,6 +169,35 @@ targets:
             UTTypeTagSpecification:
               public.filename-extension:
                 - ipa
+  IPA Manager Share:
+    type: app-extension
+    platform: iOS
+    sources:
+      - path: Sources/ShareExtension
+      - path: Sources/Shared
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.ipamanager.app.Share
+        INFOPLIST_FILE: Sources/ShareExtension/Info.plist
+        TARGETED_DEVICE_FAMILY: "1"
+    info:
+      path: Sources/ShareExtension/Info.plist
+      properties:
+        CFBundleDisplayName: IPA Manager
+        CFBundleShortVersionString: "$(MARKETING_VERSION)"
+        CFBundleVersion: "$(CURRENT_PROJECT_VERSION)"
+        NSExtension:
+          NSExtensionPointIdentifier: com.apple.share-services
+          NSExtensionPrincipalClass: "$(PRODUCT_MODULE_NAME).ShareViewController"
+          # 字典 v2 激活规则：任何本地文件类分享（ipa/zip/p12/…）都出现本入口
+          NSExtensionActivationRule:
+            NSExtensionActivationDictionaryVersion: 2
+            NSExtensionActivationSupportsFileWithMaxCount: 1
+    entitlements:
+      path: Sources/ShareExtension/IPAManagerShare.entitlements
+      properties:
+        com.apple.security.application-groups:
+          - group.com.ipamanager.app
 schemes:
   IPA Manager:
     build:
@@ -158,3 +207,7 @@ schemes:
       config: Debug
     archive:
       config: Release
+  IPA Manager Share:
+    build:
+      targets:
+        IPA Manager Share: all

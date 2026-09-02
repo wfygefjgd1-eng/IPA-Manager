@@ -10,7 +10,7 @@
 - **断点续传下载**：下载任务支持暂停/恢复/断点续传，重启 App 后自动恢复。
 - **已签应用管理**：浏览已安装/已签名的应用，支持分享、删除、清除全部。
 - **多文件导入**：支持 IPA / ZIP（含 zip 内嵌 .ipa、.app 重打包）批量导入，自动识别应用信息并提取图标。
-- **系统分享导入**：在微信 / QQ / Safari / 文件等任意 App 里对 .ipa/.zip 文件点“分享 → 拷贝到 IPA Manager”，自动导入并按“自动一条龙”签名安装（打开事件丢失时回前台自动补处理）。
+- **系统分享接收（分享扩展）**：分享面板应用行出现「IPA Manager」入口（类似 QQ 邮箱/ChatGPT 的第三方入口），任意 App 里分享 .ipa/.zip/证书文件一键接收，打开 App 自动导入并签名安装；同时保留文档类型投递（「拷贝到 IPA Manager」）双通道。
 - **诊断报告**：一键导出完整诊断日志（中文 ERROR/INFO 级别），便于排障。
 
 ## 安装方式（网络要求）
@@ -22,7 +22,7 @@
 ## 使用流程
 
 1. **准备证书**：在“证书”标签页导入自己的 P12/PFX（若为 zip 证书包 zip 内含 p12 + 描述文件，导入尝试常见密码 `1`，失败请改在证书页手动输入密码导入）与 mobileprovision 描述文件；选择默认证书与描述文件。
-2. **下载或导入应用**：在“下载”标签页浏览器中下载 .ipa/.zip；或在“首页”从文件 App 导入 / 用其他 App 的“打开方式”发送到本 App；也可以直接在微信 / QQ / Safari / 文件等任意 App 里对 .ipa/.zip 文件点“分享”，选择“**拷贝到 IPA Manager**”，App 会自动导入并按第 3 步的“自动一条龙”签名安装。
+2. **下载或导入应用**：在“下载”标签页浏览器中下载 .ipa/.zip；或在“首页”从文件 App 导入 / 用其他 App 的“打开方式”发送到本 App；也可以直接在微信 / QQ / 电报 / Safari / 文件等任意 App 里对 .ipa/.zip 文件点“分享”，选择“**IPA Manager**”（分享扩展入口，文件直接接收）或“**拷贝到 IPA Manager**”（文档投递入口），App 会自动导入并按第 3 步的“自动一条龙”签名安装。
 3. **签名并安装**：进入应用详情，点击“签名并安装”；签名完成后弹窗提示“签名完成，已发起安装”，可点“确定”留在详情页，或点“返回”关闭详情页并回到桌面首页。默认开启“签名完成后自动返回桌面”，弹窗出现约 1.5 秒后自动回桌面（设置中可关）。
    - **自动一条龙**（默认开，设置中可关）：任意方式导入成功（首页导入 / 下载完成自动导入 / 外部打开）后，App 自动用默认证书签名并直接发起安装，完成后自动回桌面等 iOS 弹安装确认，无需手动点操作；未配置有效默认证书时自动跳过并保留手动入口。
    - 签名完成后也可点“安装”用指定证书重新发起安装、或“分享”导出 IPA。
@@ -90,6 +90,7 @@ xcodebuild -project "IPA Manager.xcodeproj" \
 
 ### 版本历史
 
+- **v1.0.125**（分享扩展版）：新增分享扩展（Share Extension）——分享面板应用行出现「IPA Manager」入口（类似 QQ 邮箱/ChatGPT 的第三方入口），从电报/微信/文件等任意 App 分享 .ipa/.zip/证书文件点它即可接收，保存后打开 App 自动完成「导入 → 默认证书签名 → 发起安装 → 回桌面」一条龙。文件经 App Group 共享容器交接（扩展与主 App 沙盒隔离，无法直接传递）；若签名描述文件未包含 App Group 能力（通配符 profile 常见），扩展给出明确提示、主 App 跳过共享目录扫描，安装不受影响（zsign 按描述文件内嵌 entitlements 签名，签名结果与 profile 一致，不存在 entitlement 不匹配拒装问题）。同时修复扫描器触发点：诊断实测 iOS 27 不再回调 UIApplicationDelegate.applicationDidBecomeActive（冷启动有投递日志而回前台扫描无记录），回前台兜底扫描改挂 SwiftUI scenePhase（onOpenURL 同源通道实测可用），AppDelegate 回调保留作旧系统兜底；主 App 新增 ipamanager:// scheme，扩展保存成功后尝试直接拉起主 App 开始导入。
 - **v1.0.123**（分享投递修正 + 追踪版）：修复"第三方 App 分享 → 入口显示为直接分享到（非拷贝到）→ 点开 App 毫无反应"且诊断报告无信号的残余问题。① 移除 UISupportsDocumentBrowser 声明（true→false）：该 key 声明本 App 为"文档浏览器"应用，与 UIFileSharingEnabled（文件共享）是 Apple 定位中两种互斥的文件暴露模式，组合声明矛盾；iOS 27 分享面板出现"无载荷入口"（直接分享到、点开 App 却不拷贝文件）的头号嫌疑即此——系统按文档浏览器语义路由分享而不走拷贝投递。本 App 从不使用 UIDocumentBrowserViewController，Documents 在文件 App 的可见性由 UIFileSharingEnabled 单独提供。② 新增外部投递追踪日志（ExternalDeliveryJournal，持久化跨启动 120 条环形）：启动（launchOptions 是否携带 URL）、openURL 事件（含 openInPlace）、回前台扫描结果、外部文件处理路由与结算结果全部落盘，诊断报告新增"外部投递追踪"章节——此前日志纯内存态，分享发生在上一次会话时报告完全不可见，"分享后无反应"无从定位。③ 回前台兜底扫描扩展到 Documents 根目录：除 Documents/Inbox 外，同时自动导入直接放入 Documents 根目录的 ipa/zip/p12/pfx/mobileprovision 文件（document-browser 式"保存到 App"投递与用户经文件 App 放入文件的兜底），导入后清理源文件。
 
 - **v1.0.121**（分享导入加固版）：修复"第三方 App（电报/微信等）分享 → 拷贝到/打开方式 → App 打开后毫无反应"的残余场景。① 关闭 LSSupportsOpeningDocumentsInPlace（true→false）：开启 in-place 时系统可能直接把来源 App 沙盒内的原位 URL 投递给本 App（文件不落地到 Documents/Inbox），open 事件一旦丢失连兜底扫描都无文件可扫；关闭后所有投递一律由系统先拷入 Inbox 再打开，回前台兜底扫描成为"事件丢了也必导入"的保险（本 App 对外部文件只做导入复制、从不原位编辑，in-place 无实际收益）；② 证书文件/证书包分享导入补结算回调（onSettled 贯穿 handleDownloadedFile / importCertificateBundleOrFile / handleSingleCertificateFile）：p12/pfx/mobileprovision/zip 证书包导入收尾（含失败）后删除 Inbox 源文件并落盘"已处理"标记（原证书链路无结算点，残留只能等 24h 清扫且每次启动重复尝试导入）；③ 已处理标记改为结算时落盘：进程在导入中途被杀时投递未结算，下次启动自动重新导入（原投递即落盘会让该文件永远不再导入）；④ 回前台追加 2.5 秒延迟复查（系统极少数情况在 App 激活后才完成 Inbox 拷贝），在途/已结算投递在 AppState 内部去重，不会重复导入。

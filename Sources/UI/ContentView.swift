@@ -2,6 +2,7 @@ import SwiftUI
 
 struct ContentView: View {
     @EnvironmentObject private var appState: AppState
+    @Environment(\.scenePhase) private var scenePhase
 
     var body: some View {
         TabView(selection: $appState.selectedTab) {
@@ -58,6 +59,19 @@ struct ContentView: View {
         }
         .animation(.easeInOut(duration: 0.25), value: appState.toastMessage)
         .animation(.easeInOut(duration: 0.25), value: appState.importProgress)
+        .onChange(of: scenePhase) { phase in
+            // 回前台兜底扫描的主触发点：iOS 27 实测不再回调 UIApplicationDelegate 的
+            // applicationDidBecomeActive（冷启动有投递日志而回前台扫描无记录），而
+            // SwiftUI 场景通道（onOpenURL/scenePhase）实测可用。AppDelegate 的
+            // applicationDidBecomeActive 里保留同一扫描（旧系统兜底），扫描内部去重。
+            guard phase == .active else { return }
+            ExternalDeliveryJournal.record("scenePhase → active（回前台）")
+            appState.processInboxFilesIfNeeded()
+            // 迟到投递保险：极少数场景系统在激活之后才完成文件拷贝，2.5 秒后复查一次
+            DispatchQueue.main.asyncAfter(deadline: .now() + 2.5) {
+                appState.processInboxFilesIfNeeded()
+            }
+        }
     }
 
     /// 导入进度卡片：黑色胶囊 + 转圈/内圈百分比 + 文件名 + 阶段文字 + i/N。
