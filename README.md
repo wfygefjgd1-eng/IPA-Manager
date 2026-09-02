@@ -90,6 +90,8 @@ xcodebuild -project "IPA Manager.xcodeproj" \
 
 ### 版本历史
 
+- **v1.0.126**（扩展可诊断版）：① 诊断报告新增「分享扩展状态」章节——直接列出已安装 IPA 内 PlugIns/*.appex 与 App Group 共享容器可用性：若显示"未随包安装"，说明所用签名工具在签名时剥离了扩展（iOS 不会为未签好/被剥离的扩展显示分享入口，这正是"分享面板只有一个跳 App 的入口而无扩展面板"的根因），需改用支持扩展的签名方式（例如用 IPA Manager 自己的签名引擎签本 App）；外部投递追踪在每次进程首次扫描时记录共享容器可用性。② 分享扩展接收兼容性增强：文件载体三级匹配（public.file-url → 任意 data 系 UTI 取原始字节 → public.url 包裹的本地文件路径），覆盖更多来源 App 的分享形态。
+
 - **v1.0.125**（分享扩展版）：新增分享扩展（Share Extension）——分享面板应用行出现「IPA Manager」入口（类似 QQ 邮箱/ChatGPT 的第三方入口），从电报/微信/文件等任意 App 分享 .ipa/.zip/证书文件点它即可接收，保存后打开 App 自动完成「导入 → 默认证书签名 → 发起安装 → 回桌面」一条龙。文件经 App Group 共享容器交接（扩展与主 App 沙盒隔离，无法直接传递）；若签名描述文件未包含 App Group 能力（通配符 profile 常见），扩展给出明确提示、主 App 跳过共享目录扫描，安装不受影响（zsign 按描述文件内嵌 entitlements 签名，签名结果与 profile 一致，不存在 entitlement 不匹配拒装问题）。同时修复扫描器触发点：诊断实测 iOS 27 不再回调 UIApplicationDelegate.applicationDidBecomeActive（冷启动有投递日志而回前台扫描无记录），回前台兜底扫描改挂 SwiftUI scenePhase（onOpenURL 同源通道实测可用），AppDelegate 回调保留作旧系统兜底；主 App 新增 ipamanager:// scheme，扩展保存成功后尝试直接拉起主 App 开始导入。
 - **v1.0.123**（分享投递修正 + 追踪版）：修复"第三方 App 分享 → 入口显示为直接分享到（非拷贝到）→ 点开 App 毫无反应"且诊断报告无信号的残余问题。① 移除 UISupportsDocumentBrowser 声明（true→false）：该 key 声明本 App 为"文档浏览器"应用，与 UIFileSharingEnabled（文件共享）是 Apple 定位中两种互斥的文件暴露模式，组合声明矛盾；iOS 27 分享面板出现"无载荷入口"（直接分享到、点开 App 却不拷贝文件）的头号嫌疑即此——系统按文档浏览器语义路由分享而不走拷贝投递。本 App 从不使用 UIDocumentBrowserViewController，Documents 在文件 App 的可见性由 UIFileSharingEnabled 单独提供。② 新增外部投递追踪日志（ExternalDeliveryJournal，持久化跨启动 120 条环形）：启动（launchOptions 是否携带 URL）、openURL 事件（含 openInPlace）、回前台扫描结果、外部文件处理路由与结算结果全部落盘，诊断报告新增"外部投递追踪"章节——此前日志纯内存态，分享发生在上一次会话时报告完全不可见，"分享后无反应"无从定位。③ 回前台兜底扫描扩展到 Documents 根目录：除 Documents/Inbox 外，同时自动导入直接放入 Documents 根目录的 ipa/zip/p12/pfx/mobileprovision 文件（document-browser 式"保存到 App"投递与用户经文件 App 放入文件的兜底），导入后清理源文件。
 

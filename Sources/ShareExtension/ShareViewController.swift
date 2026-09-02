@@ -69,19 +69,35 @@ final class ShareViewController: UIViewController {
         }
         let items = context.inputItems.compactMap { $0 as? NSExtensionItem }
         let attachments = items.flatMap { $0.attachments ?? [] }
-        // 优先本地文件 URL（文件类分享的标准载体），退回通用 data
-        let provider = attachments.first { $0.hasItemConformingToTypeIdentifier(UTType.fileURL.identifier) }
-            ?? attachments.first { $0.hasItemConformingToTypeIdentifier(UTType.data.identifier) }
-        guard let provider else {
+        // 三级载体匹配：本地文件 URL（文件类分享标准载体）→ 任意 data 系 UTI
+        //（可取原始字节）→ public.url（部分来源以 URL 对象包裹本地文件路径）
+        if let provider = attachments.first(where: { $0.hasItemConformingToTypeIdentifier(UTType.fileURL.identifier) }) {
+            receiveFile(from: provider, typeIdentifier: UTType.fileURL.identifier)
+        } else if let provider = attachments.first(where: { $0.hasItemConformingToTypeIdentifier(UTType.data.identifier) }) {
+            receiveFile(from: provider, typeIdentifier: UTType.data.identifier)
+        } else if let provider = attachments.first(where: { $0.hasItemConformingToTypeIdentifier(UTType.url.identifier) }) {
+            provider.loadItem(forTypeIdentifier: UTType.url.identifier, options: nil) { [weak self] item, error in
+                guard let self else { return }
+                let url = item as? URL
+                    ?? (item as? String).flatMap { URL(string: $0) }
+                if let url, url.isFileURL {
+                    self.saveAndFinish(url: url)
+                } else {
+                    DispatchQueue.main.async {
+                        self.updateStatus("未找到可导入的文件\n（URL 载荷不是本地文件）", success: false)
+                        self.scheduleComplete(after: 3.0)
+                    }
+                }
+            }
+        } else {
             updateStatus("未找到可导入的文件\n（请分享 .ipa / .zip / 证书文件）", success: false)
             scheduleComplete(after: 2.5)
-            return
         }
-        let typeIdentifier = provider.hasItemConformingToTypeIdentifier(UTType.fileURL.identifier)
-            ? UTType.fileURL.identifier
-            : UTType.data.identifier
+    }
+
+    /// 用 loadFileRepresentation 取文件：回调块结束时临时 url 即失效，必须当场复制
+    private func receiveFile(from provider: NSItemProvider, typeIdentifier: String) {
         provider.loadFileRepresentation(forTypeIdentifier: typeIdentifier) { [weak self] url, error in
-            // 该回调块结束时临时 url 即失效，必须在此块内完成复制
             guard let self else { return }
             guard let url else {
                 DispatchQueue.main.async {
@@ -90,25 +106,30 @@ final class ShareViewController: UIViewController {
                 }
                 return
             }
-            do {
-                let saved = try AppGroup.saveIncomingFile(at: url)
-                DispatchQueue.main.async {
-                    self.updateStatus(
-                        "已接收「\(saved.lastPathComponent)」\n\n请打开 IPA Manager，将自动完成\n导入 → 签名 → 安装",
-                        success: true
-                    )
-                    self.scheduleComplete(after: 3.0)
-                    // 尝试拉起主 App：历史系统版本对分享扩展不支持 open（失败无副作用）；
-                    // 若系统支持则直接回到 App，回前台扫描随即开始导入
-                    if let appURL = URL(string: "ipamanager://import") {
-                        context.open(appURL, completionHandler: nil)
-                    }
+            self.saveAndFinish(url: url)
+        }
+    }
+
+    /// 复制进共享收件箱并展示结果（任意线程可调，UI 更新自动回主线程）
+    private func saveAndFinish(url: URL) {
+        do {
+            let saved = try AppGroup.saveIncomingFile(at: url)
+            DispatchQueue.main.async {
+                self.updateStatus(
+                    "已接收「\(saved.lastPathComponent)」\n\n请打开 IPA Manager，将自动完成\n导入 → 签名 → 安装",
+                    success: true
+                )
+                self.scheduleComplete(after: 3.0)
+                // 尝试拉起主 App：历史系统版本对分享扩展不支持 open（失败无副作用）；
+                // 若系统支持则直接回到 App，回前台扫描随即开始导入
+                if let appURL = URL(string: "ipamanager://import") {
+                    self.extensionContext?.open(appURL, completionHandler: nil)
                 }
-            } catch {
-                DispatchQueue.main.async {
-                    self.updateStatus("保存失败：\(error.localizedDescription)", success: false)
-                    self.scheduleComplete(after: 3.0)
-                }
+            }
+        } catch {
+            DispatchQueue.main.async {
+                self.updateStatus("保存失败：\(error.localizedDescription)", success: false)
+                self.scheduleComplete(after: 3.0)
             }
         }
     }

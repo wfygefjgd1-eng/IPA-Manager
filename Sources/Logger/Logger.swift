@@ -125,6 +125,20 @@ enum Logger {
         lines.append(ExternalDeliveryJournal.reportText())
 
         lines.append("")
+        lines.append("===== 分享扩展状态 =====")
+        let appexNames = Bundle.main.urls(forResourcesWithExtension: "appex", subdirectory: "PlugIns")?.map { $0.lastPathComponent } ?? []
+        if appexNames.isEmpty {
+            lines.append("分享扩展：未随包安装（IPA 内无 PlugIns/*.appex——签名工具可能剥离了扩展，请用支持扩展的签名方式重签，例如用本 App 的签名引擎签本 App）")
+        } else {
+            lines.append("分享扩展：已安装 \(appexNames.count) 个：\(appexNames.joined(separator: "、"))")
+        }
+        if AppGroup.containerURL != nil {
+            lines.append("App Group 共享容器：可用（扩展 ↔ 主 App 文件交接正常）")
+        } else {
+            lines.append("App Group 共享容器：不可用（当前签名描述文件未包含 group.com.ipamanager.app，扩展将提示无法接收）")
+        }
+
+        lines.append("")
         lines.append("由 IPA Manager 诊断功能导出")
 
         return lines.joined(separator: "\n")

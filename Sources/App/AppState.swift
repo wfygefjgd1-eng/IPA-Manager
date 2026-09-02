@@ -851,6 +851,9 @@ final class AppState: ObservableObject {
     /// 防 open 事件 × 回前台扫描 × 冷启动 launchOptions 对同一文件并发/重复触发导入。
     private var pendingInboxImports: Set<String> = []
 
+    /// 共享容器可用性已记录（每次进程只记一次，避免追踪日志被重复条目淹没）
+    private var didJournalGroupAvailability = false
+
     /// 可自动导入的散落投递扩展名（Documents 根目录扫描用；Inbox 内不做扩展名过滤
     /// ——系统投递什么处理什么）。Documents 根下只认应用/证书文件，避免把用户经
     /// 文件 App 放进来的其它文件误当投递。
@@ -880,6 +883,12 @@ final class AppState: ObservableObject {
     ///   内部登记在途 + 结算自删 + 既有自动签名一条龙）。
     /// 仅主线程调用；目录不存在/为空时开销仅一次目录探测。
     func processInboxFilesIfNeeded() {
+        if !didJournalGroupAvailability {
+            didJournalGroupAvailability = true
+            ExternalDeliveryJournal.record(AppGroup.containerURL != nil
+                ? "共享容器：可用"
+                : "共享容器：不可用（无 App Group 权限，分享扩展无法交接文件）")
+        }
         let inboxFiles = (try? FileManager.default.contentsOfDirectory(
             at: inboxURL, includingPropertiesForKeys: [.contentModificationDateKey],
             options: [.skipsHiddenFiles])) ?? []
