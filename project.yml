@@ -83,7 +83,13 @@ targets:
         CFBundleShortVersionString: "$(MARKETING_VERSION)"
         CFBundleVersion: "$(CURRENT_PROJECT_VERSION)"
         UIFileSharingEnabled: true
-        LSSupportsOpeningDocumentsInPlace: true
+        # 分享导入可靠性（v1.0.121）：关闭 in-place 后，所有「拷贝到 / 打开方式」投递
+        # 一律由系统先把文件拷入 Documents/Inbox 再投递 openURL——回前台 Inbox 兜底扫描
+        # （AppState.processInboxFilesIfNeeded）才能在 open 事件丢失时补处理。若开启
+        # in-place，投递可能直接给出来源 App 沙盒内的原位 URL（文件不落地），事件一旦
+        # 丢失无任何兜底手段。本 App 对外部文件只做导入复制、从不原位编辑，in-place
+        # 无实际收益。
+        LSSupportsOpeningDocumentsInPlace: false
         UISupportsDocumentBrowser: true
         # ATS（P0-5 安全加固）：移除 NSAllowsArbitraryLoads 全局放行，改为精细化控制
         # - NSAllowsArbitraryLoads: false  默认禁止明文 HTTP

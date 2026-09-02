@@ -43,6 +43,11 @@ final class AppDelegate: NSObject, UIApplicationDelegate {
         // 分享投递 Inbox 兜底扫描：「拷贝到 App」的文件本体必然已拷入 Documents/Inbox，
         // open 事件丢失时在回前台时补处理（见 AppState.processInboxFilesIfNeeded）。
         AppState.shared.processInboxFilesIfNeeded()
+        // 迟到投递保险：极少数场景系统在 App 激活之后才完成 Inbox 拷贝，2.5 秒后
+        // 复查一次（仅一次，不链式；在途/已结算投递在 AppState 内部去重跳过）。
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2.5) {
+            AppState.shared.processInboxFilesIfNeeded()
+        }
     }
 
     func application(
