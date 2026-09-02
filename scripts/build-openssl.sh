@@ -68,6 +68,9 @@ echo "==> 编译静态库"
 # libssl 纯属白构建+白拷贝+白链接（约省 25-30% OpenSSL 编译时间）。
 # 注意：3.x 的 Makefile 没有 build_libcrypto 目标（只有 build_libs / 具体库名），
 # 且 install_dev 会因 libssl.a 缺失而失败——直接构建 libcrypto.a 并手动安装。
+# 另外 libcrypto.a 目标不携带 build_libs 的 build_generated 依赖，需先显式
+# 生成 opensslv.h 等派生头文件，否则所有 .o 编译报 "openssl/opensslv.h not found"。
+make -j"$(sysctl -n hw.ncpu)" build_generated
 make -j"$(sysctl -n hw.ncpu)" libcrypto.a || make libcrypto.a
 
 echo "==> 安装到 $DEVICE_OUT（libcrypto-only 手动安装）"
