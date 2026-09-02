@@ -18,6 +18,9 @@ final class UserDefaultsStore {
         static func backupKey(for key: String) -> String { "\(key)_backup" }
         /// 备份时间戳键（<key>_backup_date），用于 TTL 清理（>7 天自动删除）
         static func backupDateKey(for key: String) -> String { "\(key)_backup_date" }
+        /// 分享面板「拷贝到 App」已处理的 Inbox 投递路径（去重缓存，非业务数据：
+        /// 丢失的代价只是对残留文件多导入一次，importFile 按 bundleID 去重，无副作用）
+        static let processedInboxPaths = "processed_inbox_paths"
         /// 所有需要检查 TTL 的持久化键集合
         static let allPersistedKeys: [String] = [
             certificates, profiles, signingTasks, downloadTasks, importedApps
@@ -109,6 +112,18 @@ final class UserDefaultsStore {
 
     func saveDownloadTasks(_ items: [DownloadTask]) {
         save(items, key: Keys.downloadTasks)
+    }
+
+    // MARK: - 分享投递（Inbox）已处理记录
+
+    func loadProcessedInboxPaths() -> [String] {
+        load([String].self, key: Keys.processedInboxPaths) ?? []
+    }
+
+    func saveProcessedInboxPaths(_ paths: [String]) {
+        // 上限截断：异常堆积时仅保留最近记录（投递频度低，64 条远超实际需要；
+        // 记录丢失的代价只是对残留文件多导入一次，importFile 按 bundleID 去重）
+        save(Array(paths.suffix(64)), key: Keys.processedInboxPaths)
     }
 
     // MARK: - 自动流程开关（默认开启）

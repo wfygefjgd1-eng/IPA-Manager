@@ -113,12 +113,30 @@ targets:
           - UIInterfaceOrientationPortrait
         UILaunchScreen:
           UIColorName: ""
+        # 分享面板「拷贝到 IPA Manager」链路：文档类型声明是对文件类分享的官方集成，
+        # 声明后 App 以「拷贝到 IPA Manager」出现在分享面板 App 行，系统把文件拷入
+        # Documents/Inbox 并投递 openURL。public.data 是兜底（任意未知扩展名的文件
+        # 动态 UTI 均 conforms 到它）；显式列出 com.ipamanager.ipa（下方 imported
+        # declaration）与 public.zip-archive 提升微信/QQ/Safari/文件等来源的匹配率。
         CFBundleDocumentTypes:
           - CFBundleTypeName: IPA File
             LSHandlerRank: Owner
             LSItemContentTypes:
+              - com.ipamanager.ipa
+              - public.zip-archive
               - public.data
             CFBundleTypeRole: Viewer
+        # .ipa 在 iOS 无系统 UTI，不声明时系统按动态 UTI（仅 conforms public.data）
+        # 匹配；显式声明后按扩展名精确映射，分享面板/打开方式的匹配更可靠。
+        UTImportedTypeDeclarations:
+          - UTTypeIdentifier: com.ipamanager.ipa
+            UTTypeDescription: iOS 应用安装包 (IPA)
+            UTTypeConformsTo:
+              - public.data
+              - public.archive
+            UTTypeTagSpecification:
+              public.filename-extension:
+                - ipa
 schemes:
   IPA Manager:
     build:

@@ -60,6 +60,9 @@ enum Timeouts {
     static let toast: TimeInterval = 3.0
     /// AppState external-open dedupe window
     static let externalOpenDedupe: TimeInterval = 2.0
+    /// 分享投递（Documents/Inbox）残留清扫时限：已登记处理但未结算删除的文件，
+    /// 保留 24h 后由回前台扫描删除（正常导入链路结算后会自删源文件）
+    static let inboxResidueMaxAge: TimeInterval = 24 * 60 * 60
     /// LocalInstallServer isReachable HEAD timeout
     static let isReachable: TimeInterval = 5.0
 }

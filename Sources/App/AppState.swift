@@ -102,6 +102,7 @@ final class AppState: ObservableObject {
     }
 
     init() {
+        processedInboxPaths = Set(store.loadProcessedInboxPaths())
         loadPersistedState()
         // 启动孤儿清扫放在首次“已签应用”扫描完成之后执行：refreshInstalledApps
         // 的解析会创建新的解压目录，且 installedApps 到此刻才就绪——若清扫与
@@ -733,11 +734,15 @@ final class AppState: ObservableObject {
         guard let cert = selectedCertificate, cert.status == .valid,
               certificates.contains(where: { $0.id == cert.id }) else {
             Logger.warning("自动签名跳过：无有效默认证书（\(app.name)）")
+            // 用户可见反馈：自动一条龙静默跳过时，分享/导入方视角就是"毫无动静"
+            // （尤其分享面板投递场景），给出下一步指引而不只是写日志
+            showToast("已导入「\(app.name)」，未自动签名：请先在「证书」页设置默认证书")
             return false
         }
         guard let profile = selectedProfile, profile.status == .valid,
               profiles.contains(where: { $0.id == profile.id }) else {
             Logger.warning("自动签名跳过：无有效默认描述文件（\(app.name)）")
+            showToast("已导入「\(app.name)」，未自动签名：请先在「证书」页设置默认描述文件")
             return false
         }
         // 已入队/正在签名的跳过（防重复入队）。注意：同 bundleID 重导入会生成
@@ -820,6 +825,56 @@ final class AppState: ObservableObject {
         }
     }
 
+    // MARK: - 分享面板「拷贝到 IPA Manager」投递（Documents/Inbox）
+
+    /// 系统分享投递目录：分享面板对文件类分享的官方集成是文档类型声明——声明了
+    /// CFBundleDocumentTypes 的 App 以「拷贝到 IPA Manager」出现在分享面板 App 行，
+    /// 点按后系统把文件拷入 Documents/Inbox 再投递 openURL 事件。（不用 Share
+    /// Extension：扩展要把文件交给主 App 必须 App Group，而本 App 由用户用任意
+    /// 企业证书自签安装，通配符 profile 不含 App Group 能力，嵌套 appex 的
+    /// entitlement 校验会导致整个 App 无法安装。）
+    /// UIFileSharingEnabled 下 Inbox 对文件 App 可见，系统不保证清理——导入结算后
+    /// 自删源文件，防重复导入与 GB 级残留。
+    private var inboxURL: URL {
+        fileManager.documentsURL.appendingPathComponent("Inbox", isDirectory: true)
+    }
+
+    /// 已登记的分享投递（持久化，仅主线程读写）：open 事件、回前台 Inbox 扫描、
+    /// 冷启动 launchOptions 可能对同一投递文件多次进入本类，以文件路径登记去重；
+    /// 结算删除源文件后清除登记（删除失败/无结算回调的链路由 24h 残留清扫兜底）。
+    private var processedInboxPaths: Set<String> = []
+
+    /// 回前台扫描分享投递目录（AppDelegate.applicationDidBecomeActive 调用）：
+    /// - 已登记但文件仍存在：超过 24h 的残留直接删除（导入成功会自删 Inbox 源文件，
+    ///   仍残留的多为无结算回调的证书包/删除失败，保留只会无限堆积）；
+    /// - 未登记：视为 open 事件丢失的投递，补走完整导入链路（handleFileOpenedFromOutside
+    ///   内部登记 + 结算自删 + 既有自动签名一条龙）。
+    /// 仅主线程调用；Inbox 不存在/为空时开销仅一次目录探测。
+    func processInboxFilesIfNeeded() {
+        let inbox = inboxURL
+        guard let files = try? FileManager.default.contentsOfDirectory(
+            at: inbox, includingPropertiesForKeys: [.contentModificationDateKey]
+        ), !files.isEmpty else { return }
+
+        let now = Date()
+        for file in files {
+            let path = file.path
+            if processedInboxPaths.contains(path) {
+                let modified = (try? file.resourceValues(forKeys: [.contentModificationDateKey]))?
+                    .contentModificationDate
+                if let modified, now.timeIntervalSince(modified) > Timeouts.inboxResidueMaxAge {
+                    try? FileManager.default.removeItem(at: file)
+                    processedInboxPaths.remove(path)
+                    store.saveProcessedInboxPaths(Array(processedInboxPaths))
+                    Logger.info("清理超期分享投递残留: \(file.lastPathComponent)")
+                }
+                continue
+            }
+            Logger.info("Inbox 兜底导入（open 事件丢失）: \(file.lastPathComponent)")
+            handleFileOpenedFromOutside(file)
+        }
+    }
+
     /// 外部打开文件去重：SwiftUI 生命周期下 application(_:open:) 与 onOpenURL 可能
     /// 对同一 URL 双触发（两个入口并存），短窗口内同一 URL 只处理一次，避免重复导入。
     private var lastOpenedExternalURL: String = ""
@@ -837,6 +892,28 @@ final class AppState: ObservableObject {
         let ext = url.pathExtension.lowercased()
         Logger.info("外部打开文件: \(url.lastPathComponent)")
 
+        // 分享面板「拷贝到 App」投递识别（文件位于 Documents/Inbox）：先登记持久化
+        // 再处理，open 事件与回前台扫描/冷启动 launchOptions 对同一文件的重复投递
+        //（超出 2 秒去重窗口的）在此丢弃，杜绝双重导入。
+        var inboxSettlement: (() -> Void)? = nil
+        if url.path.hasPrefix(inboxURL.path + "/") {
+            guard processedInboxPaths.insert(url.path).inserted else {
+                Logger.info("分享投递重复，跳过: \(url.lastPathComponent)")
+                return
+            }
+            store.saveProcessedInboxPaths(Array(processedInboxPaths))
+            // 结算闭包：导入链路（成功/失败）走完后删除 Inbox 源文件——文件已复制进
+            // IPA 目录/入库，源文件继续保留只会被重复导入并占用空间；删除成功才清除
+            // 登记（删除失败保留登记，由回前台扫描的 24h 残留清扫兜底）。
+            inboxSettlement = { [weak self] in
+                let removed = (try? FileManager.default.removeItem(at: url)) != nil
+                guard let self = self, removed else { return }
+                if self.processedInboxPaths.remove(url.path) != nil {
+                    self.store.saveProcessedInboxPaths(Array(self.processedInboxPaths))
+                }
+            }
+        }
+
         switch ext {
         case "zip", "tgz", "tar", "gz":
             // 压缩包统一走下载完成的分类导入（证书包 / 应用包 / zip 内嵌 ipa / 未知），
@@ -844,9 +921,14 @@ final class AppState: ObservableObject {
             // 分类为 .certificateBundle 时其内部仍会调 importCertificateBundleOrFile，证书包不受影响。
             // tgz/tar/gz 与下载链路保持同一分发（此前只认 zip，外部打开的 tgz 会落
             // default 分支报解析错误）。
-            handleDownloadedFile(at: url)
+            // Inbox 投递挂结算：应用包/内嵌 ipa/未知/失败各路径 completion 均回调，据此
+            // 删除 Inbox 源文件；证书包分支无 completion（既有行为），由残留清扫兜底。
+            handleDownloadedFile(at: url) { _ in
+                inboxSettlement?()
+            }
         case "p12", "pfx", "mobileprovision":
-            // 单个证书相关文件保持原逻辑（zip 才是证书包载体）
+            // 单个证书相关文件保持原逻辑（zip 才是证书包载体）；证书导入无统一
+            // completion，Inbox 投递不做结算，由残留清扫兜底（p12 体积小）。
             importCertificateBundleOrFile(url)
         default:
             importFile(from: url) { result in
@@ -859,6 +941,8 @@ final class AppState: ObservableObject {
                     // 外部打开失败必须给反馈（否则用户在文件 App 里点了毫无反应）
                     self.showToast("导入失败: \(error.localizedDescription)")
                 }
+                // Inbox 投递结算：导入成功/失败后删除 Inbox 源文件
+                inboxSettlement?()
             }
         }
     }

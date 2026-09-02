@@ -11,6 +11,14 @@ final class AppDelegate: NSObject, UIApplicationDelegate {
         // "IPA Manager Server Cert" / "IPA Manager Server Identity <uuid>"
         // 证书/私钥条目 App 卸载后不会自动清除，统一在启动时清理。
         CertificateManager.cleanupServerIdentityKeychainItems()
+        // 冷启动分享投递兜底：分享面板「拷贝到 IPA Manager」冷启动 App 时，个别系统
+        // 版本/时序下 application(_:open:) 与 onOpenURL 均不回调，open 事件丢失表现为
+        // "分享后毫无反应"。launchOptions[.url] 是系统冷启动保证携带的投递通道；若
+        // open/onOpenURL 随后重复投递同一 URL，由 AppState 的去重兜住，不会双重导入。
+        if let url = launchOptions?[.url] as? URL {
+            Logger.info("冷启动携带外部文件: \(url.lastPathComponent)")
+            AppState.shared.handleFileOpenedFromOutside(url)
+        }
         return true
     }
 
@@ -32,6 +40,9 @@ final class AppDelegate: NSObject, UIApplicationDelegate {
             LocalInstallServer.shared.stop()
             BackgroundAudioKeepAlive.shared.stop()
         }
+        // 分享投递 Inbox 兜底扫描：「拷贝到 App」的文件本体必然已拷入 Documents/Inbox，
+        // open 事件丢失时在回前台时补处理（见 AppState.processInboxFilesIfNeeded）。
+        AppState.shared.processInboxFilesIfNeeded()
     }
 
     func application(
