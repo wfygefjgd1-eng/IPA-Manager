@@ -62,8 +62,9 @@ xcodebuild -project "IPA Manager.xcodeproj" \
 
 - 固定 OpenSSL 3.3.2，静态库（`no-shared`）；
 - **不启用 legacy provider、不 install providers.h**（本工程不 include 它，避免链接触发缺失头文件）；
-- 仅 iOS 真机 arm64（`ios64-xcrun`）；测试/示例/应用禁用（`no-tests no-apps`）。
-- 构建脚本 `scripts/build-openssl.sh` 为本地与 CI 共用入口；CI 的 OpenSSL 缓存 key 由 `hashFiles('scripts/build-openssl.sh')` 随脚本内容自动失效（脚本内容变化即自动换 key 重建），仅当脚本内容未变而需要强制重建时才手动修改 key 后的 `-v1` 后缀。
+- 仅 iOS 真机 arm64（`ios64-xcrun`）；测试/示例/应用禁用（`no-tests no-apps`）；
+- **仅构建 libcrypto**（`make build_libcrypto`）：全库无任何 SSL_*/TLS_* 调用，不构建也不链接 libssl（工程链接项只有 `libcrypto-device.a`），节省约 25-30% 编译时间；
+- 构建脚本 `scripts/build-openssl.sh` 为本地与 CI 共用入口；CI 的 OpenSSL 缓存 key 由 `hashFiles('scripts/build-openssl.sh')` 随脚本内容自动失效（脚本内容变化即自动换 key 重建），仅当脚本内容未变而需要强制重建时才手动修改 key 后的 `-v2` 后缀。
 
 ## 持续集成（CI）
 

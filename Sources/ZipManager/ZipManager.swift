@@ -67,10 +67,63 @@ final class ZipManager {
             Logger.error("ZIP 解压失败（底层原因）: \(error)")
             // 清理半成品，避免残留不完整文件
             try? fileManager.removeItem(at: destinationURL)
+            if Self.isDiskFull(error) {
+                throw ZipError.unknown("磁盘空间不足，无法完成解压。请清理存储空间后重试")
+            }
             throw ZipError.corrupted("ZIP 文件已损坏或下载不完整，请删除后重新下载")
         }
 
         Logger.info("解压完成: \(destinationURL.path)")
+    }
+
+    /// 列出压缩包全部条目路径（不解压任何实体，仅遍历中央目录，几百 MB 的包也是
+    /// 毫秒级）。供"只需按文件名/路径形状分类内容"的场景使用（下载自动导入的
+    /// 证书包/应用包/内嵌 ipa 分类），替代旧实现的全量解压后扫目录——2GB 包的
+    /// 自动导入不再为看一眼文件名付整包解压的 IO 与磁盘峰值。
+    /// 条目级安全校验与 unzip 一致（复用 validateAndGetArchive：zip-slip/symlink/
+    /// 反斜杠/体积上限），含非法条目的包直接抛 ZipError。
+    func listEntryPaths(archiveURL: URL) throws -> [String] {
+        try validateZipHeader(at: archiveURL)
+        let (archive, _) = try validateAndGetArchive(at: archiveURL)
+        return archive.map { $0.path }
+    }
+
+    /// 把压缩包中指定路径的单个条目解出到目标 URL（其余条目不落盘）。
+    /// 供内嵌 .ipa 抽取等"只取一个条目"的场景：旧实现（分类全量解压）要付整包
+    /// 解压的 IO/磁盘峰值才能拿到一个 .ipa。目标 URL 由调用方构造（调用方负责
+    /// 唯一化与合法性）；entryPath 必须来自 listEntryPaths 的返回值（已经过
+    /// 安全校验，穿越/符号链接条目在 validateAndGetArchive 中已被拒绝）。
+    func extractEntry(archiveURL: URL, entryPath: String, to targetURL: URL) throws {
+        try validateZipHeader(at: archiveURL)
+        let (archive, _) = try validateAndGetArchive(at: archiveURL)
+        guard let entry = archive.first(where: { $0.path == entryPath }) else {
+            throw ZipError.corrupted("压缩包内未找到条目: \(entryPath)")
+        }
+        guard entry.type == .file else {
+            throw ZipError.corrupted("压缩包条目不是文件: \(entryPath)")
+        }
+        let parent = targetURL.deletingLastPathComponent()
+        try fileManager.createDirectory(at: parent, withIntermediateDirectories: true)
+        if fileManager.fileExists(atPath: targetURL.path) {
+            try fileManager.removeItem(at: targetURL)
+        }
+        do {
+            try archive.extract(entry, to: targetURL)
+        } catch {
+            try? fileManager.removeItem(at: targetURL)
+            if Self.isDiskFull(error) {
+                throw ZipError.unknown("磁盘空间不足，无法完成解压。请清理存储空间后重试")
+            }
+            throw ZipError.corrupted("条目解压失败（\(entryPath)）：文件可能已损坏")
+        }
+    }
+
+    /// 磁盘满（NSFileWriteOutOfSpace = 640）单独归因：把"解压时空间不足"误报成
+    /// "ZIP 已损坏"会诱导用户重新下载——重新下载必然在相同位置再失败，且下载
+    /// 目录还会再多一份 IPA 占位，进一步压缩空间。
+    private static func isDiskFull(_ error: Error) -> Bool {
+        let ns = error as NSError
+        return ns.domain == NSCocoaErrorDomain && ns.code == NSFileWriteOutOfSpace
     }
 
     /// 单次 Archive 打开完成全部条目级安全校验，并返回已校验的 Archive 与总解压体积。
@@ -257,6 +310,9 @@ final class ZipManager {
         } catch {
             Logger.error("ZIP 解压失败（底层原因）: \(error)")
             try? fileManager.removeItem(at: destinationURL)
+            if Self.isDiskFull(error) {
+                throw ZipError.unknown("磁盘空间不足，无法完成解压。请清理存储空间后重试")
+            }
             throw ZipError.corrupted("ZIP 文件已损坏或下载不完整，请删除后重新下载")
         }
     }

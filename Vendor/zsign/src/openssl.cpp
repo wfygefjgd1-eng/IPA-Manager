@@ -1,6 +1,7 @@
 #include "common.h"
 #include "base64.h"
 #include "openssl.h"
+#include <mutex>
 #include <openssl/pem.h>
 #include <openssl/cms.h>
 #include <openssl/err.h>
@@ -826,6 +827,35 @@ ZSignAsset::ZSignAsset()
 	m_bSHA256Only = false;
 }
 
+ZSignAsset::~ZSignAsset()
+{
+	if (NULL != m_evpPKey) {
+		EVP_PKEY_free((EVP_PKEY*)m_evpPKey);
+		m_evpPKey = NULL;
+	}
+	if (NULL != m_x509Cert) {
+		X509_free((X509*)m_x509Cert);
+		m_x509Cert = NULL;
+	}
+	if (NULL != m_caCerts) {
+		sk_X509_pop_free((STACK_OF(X509)*)m_caCerts, X509_free);
+		m_caCerts = NULL;
+	}
+}
+
+void ZSignAsset::EnsurePKCS12ProvidersLoaded()
+{
+	static std::once_flag s_providersOnce;
+	std::call_once(s_providersOnce, []() {
+		OSSL_PROVIDER_load(NULL, "default");
+		// legacy：静态构建可能未编入，加载失败属预期——立即清错误队列，
+		// 防止 "provider not found" 混入后续 PKCS12_parse 的真实诊断。
+		if (NULL == OSSL_PROVIDER_load(NULL, "legacy")) {
+			ERR_clear_error();
+		}
+	});
+}
+
 bool ZSignAsset::Init(
 	const string& strCertFile,
 	const string& strPKeyFile, 
@@ -885,9 +915,9 @@ bool ZSignAsset::Init(
 			if (NULL == evpPKey) {
 				BIO_reset(bioPKey);
 				// PBES2/AES p12 需要 default provider；旧式 3DES/RC2 需要 legacy provider。
-				// 静态链接构建中 provider 对象若未被链接器拉入，这里会返回 NULL，但不影响后续尝试。
-				OSSL_PROVIDER_load(NULL, "default");
-				OSSL_PROVIDER_load(NULL, "legacy");
+				// 进程级一次性加载（静态构建可能没有 legacy，失败已就地清错误队列），
+				// 旧实现每次 Init 都 load 一次且从不 unload，provider 引用计数持续累积。
+				EnsurePKCS12ProvidersLoaded();
 				PKCS12* p12 = d2i_PKCS12_bio(bioPKey, NULL);
 				if (NULL != p12) {
 					STACK_OF(X509)* caCerts = NULL;
@@ -950,11 +980,16 @@ bool ZSignAsset::Init(
 
 	if (NULL == x509Cert) {
 		ZLog::Error(">>> Can't find paired certificate and private key!\n");
+		// Init 失败路径同样要释放已加载的私钥（局部变量不会经过析构）
+		EVP_PKEY_free(evpPKey);
 		return false;
 	}
 
 	if (!GetCertSubjectCN(x509Cert, m_strSubjectCN)) {
 		ZLog::Error(">>> Can't find paired certificate subject common name!\n");
+		// Init 失败路径同样要释放已加载的私钥与证书
+		X509_free(x509Cert);
+		EVP_PKEY_free(evpPKey);
 		return false;
 	}
 

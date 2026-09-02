@@ -14,6 +14,13 @@ protocol SigningEngineProtocol {
 final class SigningEngine: SigningEngineProtocol {
     static let shared = SigningEngine()
 
+    /// 全局 zsign 串行队列：zsign 桥接层并发不安全，自动签名（AppState 的
+    /// 串行队列）只串行化了自动路径，手动签名与证书导入的 p12 解析
+    /// （zsign_p12_info）此前走并发 global 队列，可与自动签名的 zsign 任务
+    /// 并发执行 → 崩溃/产物损坏。所有桥接入口（zsign_sign / zsign_p12_info）
+    /// 统一在此队列执行，进程级互斥。
+    static let zsignQueue = DispatchQueue(label: "com.ipamanager.zsign", qos: .userInitiated)
+
     private let fileManager = AppFileManager.shared
     private let certManager = CertificateManager.shared
     private let zipManager = ZipManager.shared
@@ -88,9 +95,13 @@ final class SigningEngine: SigningEngineProtocol {
 
         // 首选：把 p12 里的私钥导出为 PEM 私钥文件（绕开 iOS 静态 OpenSSL 对
         // PBES2/AES p12 的 PKCS12_parse 失败问题）；返回 nil（EC 曲线不支持/
-        // 解析失败）则回退直接用 p12 文件。zsign 的 ZSignAsset::Init 在 certPath
+        // 系统解析失败）则回退直接用 p12 文件。zsign 的 ZSignAsset::Init 在 certPath
         // 为空时会自动从描述文件的 DeveloperCertificates 里找与私钥配对的证书。
-        let keyFileURL = (try? exportPrivateKeyPEM(from: p12URL, password: certPassword)) ?? nil
+        // 注意：这里必须传播 throw——exportPrivateKeyPEM 只对"确定性失败"抛错
+        // （密码不正确：系统解不开，OpenSSL 用同一个密码同样解不开，早失败并
+        // 给出精确中文诊断，而不是落到 zsign 的泛化错误）；其余失败在函数内部
+        // 记日志后返回 nil 走回退（系统不支持的旧式加密 p12，OpenSSL 反而可能解析）。
+        let keyFileURL = try exportPrivateKeyPEM(from: p12URL, password: certPassword)
         defer {
             if let keyFileURL = keyFileURL {
                 try? fileManager.deleteItem(at: keyFileURL)
@@ -216,33 +227,43 @@ final class SigningEngine: SigningEngineProtocol {
               let array = items as? [[String: Any]],
               let first = array.first,
               let rawIdentity = first[kSecImportItemIdentity as String] else {
-            let reason = "系统无法解析此证书 (错误码 \(status))"
-            Logger.error("导出 PEM 私钥失败: \(reason)")
-            throw AppError.signFailed(reason)
+            if status == errSecAuthFailed {
+                // 密码不正确是确定性失败：zsign 的 OpenSSL 用同一个密码同样解不开，
+                // 早失败并给出精确诊断，而不是落到 zsign 的泛化错误让用户无从排查
+                //（Keychain 中存的密码与 p12 实际密码不符，例如证书密码被重置过）。
+                let reason = "证书密码不正确，无法解密证书（系统错误码 \(status)），请删除该证书后重新导入"
+                Logger.error("导出 PEM 私钥失败: \(reason)")
+                throw AppError.signFailed(reason)
+            }
+            // 其余解析失败（旧式 RC2/3DES 加密的 p12 系统不支持等）：记下具体状态码
+            // 后回退 zsign/OpenSSL 直接解析 p12——那条路径反而可能成功
+            Logger.warning("系统解析 p12 失败(错误码 \(status))，回退 OpenSSL 直接解析 p12")
+            return nil
         }
         // SecIdentity 是 CoreFoundation 类型，不能对 CF 类型做条件转换（编译器报错
         // “conditional downcast to CoreFoundation type will always succeed”），
         // 与 ServerIdentityProvider 一致：CFGetTypeID 校验类型后用强制转换，
         // 类型不符时抛中文错误而非崩溃。
         guard CFGetTypeID(rawIdentity as CFTypeRef) == SecIdentityGetTypeID() else {
-            let reason = "证书数据格式异常（无法获取签名身份）"
-            Logger.error("导出 PEM 私钥失败: \(reason)")
-            throw AppError.signFailed(reason)
+            // 结构异常但 p12 文件本身在磁盘上：回退 OpenSSL 路径仍有机会解析
+            Logger.warning("系统解析 p12 得到异常身份类型，回退 OpenSSL 直接解析 p12")
+            return nil
         }
         let identity = rawIdentity as! SecIdentity
 
         var privateKey: SecKey?
         let keyStatus = SecIdentityCopyPrivateKey(identity, &privateKey)
         guard keyStatus == errSecSuccess, let key = privateKey else {
-            let reason = "证书中未找到私钥"
-            Logger.error("导出 PEM 私钥失败: \(reason)")
-            throw AppError.signFailed(reason)
+            // 典型场景：设备锁定时受保护私钥不可用（errSecInteractionNotAllowed）。
+            // OpenSSL 直接读 p12 文件不经过 Keychain，回退后仍可完成签名。
+            Logger.warning("系统导出私钥失败(错误码 \(keyStatus))，回退 OpenSSL 直接解析 p12")
+            return nil
         }
 
         guard let keyData = SecKeyCopyExternalRepresentation(key, nil) as Data? else {
-            let reason = "无法导出私钥"
-            Logger.error("导出 PEM 私钥失败: \(reason)")
-            throw AppError.signFailed(reason)
+            // 私钥不可导出（安全策略限制）：p12 文件本身仍可由 OpenSSL 解析，回退
+            Logger.warning("系统无法导出私钥数据，回退 OpenSSL 直接解析 p12")
+            return nil
         }
 
         var isEC = false
@@ -458,17 +479,19 @@ final class SigningEngine: SigningEngineProtocol {
             return true
         }
         // Archive 由 deinit 自动关闭（与 ZipManager 一致，不调用 close()）
+        // 必须完整遍历中央目录再下结论：旧实现"遇到第一个非 Payload 条目即判非
+        // 标准"依赖条目顺序——重签名流水线 / macOS 打包常把 __MACOSX/、META-INF/
+        // 等排在 Payload 之前，标准 IPA 被误判为缺 Payload → 走整套"解压 + 找
+        // .app + 重打包"规范化，大 IPA 白白多花数十秒与一倍临时磁盘。
+        var hasPayload = false
         for entry in archive {
             let path = entry.path
             if path == "Payload" || path.hasPrefix("Payload/") {
-                return true
-            }
-            // 顶层第一条非 Payload 条目即可判定非标准（先到先得，避免全量遍历）
-            if !path.isEmpty && !path.hasPrefix("Payload") {
-                return false
+                hasPayload = true
+                break
             }
         }
-        return false
+        return hasPayload
     }
 
     /// 在解压目录中查找 .app 应用包（顶层优先，递归兜底）。

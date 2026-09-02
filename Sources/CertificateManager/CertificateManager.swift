@@ -12,7 +12,10 @@ final class CertificateManager {
         password: String,
         completion: @escaping (Result<CertificateInfo, Error>) -> Void
     ) {
-        DispatchQueue.global(qos: .userInitiated).async {
+        // 走 SigningEngine 的全局 zsign 串行队列：readCertificate 内部调用
+        // zsign_p12_info（桥接层并发不安全），旧实现派发到并发 global 队列，
+        // 与自动/手动签名（zsign_sign）并发时可触发桥接层数据竞争。
+        SigningEngine.zsignQueue.async {
             let accessed = url.startAccessingSecurityScopedResource()
             defer {
                 if accessed {

@@ -5,9 +5,18 @@ class ZSignAsset
 {
 public:
 	ZSignAsset();
+	// Init 把 EVP_PKEY/X509/CA 栈存入成员且全库无任何释放路径：CLI 短命进程无感，
+	// 嵌入常驻 App 后每次签名泄漏一份私钥+证书+CA 栈（明文私钥材料滞留堆中）。
+	~ZSignAsset();
 
 public:
-	bool Init(const string& strCertFile, 
+	// PKCS12 解析所需 provider 的进程级一次性加载（default 必需，legacy 尽力而为：
+	// 静态构建可能未编入，加载失败即清错误队列防污染后续诊断）。旧实现每次
+	// p12 解析都 OSSL_PROVIDER_load 一次且从不 unload，provider 引用计数持续累积。
+	static void EnsurePKCS12ProvidersLoaded();
+
+public:
+	bool Init(const string& strCertFile,
 				const string& strPKeyFile,
 				const string& strProvFile,
 				const string& strEntitleFile,

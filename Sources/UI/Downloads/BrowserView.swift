@@ -571,9 +571,16 @@ private struct WebView: UIViewRepresentable {
             decisionHandler: @escaping (WKNavigationResponsePolicy) -> Void
         ) {
             let mime = navigationResponse.response.mimeType?.lowercased() ?? ""
-            let mimeIsDownload = mime.contains("zip") || mime.contains("octet-stream") || mime.contains("application/x-tar")
+            // 只把已知归档/二进制类型当下载；canShowMIMEType == false 覆盖大量
+            // 可正常渲染的类型（典型：application/json 的 API 响应），旧实现一律
+            // 拦成下载，浏览器里点开一个 JSON 接口就会莫名多出一条"已完成"任务
+            let mimeIsDownload = mime.contains("zip")
+                || mime.contains("octet-stream")
+                || mime.contains("application/x-tar")
+                || mime.contains("application/x-gzip")
+            let isTextLike = mime.hasPrefix("text/") || mime.contains("json") || mime.contains("xml")
 
-            if !navigationResponse.canShowMIMEType || mimeIsDownload {
+            if !isTextLike && (!navigationResponse.canShowMIMEType || mimeIsDownload) {
                 if let url = navigationResponse.response.url {
                     parent.onDownloadDetected(url)
                 }
@@ -581,6 +588,13 @@ private struct WebView: UIViewRepresentable {
                 return
             }
             decisionHandler(.allow)
+        }
+
+        // 内容进程被系统回收（长时间浏览/内存压力）时页面白屏且 isLoading 为 false：
+        // 自动重载一次恢复，避免用户以为应用坏了
+        func webViewWebContentProcessDidTerminate(_ webView: WKWebView) {
+            Logger.warning("网页内容进程被系统回收，自动重载")
+            webView.reload()
         }
 
         // 新窗口打开（target=_blank）统一在当前浏览器打开

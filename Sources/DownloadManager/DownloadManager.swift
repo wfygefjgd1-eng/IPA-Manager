@@ -35,6 +35,18 @@ final class DownloadManager: NSObject {
 
     /// 总大小已持久化过的任务 id 集合（每个任务仅持久化一次，见 didWriteData）
     private var sizePersistedTasks: Set<UUID> = []
+    /// 用户点"暂停"触发了 cancel(byProducingResumeData:) 的任务 id：
+    /// didCompleteWithError 收到 NSURLErrorCancelled 时据此按"暂停完成"收尾
+    /// （存 resumeData、状态保持 .paused），而不是记成 failed。
+    private var pausingTaskIDs: Set<UUID> = []
+    /// 经 resumeData 续传重建的任务 id：didWriteData 首次回调时校验"续传偏移 +
+    /// 本次期望字节数"与恢复前持久化的总大小一致，防止服务器端内容变化
+    /// （release 重新上传、CDN 换源）把前半旧内容与后半新内容拼成损坏产物。
+    private var resumedTaskIDs: Set<UUID> = []
+    /// 进度持久化节流：每任务距上次落盘的最小间隔（秒）。进程被杀后恢复的
+    /// receivedBytes 足够新，产物认领的 receivedBytes==totalBytes 守卫与续传
+    /// 偏移才有意义；又不至于每次进度回调（秒级多次）都全量序列化任务表。
+    private var lastProgressPersistDate: [UUID: Date] = [:]
 
     override init() {
         super.init()
@@ -99,9 +111,26 @@ final class DownloadManager: NSObject {
     }
 
     func pauseDownload(id: UUID) {
-        tasks[id]?.suspend()
-        taskModels[id]?.status = .paused
-        persistTasks()
+        guard taskModels[id] != nil else { return }
+        if let sessionTask = tasks[id] {
+            // 产出断点数据：旧实现 suspend() 只停不产 resumeData——进程随后被杀
+            // （iOS 随时回收后台 App），重启后"继续"只能整包重下，断点续传对
+            // "暂停过夜"的大文件场景实际不存在。cancel(byProducingResumeData:)
+            // 让暂停也持有断点；sessionTask 的收尾（存 resumeData、移除 tasks[id]）
+            // 统一在 didCompleteWithError 的暂停分支完成。
+            pausingTaskIDs.insert(id)
+            // resumeData 本身由 didCompleteWithError 的 userInfo 携带，此闭包无需处理
+            sessionTask.cancel(byProducingResumeData: { _ in })
+            // 立即落状态与列表展示；tasks[id] 保留到 didCompleteWithError 回调——
+            // 那里的"当前活跃任务"身份守卫依赖它，提前移除会导致回调被忽略、
+            // resumeData 丢失。回调的暂停分支完成收尾（存 resumeData、移除 sessionTask）。
+            taskModels[id]?.status = .paused
+            persistTasks()
+        } else {
+            // 无活跃 sessionTask（暂停后重启恢复的任务）：只更新状态
+            taskModels[id]?.status = .paused
+            persistTasks()
+        }
     }
 
     func resumeDownload(id: UUID) {
@@ -230,6 +259,14 @@ final class DownloadManager: NSObject {
             }
             guard let candidate = matched else { continue }
             if task.totalBytes > 0 {
+                // 认领守卫追加"中断前已收满"：同 URL 重复下载的两个任务产物同名
+                // 且同大小，仅凭大小一致无法区分归属。仅当崩溃/被杀前最后一次
+                // 持久化的 receivedBytes 已达到 totalBytes（下载确实走完）才认领；
+                // 未收满的任务回落 rebuildTask 续传（进度已周期性持久化，偏移够新）。
+                guard task.receivedBytes == task.totalBytes else {
+                    Logger.info("任务下载进度未达 100%（\(task.receivedBytes)/\(task.totalBytes)），不认领同名产物: \(name)")
+                    continue
+                }
                 let size = (try? candidate.resourceValues(forKeys: [.fileSizeKey]))?.fileSize ?? 0
                 guard Int64(size) == task.totalBytes else {
                     Logger.info("同名文件大小与任务总大小不符，跳过认领: \(name)")
@@ -258,11 +295,17 @@ final class DownloadManager: NSObject {
         var sessionTask: URLSessionDownloadTask?
         if let resumeData = candidate.resumeData, !resumeData.isEmpty {
             sessionTask = session.downloadTask(withResumeData: resumeData)
+            // 标记为续传任务：didWriteData 首次回调校验续传偏移+期望字节数与
+            // 原总大小一致（服务器端内容变化防护）
+            resumedTaskIDs.insert(candidate.id)
         }
         if sessionTask == nil {
             sessionTask = session.downloadTask(with: url)
             candidate.receivedBytes = 0
             candidate.totalBytes = 0
+            resumedTaskIDs.remove(candidate.id)
+            // 整包重下允许新 totalBytes 重新落盘（旧值作废）
+            sizePersistedTasks.remove(candidate.id)
         }
         sessionTask?.taskDescription = candidate.id.uuidString
         candidate.status = .downloading
@@ -322,6 +365,9 @@ final class DownloadManager: NSObject {
             switch self.classifyDownload(at: destination.path) {
             case .zip:
                 updated.status = .completed
+                // 下载已完整：resumeData 作废（已被 URLSession 消费）。残留的旧
+                // resumeData 会让后续 retry/恢复路径误用失效断点（重建任务必失败）。
+                updated.resumeData = nil
             case .html:
                 updated.status = .failed
                 updated.error = "下载到的是网页而非文件（可能链接失效或被拦截），请检查链接后重试"
@@ -341,6 +387,7 @@ final class DownloadManager: NSObject {
                     retryableFailure = true
                 } else {
                     updated.status = .completed
+                    updated.resumeData = nil
                 }
             }
 
@@ -391,6 +438,11 @@ final class DownloadManager: NSObject {
         retrying.error = nil
         retrying.receivedBytes = 0
         retrying.totalBytes = 0
+        // 重试总是从 0 整包重下：旧 resumeData 已被上一次下载消费或已失效，
+        // 保留只会让后续恢复路径误用（重建任务必失败）；同时允许新 totalBytes
+        // 重新落盘（服务器可能换了内容，体积与上次不同）。
+        retrying.resumeData = nil
+        sizePersistedTasks.remove(id)
 
         let sessionTask = session.downloadTask(with: url)
         sessionTask.taskDescription = id.uuidString
@@ -487,15 +539,59 @@ extension DownloadManager: URLSessionDownloadDelegate {
         totalBytesExpectedToWrite: Int64
     ) {
         guard let id = taskID(for: downloadTask), taskModels[id] != nil else { return }
+
+        // 续传一致性校验（仅续传任务的首次进度回调执行）：URLSession 只发
+        // Range: bytes=N-，不校验服务器内容是否变化——release 重新上传 / CDN
+        // 换源时会把"前半旧内容 + 后半新内容"拼成损坏产物（zip 场景导入时报
+        // "已损坏"，其它格式静默落盘）。偏移 + 本次期望字节数 ≠ 恢复前持久化的
+        // 总大小 → 断点作废，取消后整包重下。
+        if resumedTaskIDs.remove(id) != nil,
+           let model = taskModels[id],
+           model.totalBytes > 0, totalBytesExpectedToWrite > 0,
+           model.receivedBytes > 0,
+           model.receivedBytes + totalBytesExpectedToWrite != model.totalBytes {
+            Logger.warning("续传内容与原文件不一致（偏移 \(model.receivedBytes) + 期望 \(totalBytesExpectedToWrite) ≠ 原总大小 \(model.totalBytes)），放弃断点整包重下: \(model.fileName)")
+            tasks[id]?.cancel()
+            tasks.removeValue(forKey: id)
+            var retrying = model
+            retrying.retryCount = effectiveRetryCount(for: model) + 1
+            retrying.lastRetryDate = Date()
+            retrying.status = .downloading
+            retrying.error = nil
+            retrying.receivedBytes = 0
+            retrying.totalBytes = 0
+            retrying.resumeData = nil
+            sizePersistedTasks.remove(id)
+            if let url = URL(string: retrying.url) {
+                let sessionTask = session.downloadTask(with: url)
+                sessionTask.taskDescription = id.uuidString
+                taskModels[id] = retrying
+                tasks[id] = sessionTask
+                sessionTask.resume()
+                persistTasks()
+            }
+            return
+        }
+
         taskModels[id]?.receivedBytes = totalBytesWritten
         taskModels[id]?.totalBytes = totalBytesExpectedToWrite
         // 总大小首次已知（>0；未知 Content-Length 为 -1）时持久化一次：崩溃恢复的
         // "产物认领"大小校验依赖持久化的 totalBytes——进度本身由内存模型承载
         // （UI 0.5s 轮询），但 didWriteData 从不落盘的话，恢复出来的任务
         // totalBytes 恒为 0，校验在最需要它的崩溃恢复场景形同虚设。
-        if totalBytesExpectedToWrite > 0, !sizePersistedTasks.contains(id) {
-            sizePersistedTasks.insert(id)
-            persistTasks()
+        // 之后按每任务 5 秒节流周期性落盘 receivedBytes：进程被杀后恢复的偏移
+        // 才足够新（产物认领的 receivedBytes==totalBytes 守卫、续传偏移都依赖它）。
+        if totalBytesExpectedToWrite > 0 {
+            if !sizePersistedTasks.contains(id) {
+                sizePersistedTasks.insert(id)
+                persistTasks()
+            } else {
+                let now = Date()
+                if (lastProgressPersistDate[id].map { now.timeIntervalSince($0) >= 5 }) ?? true {
+                    lastProgressPersistDate[id] = now
+                    persistTasks()
+                }
+            }
         }
     }
 
@@ -540,6 +636,21 @@ extension DownloadManager: URLSessionDownloadDelegate {
             updated.resumeData = resumeData
         }
 
+        // 用户"暂停"触发的 cancel(byProducingResumeData:)：按暂停完成收尾，
+        // 状态保持 .paused、存好断点、移除 sessionTask——绝不能记成 failed。
+        if pausingTaskIDs.remove(id) != nil {
+            if (updated.resumeData ?? Data()).isEmpty {
+                // 没产出断点（如刚起步就暂停）：清掉，恢复时按整包重下
+                updated.resumeData = nil
+            }
+            updated.status = .paused
+            updated.error = nil
+            taskModels[id] = updated
+            tasks.removeValue(forKey: id)
+            persistTasks()
+            return
+        }
+
         // 断点续传失败整包兜底：续传最常见的失败是服务器不支持 Range / 会话失效 /
         // resumeData 损坏，此时旧 resumeData 已"毒化"，恢复时必然再次失败。
         // 未超重试上限时清空 resumeData 并整包重下（复用 retryDownload，计数持久化
@@ -549,7 +660,8 @@ extension DownloadManager: URLSessionDownloadDelegate {
         // resumeData 无效——直接重试 URLSession 即可，盲目整包重下会浪费时间/流量。
         let resumeRelatedCodes: [Int] = [
             NSURLErrorCannotWriteToFile,      // -3000  文件系统异常，resumeData 可疑
-            NSURLErrorDataNotAllowed          // -1020  策略禁止读取数据
+            NSURLErrorDataNotAllowed,         // -1020  策略禁止读取数据
+            NSURLErrorFileDoesNotExist        // -1100  resumeData 引用的 tmp 断点文件已被系统清理
         ]
         if let resumeData = updated.resumeData, !resumeData.isEmpty,
            resumeRelatedCodes.contains(nsError.code),
@@ -560,6 +672,14 @@ extension DownloadManager: URLSessionDownloadDelegate {
             tasks.removeValue(forKey: id)
             retryDownload(id: id, model: updated)
             return
+        }
+
+        // 文件类失败的 resumeData 已毒化（tmp 断点文件丢失/不可读），即便重试上限
+        // 已到也要清除：否则用户每次点"继续"都重建同一个必失败的任务，永远轮不到
+        // 整包重下的兜底。
+        if updated.resumeData != nil,
+           resumeRelatedCodes.contains(nsError.code) {
+            updated.resumeData = nil
         }
 
         updated.status = .failed

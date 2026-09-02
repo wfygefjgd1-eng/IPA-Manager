@@ -99,6 +99,7 @@ struct CertificatesView: View {
                     importTarget = .certificate
                     showImporter = true
                 }
+                .disabled(isImporting)
             } else {
                 ForEach(appState.certificates) { certificate in
                     certificateRow(certificate)
@@ -134,6 +135,7 @@ struct CertificatesView: View {
                     importTarget = .profile
                     showImporter = true
                 }
+                .disabled(isImporting)
             } else {
                 ForEach(appState.profiles) { profile in
                     profileRow(profile)
@@ -182,6 +184,7 @@ struct CertificatesView: View {
             )
         }
         .buttonStyle(.plain)
+        .disabled(isImporting)
         .padding(.horizontal, 16)
         .padding(.bottom, 8)
     }
@@ -418,6 +421,14 @@ struct CertificatesView: View {
     }
 
     private func handleImportedFile(_ url: URL) {
+        // 导入进行中忽略新导入：三个入口（底部按钮 + 两个空态卡）的 disabled 之外的
+        // 双保险。并发导入会让后完成的一路覆盖 managedPendingP12/pendingExtractDir，
+        // 先完成那一路的明文 P12 副本与解压目录永远清不掉（私钥材料残留 Documents），
+        // 且兜底清扫会误删另一路正在使用的解压目录。
+        guard !isImporting else {
+            Logger.warning("证书导入进行中，忽略新导入: \(url.lastPathComponent)")
+            return
+        }
         let accessed = url.startAccessingSecurityScopedResource()
         defer {
             if accessed {

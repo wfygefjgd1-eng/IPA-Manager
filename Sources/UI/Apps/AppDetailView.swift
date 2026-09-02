@@ -300,7 +300,9 @@ struct AppDetailView: View {
                         .frame(maxWidth: .infinity)
                 }
                 .buttonStyle(.bordered)
-                .disabled(isSigning)
+                // 源文件缺失时分享面板拿到的是不存在的 URL：各 activity 静默失败
+                // 或产出空内容，与签名按钮禁用所暗示的"文件不可用"状态保持一致
+                .disabled(isSigning || sourceFileMissing)
 
                 Button(role: .destructive) {
                     // 删除是永久性磁盘操作，加二次确认，与全部清除一致的交互风格

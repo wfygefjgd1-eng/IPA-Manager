@@ -80,10 +80,29 @@ struct AppIconView: View {
         return image
     }
 
+    /// mtime 读取的记忆缓存（5 秒 TTL）：缓存命中路径每次 body 重算也要 stat 一次
+    /// 磁盘参与缓存键，而 AppState 任一 @Published 变化都会让列表整页重算 body
+    /// （导入期间每秒多次 × N 个图标）。mtime 校验只对"重导入覆盖同名文件"有意义，
+    /// 5 秒 TTL 在覆盖场景下最多延迟一次刷新，IO 放大却完全消除。
+    private static let mtimeLock = NSLock()
+    private static var mtimeMemo: [String: (value: TimeInterval, at: Date)] = [:]
+
     /// 文件修改时间戳（秒）：随缓存键参与比较；文件缺失时返回 0（loadIcon 会因
     /// 打不开文件源返回 nil，占位图兜底），保证键值稳定。
     private static func modificationTime(of path: String) -> TimeInterval {
+        mtimeLock.lock()
+        if let memo = mtimeMemo[path], Date().timeIntervalSince(memo.at) < 5 {
+            mtimeLock.unlock()
+            return memo.value
+        }
+        mtimeLock.unlock()
+
         let attributes = try? FileManager.default.attributesOfItem(atPath: path)
-        return (attributes?[.modificationDate] as? Date)?.timeIntervalSince1970 ?? 0
+        let value = (attributes?[.modificationDate] as? Date)?.timeIntervalSince1970 ?? 0
+
+        mtimeLock.lock()
+        mtimeMemo[path] = (value, Date())
+        mtimeLock.unlock()
+        return value
     }
 }

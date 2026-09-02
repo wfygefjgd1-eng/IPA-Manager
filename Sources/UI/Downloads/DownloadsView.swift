@@ -33,7 +33,13 @@ struct DownloadsView: View {
                                     .listRowBackground(Color.clear)
                             }
                             .onDelete { offsets in
-                                deleteTasks(at: offsets)
+                                // 与 AppsView 对齐：多选模式下滑动删除也走勾选集合路径，
+                                // 避免"删单行"与"删除选中 (N)"语义分裂、勾选残留死 id
+                                if isSelecting {
+                                    deleteSelectedTasks()
+                                } else {
+                                    deleteTasks(at: offsets)
+                                }
                             }
                         } header: {
                             HStack {
@@ -445,8 +451,17 @@ struct DownloadsView: View {
     /// 以及“自动导入其实已经成功”的复查；需要真实解压解析或补导入时放到后台执行，
     /// 避免大文件解压阻塞主线程。
     private func recognizeUnmatchedTask(_ task: DownloadTask) {
+        // 自动导入进行中直接提示稍候：此刻 matchedApp 必然未命中（导入未入库），
+        // 旧实现会再触发一次完整导入（同一 zip 双份入库、后续自动签名重复执行），
+        // 且 4 秒兜底先到弹"导入可能失败"的误导 alert。
+        if appState.importProgress != nil {
+            Logger.info("下载文件识别跳过：自动导入进行中: \(task.fileName)")
+            unrecognizedMessage = "该文件正在自动导入中，请等导入完成（首页进度卡消失）后再点击。"
+            showUnrecognizedAlert = true
+            return
+        }
         // 主线程优先复查 @Published importedApps：自动导入可能在下载完成时就已入库成功
-        // （如 zip 内嵌 ipa，诊断日志里的“自动解析成功: xxx.ipa”），此时 matchedApp 直接命中。
+        // （如 zip 内嵌 ipa，诊断日志里的"自动解析成功: xxx.ipa"），此时 matchedApp 直接命中。
         // 零延迟直接打开签名详情页——与列表点击已匹配任务行为一致，绝不再重复解析/导入，
         // 也绝不给用户弹任何 alert。
         if let app = matchedApp(for: task) {
@@ -548,12 +563,15 @@ struct DownloadsView: View {
                         }
                     }
                     DispatchQueue.main.asyncAfter(deadline: .now() + 4.0) {
-                        guard !finished else { return }
-                        finished = true
+                        // 兜底不占用 finished：4 秒时导入大概率还在串行队列排队/执行，
+                        // 旧实现此时置 finished = true 会吞掉真正的导入 completion——
+                        // 几十秒后导入成功了却不再打开签名页。改为：命中已入库应用
+                        // 就打开；未命中且 completion 尚未回来才提示，且保留 completion
+                        // 稍后回来说明真实结果（成功打开签名页 / 失败弹具体原因）。
                         if let app = self.matchedApp(for: task) {
                             self.rememberResolvedTask(task: task, app: app)
                             self.openSigning(for: app)
-                        } else {
+                        } else if !finished {
                             let reason = "压缩包内包含应用（.app 或 .ipa），已重新尝试导入。若仍失败，请查看下方具体原因。"
                             Logger.error("无法识别下载文件: \(task.fileName) - \(reason)")
                             self.unrecognizedMessage = reason
@@ -714,6 +732,10 @@ struct DownloadsView: View {
             .sorted { $0.createdAt > $1.createdAt }
         if snapshot != tasks {
             tasks = snapshot
+            // 删除/轮询后剪掉已不存在的 id：滑动删除已勾选行时 selectedIDs 残留死 id
+            // 会让"删除选中 (N)"计数虚高、全选判定错位
+            let validIDs = Set(snapshot.map { $0.id })
+            selectedIDs.formIntersection(validIDs)
         }
     }
 

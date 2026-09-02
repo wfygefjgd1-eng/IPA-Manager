@@ -3,13 +3,13 @@ import UIKit
 import ZIPFoundation
 
 protocol Installing {
-    func install(ipaPath: String, certificate: CertificateInfo) throws
+    func install(ipaPath: String, certificate: CertificateInfo, onInstallOpened: (() -> Void)?) throws
 }
 
 final class Installer: Installing {
     static let shared = Installer()
 
-    func install(ipaPath: String, certificate: CertificateInfo) throws {
+    func install(ipaPath: String, certificate: CertificateInfo, onInstallOpened: (() -> Void)? = nil) throws {
         Logger.info("开始本地安装: \(ipaPath)")
 
         // 轻量同步校验（快速失败，错误可直接同步抛给调用方弹窗展示）：
@@ -26,13 +26,13 @@ final class Installer: Installing {
         // 若留在 UI 主线程同步执行会卡死数秒~数分钟，有被看门狗杀进程的风险。
         // 完成后回主线程执行 UIApplication.shared.open。
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-            self?.performInstall(ipaPath: ipaPath, certificate: certificate)
+            self?.performInstall(ipaPath: ipaPath, certificate: certificate, onInstallOpened: onInstallOpened)
         }
     }
 
     /// 后台执行完整安装流程（服务器启动/探测 + IPA 元数据解析 + manifest 生成），
     /// 出错时停掉本地服务器并记录错误日志；成功后再切回主线程打开 itms-services 链接。
-    private func performInstall(ipaPath: String, certificate: CertificateInfo) {
+    private func performInstall(ipaPath: String, certificate: CertificateInfo, onInstallOpened: (() -> Void)?) {
         do {
             let ipaURL = URL(fileURLWithPath: ipaPath)
             // 本地服务器只负责流式提供 IPA；manifest 走公网 HTTPS
@@ -48,7 +48,7 @@ final class Installer: Installing {
             var bundleID = "com.ipamanager.installed"
             var appName = ipaURL.deletingPathExtension().lastPathComponent
             var version = "1.0"
-            if let info = lightweightAppInfo(from: ipaURL), !info.bundleID.isEmpty {
+            if let info = IPAParser().lightweightAppInfo(from: ipaURL), !info.bundleID.isEmpty {
                 bundleID = info.bundleID
                 if !info.version.isEmpty { version = info.version }
                 if !info.name.isEmpty { appName = info.name }
@@ -60,12 +60,14 @@ final class Installer: Installing {
 
             let payloadURL = baseURL.appendingPathComponent(ipaURL.lastPathComponent)
 
-            // 优先使用公网 manifest（api.palera.in /genPlist），失败则回退本地 manifest。
-            // 公网方案：manifest 由公网 HTTPS 托管，系统安装进程可稳定获取；本地回退保证
-            // 在无外网或 api.palera.in 故障时仍可通过 127.0.0.1 安装。
+            // 公网 manifest（api.palera.in /genPlist）可用性预检：URL 构造本身恒成功，
+            // 真正的失败发生在 SpringBoard 拉 manifest 时（无外网 / DNS 污染 / 服务
+            // 故障），那时已无法纠正。这里先做一次 2 秒超时的同步预检（后台线程），
+            // 失败直接走本地 manifest（cacheManifest + 127.0.0.1 URL），保证无外网/
+            // 被墙环境仍可安装。
             var manifestURL: URL?
             var isLocalFallback = false
-            do {
+            if Self.isExternalManifestServiceReachable() {
                 manifestURL = try generateExternalManifestURL(
                     bundleID: bundleID, name: appName, version: version,
                     payloadURL: payloadURL
@@ -73,14 +75,8 @@ final class Installer: Installing {
                 if manifestURL == nil {
                     throw AppError.installFailed("公网 manifest 生成返回 nil")
                 }
-                // 预生成本地 manifest 作为暖备（不切换 URL），便于日志排查与后续快速回退
-                let warmData = generateLocalManifestData(bundleID: bundleID, name: appName, version: version, payloadURL: payloadURL)
-                if !warmData.isEmpty {
-                    Logger.debug("本地 manifest 已预生成（暖备，大小 \(warmData.count) 字节），主用公网")
-                }
-            } catch {
-                Logger.warning("公网 manifest 生成失败，回退到本地: \(error.localizedDescription)")
-                manifestURL = nil
+            } else {
+                Logger.warning("api.palera.in 预检不可达（2 秒超时），直接使用本地 manifest")
             }
 
             if manifestURL == nil {
@@ -129,6 +125,9 @@ final class Installer: Installing {
                         // 记录"安装已发起"活动：回前台/保活超时据此识别安装仍在进行，
                         // 不停服务器（用户在系统安装弹窗停留时切回 App 是常见操作）
                         LocalInstallServer.shared.noteInstallOpened()
+                        // open 成功后才通知调用方（如"自动回桌面"的调度锚点）：
+                        // 主线程回调
+                        onInstallOpened?()
                     } else {
                         Logger.error("无法打开 itms-services 链接")
                         // 后台失败同步抛不回去，补一条用户可见反馈
@@ -145,6 +144,27 @@ final class Installer: Installing {
             Logger.error("本地安装失败: \(error.localizedDescription)")
             AppState.shared.showToast("安装失败：\(error.localizedDescription)")
         }
+    }
+
+    /// api.palera.in 可达性预检：2 秒超时 HEAD，在后台线程同步执行
+    /// （调用方 performInstall 已在后台队列）。状态码 <500 视为服务可达
+    /// （4xx 说明服务器在正常应答，genPlist 端点的问题不是网络问题）。
+    private static func isExternalManifestServiceReachable() -> Bool {
+        guard let url = URL(string: "https://api.palera.in/") else { return false }
+        var request = URLRequest(url: url, timeoutInterval: 2)
+        request.httpMethod = "HEAD"
+        // @Sendable 闭包不能直接捕获可变局部变量：用盒子承载结果
+        final class ReachBox: @unchecked Sendable { var value = false }
+        let box = ReachBox()
+        let semaphore = DispatchSemaphore(value: 0)
+        URLSession.shared.dataTask(with: request) { _, response, error in
+            if let http = response as? HTTPURLResponse, error == nil {
+                box.value = (200..<500).contains(http.statusCode)
+            }
+            semaphore.signal()
+        }.resume()
+        _ = semaphore.wait(timeout: .now() + 3)
+        return box.value
     }
 
     /// 用公网 HTTPS 服务生成 manifest（Feather 同款：api.palera.in/genPlist）。
@@ -209,36 +229,6 @@ final class Installer: Installing {
         let manifestURL = baseURL.appendingPathComponent("manifest.plist")
         Logger.info("本地 manifest 已生成并缓存: \(data.count) 字节 -> \(manifestURL.absoluteString)")
         return manifestURL
-    }
-
-    /// 轻量读取 IPA 元数据：只读 zip 中央目录里 Payload/<App>.app/Info.plist 的
-    /// 单个条目数据并解析（ZIPFoundation Archive 不解压实体），避免安装时整包解压。
-    /// 返回 nil 表示读取/解析失败，调用方回退到完整解析。
-    private func lightweightAppInfo(from ipaURL: URL) -> (bundleID: String, version: String, name: String)? {
-        guard let archive = try? Archive(url: ipaURL, accessMode: .read) else { return nil }
-        // 只匹配顶层 .app 的 Info.plist（Payload/A.app/Info.plist 或裸 A.app/Info.plist），
-        // 不匹配 .framework/.appex 等嵌套结构里的 Info.plist。
-        guard let entry = archive.first(where: { entry in
-            guard entry.type == .file, entry.path.hasSuffix("/Info.plist") else { return false }
-            let components = entry.path.components(separatedBy: "/")
-            return (components.count == 3 && components[0] == "Payload" && components[1].hasSuffix(".app"))
-                || (components.count == 2 && components[0].hasSuffix(".app"))
-        }) else { return nil }
-
-        var plistData = Data()
-        do {
-            try archive.extract(entry, consumer: { plistData.append($0) })
-        } catch {
-            return nil
-        }
-        guard let dict = (try? PropertyListSerialization.propertyList(from: plistData, options: [], format: nil)) as? [String: Any] else {
-            return nil
-        }
-        return (
-            bundleID: dict["CFBundleIdentifier"] as? String ?? "",
-            version: (dict["CFBundleShortVersionString"] as? String) ?? (dict["CFBundleVersion"] as? String) ?? "",
-            name: (dict["CFBundleDisplayName"] as? String) ?? (dict["CFBundleName"] as? String) ?? ""
-        )
     }
 
     private func stopServer() {

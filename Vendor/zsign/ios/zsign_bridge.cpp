@@ -33,7 +33,7 @@ const char* zsign_last_error(void) {
     return g_lastError.c_str();
 }
 
-int zsign_sign(const ZSignOptions* options) {
+int zsign_sign_impl(const ZSignOptions* options) {
     if (!options) {
         g_lastError = "Invalid options";
         return -1;
@@ -253,7 +253,7 @@ static std::string GetOpenSSLErrors(const char* prefix) {
     return result;
 }
 
-int zsign_p12_info(const char* p12Path, const char* password, ZSignP12Info* info) {
+int zsign_p12_info_impl(const char* p12Path, const char* password, ZSignP12Info* info) {
     if (!p12Path || !info) {
         g_lastError = "Invalid p12 info arguments";
         return -1;
@@ -267,11 +267,10 @@ int zsign_p12_info(const char* p12Path, const char* password, ZSignP12Info* info
         return -1;
     }
 
-    // Load providers (best effort): 本工程静态 OpenSSL 未启用 legacy provider，
-    // OSSL_PROVIDER_load("legacy") 必然失败并在本线程错误队列压入 provider not found。
-    // 这里显式忽略其返回值并立即清空错误队列，避免污染后续 OpenSSL 操作的诊断。
-    OSSL_PROVIDER_load(NULL, "legacy");
-    OSSL_PROVIDER_load(NULL, "default");
+    // Load providers (best effort): 进程级一次性加载（default 必需、legacy 尽力
+    // 而为且失败即清错误队列）。旧实现每次调用都 OSSL_PROVIDER_load 且从不
+    // unload，provider 引用计数随导入次数持续累积。
+    ZSignAsset::EnsurePKCS12ProvidersLoaded();
     ERR_clear_error();
 
     PKCS12* p12 = d2i_PKCS12_bio(bio, NULL);
@@ -346,284 +345,32 @@ int zsign_p12_info(const char* p12Path, const char* password, ZSignP12Info* info
     return 0;
 }
 
-int zsign_p12_export_identity(const char* p12Path, const char* password,
-                              unsigned char** outCertDER, int* outCertLen,
-                              unsigned char** outKeyDER,  int* outKeyLen,
-                              int* outIsRSA, int* outKeyFormat, int* outKeyBits) {
-    if (!p12Path || !outCertDER || !outCertLen || !outKeyDER || !outKeyLen || !outIsRSA || !outKeyFormat || !outKeyBits) {
-        g_lastError = "无效的 p12 导出参数";
+// ---------------------------------------------------------------------------
+// extern "C" 异常屏障：异常穿越 C ABI 属 UB（std::terminate）。签名输入是
+// 不可信 IPA/p12，深解析路径上的 std::string/vector 分配失败（std::bad_alloc）
+// 等异常不得逃逸出桥接层。
+// ---------------------------------------------------------------------------
+
+int zsign_sign(const ZSignOptions* options) {
+    try {
+        return zsign_sign_impl(options);
+    } catch (const std::exception& e) {
+        g_lastError = std::string("签名内部异常: ") + e.what();
+        return -1;
+    } catch (...) {
+        g_lastError = "签名内部异常（未知 C++ 异常）";
         return -1;
     }
-
-    *outCertDER = NULL;
-    *outCertLen = 0;
-    *outKeyDER = NULL;
-    *outKeyLen = 0;
-    *outIsRSA = 0;
-    *outKeyFormat = 0;
-    *outKeyBits = 0;
-
-    BIO* bio = BIO_new_file(p12Path, "rb");
-    if (!bio) {
-        g_lastError = "无法打开 p12 文件";
-        return -1;
-    }
-
-    // 与 zsign_p12_info 一致：加载 legacy + default provider（best effort）。
-    // legacy 在本构建加载必然失败，立即清空错误队列避免污染诊断。
-    OSSL_PROVIDER_load(NULL, "legacy");
-    OSSL_PROVIDER_load(NULL, "default");
-    ERR_clear_error();
-
-    PKCS12* p12 = d2i_PKCS12_bio(bio, NULL);
-    BIO_free(bio);
-    if (!p12) {
-        g_lastError = GetOpenSSLErrors("无效的 p12 文件");
-        ERR_clear_error();
-        return -1;
-    }
-
-    EVP_PKEY* pkey = NULL;
-    X509* cert = NULL;
-    STACK_OF(X509)* ca = NULL;
-    const char* pwd = password ? password : "";
-    if (PKCS12_parse(p12, pwd, &pkey, &cert, &ca) != 1) {
-        g_lastError = GetOpenSSLErrors("密码错误或 p12 格式不受支持");
-        PKCS12_free(p12);
-        ERR_clear_error();
-        return -2; // distinct: password/format error
-    }
-    PKCS12_free(p12);
-
-    if (cert == NULL || pkey == NULL) {
-        g_lastError = (cert == NULL) ? "p12 中未找到证书" : "p12 中未找到私钥";
-        if (pkey) EVP_PKEY_free(pkey);
-        if (cert) X509_free(cert);
-        if (ca) sk_X509_pop_free(ca, X509_free);
-        ERR_clear_error();
-        return -1;
-    }
-
-    int isRSA = (EVP_PKEY_base_id(pkey) == EVP_PKEY_RSA) ? 1 : 0;
-
-    // 证书 DER（i2d_X509：先取长度，再写入并推进指针）
-    int nCertLen = i2d_X509(cert, NULL);
-    if (nCertLen <= 0) {
-        g_lastError = "证书 DER 编码失败";
-        EVP_PKEY_free(pkey);
-        X509_free(cert);
-        if (ca) sk_X509_pop_free(ca, X509_free);
-        ERR_clear_error();
-        return -1;
-    }
-    unsigned char* certDER = (unsigned char*)malloc((size_t)nCertLen);
-    if (!certDER) {
-        g_lastError = "内存分配失败";
-        EVP_PKEY_free(pkey);
-        X509_free(cert);
-        if (ca) sk_X509_pop_free(ca, X509_free);
-        return -1;
-    }
-    {
-        unsigned char* pCert = certDER;
-        if (i2d_X509(cert, &pCert) <= 0) {
-            free(certDER);
-            g_lastError = "证书 DER 编码失败";
-            EVP_PKEY_free(pkey);
-            X509_free(cert);
-            if (ca) sk_X509_pop_free(ca, X509_free);
-            ERR_clear_error();
-            return -1;
-        }
-    }
-
-    // 私钥 DER：优先 PKCS#8（SecKeyCreateWithData 最稳）；不可用或失败时回退 i2d_PrivateKey（RSA 输出 PKCS#1，EC 输出 SEC1）。
-    // 注意：PKCS#8 路径受 OPENSSL_NO_DEPRECATED 系列宏保护（本工程构建未启用 no-deprecated，条件成立 → 走 PKCS#8）；
-    // 为保证只读诊断也能区分实际导出格式，nKeyFormat 会随成功结果输出（1=PKCS#8, 2=PKCS#1/SEC1）。
-    unsigned char* keyDER = NULL;
-    int nKeyLen = 0;
-    int nKeyFormat = 0;
-#if !defined(OPENSSL_NO_DEPRECATED) && !defined(OPENSSL_NO_DEPRECATED_3_0)
-    {
-        PKCS8_PRIV_KEY_INFO* p8info = EVP_PKEY2PKCS8(pkey);
-        if (p8info != NULL) {
-            int nP8Len = i2d_PKCS8_PRIV_KEY_INFO(p8info, NULL);
-            if (nP8Len > 0) {
-                unsigned char* buf = (unsigned char*)malloc((size_t)nP8Len);
-                if (buf != NULL) {
-                    unsigned char* pKey = buf;
-                    if (i2d_PKCS8_PRIV_KEY_INFO(p8info, &pKey) > 0) {
-                        keyDER = buf;
-                        nKeyLen = nP8Len;
-                        nKeyFormat = 1; // PKCS#8
-                    } else {
-                        free(buf);
-                    }
-                }
-            }
-            PKCS8_PRIV_KEY_INFO_free(p8info);
-        }
-    }
-#endif
-    if (keyDER == NULL) {
-        int nP1Len = i2d_PrivateKey(pkey, NULL);
-        if (nP1Len <= 0) {
-            free(certDER);
-            g_lastError = "私钥 DER 编码失败";
-            EVP_PKEY_free(pkey);
-            X509_free(cert);
-            if (ca) sk_X509_pop_free(ca, X509_free);
-            ERR_clear_error();
-            return -1;
-        }
-        unsigned char* buf = (unsigned char*)malloc((size_t)nP1Len);
-        if (!buf) {
-            free(certDER);
-            g_lastError = "内存分配失败";
-            EVP_PKEY_free(pkey);
-            X509_free(cert);
-            if (ca) sk_X509_pop_free(ca, X509_free);
-            return -1;
-        }
-        unsigned char* pKey = buf;
-        if (i2d_PrivateKey(pkey, &pKey) <= 0) {
-            free(buf);
-            free(certDER);
-            g_lastError = "私钥 DER 编码失败";
-            EVP_PKEY_free(pkey);
-            X509_free(cert);
-            if (ca) sk_X509_pop_free(ca, X509_free);
-            ERR_clear_error();
-            return -1;
-        }
-        keyDER = buf;
-        nKeyLen = nP1Len;
-        nKeyFormat = 2; // PKCS#1/SEC1 回退
-    }
-
-    *outCertDER = certDER;
-    *outCertLen = nCertLen;
-    *outKeyDER = keyDER;
-    *outKeyLen = nKeyLen;
-    *outIsRSA = isRSA;
-    *outKeyFormat = nKeyFormat;
-    *outKeyBits = EVP_PKEY_bits(pkey);
-
-    EVP_PKEY_free(pkey);
-    X509_free(cert);
-    if (ca) sk_X509_pop_free(ca, X509_free);
-    ERR_clear_error();
-    g_lastError.clear();
-    return 0;
 }
 
-int zsign_p12_recreate_legacy(const char* p12Path, const char* password,
-                              char* outLegacyPath, int outPathLen) {
-    if (!p12Path || !outLegacyPath || outPathLen <= 0) {
-        g_lastError = "无效的传统 p12 重打包参数";
+int zsign_p12_info(const char* p12Path, const char* password, ZSignP12Info* info) {
+    try {
+        return zsign_p12_info_impl(p12Path, password, info);
+    } catch (const std::exception& e) {
+        g_lastError = std::string("p12 解析内部异常: ") + e.what();
+        return -1;
+    } catch (...) {
+        g_lastError = "p12 解析内部异常（未知 C++ 异常）";
         return -1;
     }
-
-    // 调用方已在 outLegacyPath 中填入目标文件路径；按 outPathLen 用 snprintf 防御性回写，
-    // 保证缓冲区内路径以 \0 结尾且不越界（从本地副本写入，避免 snprintf 重叠拷贝的 UB）。
-    std::string strPath = outLegacyPath;
-    snprintf(outLegacyPath, (size_t)outPathLen, "%s", strPath.c_str());
-    if (strPath.empty()) {
-        g_lastError = "输出路径为空";
-        return -1;
-    }
-
-    BIO* bio = BIO_new_file(p12Path, "rb");
-    if (!bio) {
-        g_lastError = "无法打开 p12 文件";
-        return -1;
-    }
-
-    PKCS12* p12 = d2i_PKCS12_bio(bio, NULL);
-    BIO_free(bio);
-    if (!p12) {
-        g_lastError = GetOpenSSLErrors("无效的 p12 文件");
-        ERR_clear_error();
-        return -1;
-    }
-
-    EVP_PKEY* pkey = NULL;
-    X509* cert = NULL;
-    STACK_OF(X509)* ca = NULL;
-    const char* pwd = password ? password : "";
-    if (PKCS12_parse(p12, pwd, &pkey, &cert, &ca) != 1) {
-        g_lastError = GetOpenSSLErrors("密码错误或 p12 格式不受支持");
-        PKCS12_free(p12);
-        ERR_clear_error();
-        return -2; // distinct: password/format error
-    }
-    PKCS12_free(p12);
-
-    if (cert == NULL || pkey == NULL) {
-        g_lastError = (cert == NULL) ? "p12 中未找到证书" : "p12 中未找到私钥";
-        if (pkey) EVP_PKEY_free(pkey);
-        if (cert) X509_free(cert);
-        if (ca) sk_X509_pop_free(ca, X509_free);
-        ERR_clear_error();
-        return -1;
-    }
-
-    // 重打包为"传统加密" p12：私钥与证书都用 PBE-SHA1-3DES（NID 36）。
-    // 这是 iOS SecPKCS12Import（CDSA 解码器）原生支持的格式——OpenSSL 3 默认的
-    // PBES2/PBKDF2+AES 新式加密 iOS 无法导入，而传统 PBE 一定可以。
-    // 不用 RC2/RC4 等 legacy provider 算法：本工程静态链接的 OpenSSL 未启用 legacy
-    // provider（CI 参数 ios64-xcrun no-shared 无 enable-legacy，_legacy_provider 符号
-    // 不存在，链接会失败；OSSL_PROVIDER_load("legacy") 在静态下也无法 DSO 加载）。
-    // 3DES 由 default provider 提供，无需 legacy 即可成功加密，同样生成 iOS 可导入的
-    // 传统加密 p12。
-    // iter/mac_iter 用 2048：满足 iOS 对 MAC 迭代次数的要求（太低会被拒），也不会太慢。
-    // NID 用 OBJ_txt2nid 运行时查询（跨构建环境最稳），失败回退到 objects.txt 里的
-    // 固定数值 36（NID_pbe_WithSHA1And3_KeyTripleDES_CBC）。
-    int nid3des = OBJ_txt2nid("PBE-SHA1-3DES");
-    if (nid3des == NID_undef) { nid3des = 36; }
-    OSSL_PROVIDER_load(NULL, "default");
-    ERR_clear_error();
-    PKCS12* legacy = PKCS12_create(pwd, "IPA Manager Server Identity",
-                                   pkey, cert, ca,
-                                   nid3des, nid3des,
-                                   2048, 2048, 0);
-    if (!legacy) {
-        g_lastError = GetOpenSSLErrors("传统 p12 重打包失败（PKCS12_create）");
-        EVP_PKEY_free(pkey);
-        X509_free(cert);
-        if (ca) sk_X509_pop_free(ca, X509_free);
-        ERR_clear_error();
-        return -1;
-    }
-
-    // 写出 DER（i2d_PKCS12_bio 返回编码字节数，>0 即输出非空；MAC 校验交给 SecPKCS12Import）
-    BIO* out = BIO_new_file(strPath.c_str(), "wb");
-    if (!out) {
-        g_lastError = "无法创建输出 p12 文件：" + strPath;
-        PKCS12_free(legacy);
-        EVP_PKEY_free(pkey);
-        X509_free(cert);
-        if (ca) sk_X509_pop_free(ca, X509_free);
-        ERR_clear_error();
-        return -1;
-    }
-    if (i2d_PKCS12_bio(out, legacy) <= 0) {
-        BIO_free(out);
-        g_lastError = GetOpenSSLErrors("传统 p12 DER 写出失败");
-        PKCS12_free(legacy);
-        EVP_PKEY_free(pkey);
-        X509_free(cert);
-        if (ca) sk_X509_pop_free(ca, X509_free);
-        ERR_clear_error();
-        return -1;
-    }
-    BIO_free(out);
-
-    PKCS12_free(legacy);
-    EVP_PKEY_free(pkey);
-    X509_free(cert);
-    if (ca) sk_X509_pop_free(ca, X509_free);
-    ERR_clear_error();
-    g_lastError.clear();
-    return 0;
 }

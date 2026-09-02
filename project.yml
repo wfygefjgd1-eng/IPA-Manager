@@ -7,7 +7,10 @@ options:
 packages:
   ZIPFoundation:
     url: https://github.com/weichsel/ZIPFoundation.git
-    from: "0.9.19"
+    # 锁定精确版本：*.xcodeproj 不入库（gitignore），CI 每次 xcodegen generate
+    # 都是全新解析——浮动版本（from:）会在上游发 0.x 小版本后静默换依赖，
+    # 构建结果不可复现。升级走显式提交。
+    exactVersion: "0.9.19"
 settings:
   base:
     SWIFT_VERSION: "5.9"
@@ -69,7 +72,6 @@ targets:
           - MINIZIP_FOPEN_NO_64=1
         OTHER_LDFLAGS:
           - $(SRCROOT)/Vendor/openssl/lib/libcrypto-device.a
-          - $(SRCROOT)/Vendor/openssl/lib/libssl-device.a
           - -lz
         SWIFT_OBJC_BRIDGING_HEADER: $(SRCROOT)/Sources/Bridging-Header.h
         ENABLE_MODULES: YES

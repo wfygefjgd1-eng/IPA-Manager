@@ -1,4 +1,5 @@
 import Foundation
+import ZIPFoundation
 
 protocol IPAParsing {
     func parse(fileURL: URL) throws -> ParsedPackage
@@ -147,12 +148,51 @@ final class IPAParser {
     }
 
     func parseAppInfo(fileURL: URL, progress: ((Double) -> Void)? = nil) throws -> AppInfo {
+        try parseAppInfoWithRoot(fileURL: fileURL, progress: progress).info
+    }
+
+    /// 与 parseAppInfo 相同，但额外返回本次解析的解压根目录（Extracted/<base>-<uuid>）。
+    /// 调用方在图标持久化到稳定位置（Extracted/Icons/）后应立即清理该目录——
+    /// 完整解压副本可达数百 MB~数 GB，旧实现要留到下次冷启动孤儿清扫才释放，
+    /// 一次会话连续解析多个包时磁盘占用线性堆积。
+    func parseAppInfoWithRoot(fileURL: URL, progress: ((Double) -> Void)? = nil) throws -> (info: AppInfo, rootURL: URL) {
         let package = try parse(fileURL: fileURL, progress: progress)
         var info = try infoParser.parse(at: package.infoPlistURL)
         info.path = package.appURL.path
         info.size = AppFileManager.shared.fileSize(at: fileURL)
         info.iconPath = try? infoParser.extractIcon(from: package.infoPlistURL, appURL: package.appURL)
-        return info
+        return (info, package.rootURL)
+    }
+
+    /// 轻量读取 IPA 元数据：只读 zip 中央目录里 Payload/<App>.app/Info.plist 的
+    /// 单个条目数据并解析（ZIPFoundation Archive 不解压实体，几百 MB 的 IPA 也只要
+    /// 毫秒级）。供"只需 bundleID/版本/名称、不必整包解压"的场景使用：
+    /// 安装元数据、同名冲突判定等。返回 nil 表示读取/解析失败，调用方按未知处理。
+    func lightweightAppInfo(from ipaURL: URL) -> (bundleID: String, version: String, name: String)? {
+        guard let archive = try? Archive(url: ipaURL, accessMode: .read) else { return nil }
+        // 只匹配顶层 .app 的 Info.plist（Payload/A.app/Info.plist 或裸 A.app/Info.plist），
+        // 不匹配 .framework/.appex 等嵌套结构里的 Info.plist。
+        guard let entry = archive.first(where: { entry in
+            guard entry.type == .file, entry.path.hasSuffix("/Info.plist") else { return false }
+            let components = entry.path.components(separatedBy: "/")
+            return (components.count == 3 && components[0] == "Payload" && components[1].hasSuffix(".app"))
+                || (components.count == 2 && components[0].hasSuffix(".app"))
+        }) else { return nil }
+
+        var plistData = Data()
+        do {
+            try archive.extract(entry, consumer: { plistData.append($0) })
+        } catch {
+            return nil
+        }
+        guard let dict = (try? PropertyListSerialization.propertyList(from: plistData, options: [], format: nil)) as? [String: Any] else {
+            return nil
+        }
+        return (
+            bundleID: dict["CFBundleIdentifier"] as? String ?? "",
+            version: (dict["CFBundleShortVersionString"] as? String) ?? (dict["CFBundleVersion"] as? String) ?? "",
+            name: (dict["CFBundleDisplayName"] as? String) ?? (dict["CFBundleName"] as? String) ?? ""
+        )
     }
 
     func convertToIPAIfNeeded(fileURL: URL, progress: ((Double) -> Void)? = nil) throws -> URL {

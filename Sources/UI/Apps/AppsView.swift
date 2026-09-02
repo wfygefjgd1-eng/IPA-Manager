@@ -56,7 +56,12 @@ struct AppsView: View {
                         }
                     }
                     .listStyle(.plain)
-                    // 毛玻璃背景：隐藏 List 默认不透明底色，透出下方的 GlassBackground
+                    // 刷新会经 makeInstalledAppInfo 重建全部 AppInfo（每个条目都拿到
+                    // 新 UUID）：及时剪掉已失效的 id，否则勾选计数虚报、"删除选中"
+                    // 匹配不到任何条目静默失效、全选/反选判定错乱
+                    .onChange(of: appState.installedApps) { apps in
+                        selectedIDs.formIntersection(Set(apps.map(\.id)))
+                    }
                     .scrollContentBackground(.hidden)
                     .safeAreaInset(edge: .bottom, spacing: 0) {
                         // 底部悬浮操作条：位于 Tab 栏上方，拇指可及；半透明材质不突兀
@@ -110,10 +115,10 @@ struct AppsView: View {
                 Button(role: .destructive) {
                     deleteSelectedApps()
                 } label: {
-                    Label("删除选中 (\(selectedIDs.count))", systemImage: "trash")
+                    Label("删除选中 (\(selectedCount))", systemImage: "trash")
                         .font(.subheadline.weight(.semibold))
                 }
-                .disabled(selectedIDs.isEmpty)
+                .disabled(selectedCount == 0)
             } else {
                 Button(role: .destructive) {
                     showClearAllAlert = true
@@ -183,6 +188,12 @@ struct AppsView: View {
     }
 
     // MARK: - 多选删除
+
+    /// 实际可删除的勾选数（勾选集合与当前列表的交集大小）：onChange 剪枝之外的
+    /// 双保险，保证按钮计数与真实删除数一致
+    private var selectedCount: Int {
+        appState.installedApps.lazy.filter { selectedIDs.contains($0.id) }.count
+    }
 
     /// 是否已全选当前列表（用于"全选 / 取消全选"切换）
     private var allSelected: Bool {

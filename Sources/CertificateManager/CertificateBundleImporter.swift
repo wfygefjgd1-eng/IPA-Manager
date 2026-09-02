@@ -28,7 +28,11 @@ final class CertificateBundleImporter {
 
         try zipManager.unzip(archiveURL: zipURL, destinationURL: extractDir)
 
+        // p12 与 pfx 都要找：分类器（classifyArchivedContent）把 .pfx 也算作证书包，
+        // 但旧实现递归查找只匹配 p12——pfx-only 的 zip 必然导入失败，且错误文案
+        // （"未找到 .p12/.pfx 证书"）声称支持 pfx，自相矛盾。两者都找，p12 优先。
         let p12Path = Self.findFileRecursively(extension: "p12", in: extractDir)
+            ?? Self.findFileRecursively(extension: "pfx", in: extractDir)
         let provPath = Self.findFileRecursively(extension: "mobileprovision", in: extractDir)
         guard p12Path != nil || provPath != nil else {
             // 与分类器（AppState.classifyArchivedContent 的全深度枚举）查找深度一致后
@@ -75,6 +79,32 @@ final class CertificateBundleImporter {
         // 只清理位于托管目录内的 cert-*.p12 副本，避免误删用户原始文件
         if url.path.hasPrefix(dir) {
             try? fileManager.deleteItem(at: url)
+        }
+    }
+
+    /// 启动清扫证书导入残留：删除 Certificates/ 下所有 cert-*.p12 托管副本与
+    /// bundle-extract-* 解压目录。正常路径这些副本在导入完成（无论成败）后即被
+    /// 精确清理；导入中途进程被杀/崩溃时无人清理，明文私钥材料会永久残留
+    /// Documents。启动时无任何证书导入进行中，残留副本必然无用（私钥已入
+    /// Keychain，或导入根本未发生）。
+    func sweepOrphanManagedArtifacts() {
+        let certDir = fileManager.directoryURL(.certificates)
+        guard let items = try? FileManager.default.contentsOfDirectory(
+            at: certDir,
+            includingPropertiesForKeys: [.isRegularFileKey],
+            options: [.skipsHiddenFiles]
+        ) else { return }
+        var swept = 0
+        for item in items {
+            let name = item.lastPathComponent
+            let isManagedP12 = name.hasPrefix("cert-") && name.hasSuffix(".p12")
+            let isBundleExtract = name.hasPrefix("bundle-extract-")
+            guard isManagedP12 || isBundleExtract else { continue }
+            try? fileManager.deleteItem(at: item)
+            swept += 1
+        }
+        if swept > 0 {
+            Logger.info("启动清扫证书导入残留: 删除 \(swept) 项（cert-*.p12 / bundle-extract-*）")
         }
     }
 

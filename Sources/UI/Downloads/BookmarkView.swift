@@ -16,6 +16,8 @@ struct BookmarkView: View {
     @State private var alertCase: BookmarkAlertCase = .add
     @State private var showAlert = false
     @State private var showAddedToast = false
+    /// 添加成功 toast 的可取消计时（见添加书签处的使用）
+    @State private var addedToastWorkItem: DispatchWorkItem?
 
     var body: some View {
         NavigationView {
@@ -152,9 +154,12 @@ struct BookmarkView: View {
         if !bookmarks.contains(where: { $0.url == item.url }) {
             bookmarks.append(item)
             showAddedToast = true
-            DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
-                showAddedToast = false
-            }
+            // 可取消计时：连续添加两个书签时，旧实现的第一个 1.5s 计时到点会把
+            // 第二个刚亮的 toast 提前藏掉（与 BrowserView 的 toast 互踩同源）
+            addedToastWorkItem?.cancel()
+            let work = DispatchWorkItem { showAddedToast = false }
+            addedToastWorkItem = work
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.5, execute: work)
         }
         BookmarkStore.shared.save(bookmarks)
         newBookmarkURL = ""

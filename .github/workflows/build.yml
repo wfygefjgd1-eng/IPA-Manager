@@ -34,18 +34,42 @@ jobs:
       - name: Install XcodeGen
         run: brew install xcodegen
 
-      - name: Cache OpenSSL build
+      - name: Restore OpenSSL cache
         id: cache-openssl
-        uses: actions/cache@v4
+        uses: actions/cache/restore@v4
         with:
           path: |
             Vendor/openssl/lib
             Vendor/openssl/include
-          key: openssl-ios-${{ runner.os }}-${{ hashFiles('scripts/build-openssl.sh') }}-v1
+          key: openssl-ios-${{ runner.os }}-${{ hashFiles('scripts/build-openssl.sh') }}-v2
 
       - name: Build OpenSSL for iOS (device arm64)
         if: steps.cache-openssl.outputs.cache-hit != 'true'
         run: bash scripts/build-openssl.sh
+
+      - name: Verify cached OpenSSL artifacts (rebuild locally if broken)
+        if: steps.cache-openssl.outputs.cache-hit == 'true'
+        run: |
+          # 缓存可能存有半成品（job 在 save 前被 cancel / runner 磁盘满）：关键
+          # 产物缺失时就地重建，否则报错点会漂移到 xcodebuild 链接期的
+          # "library not found"，只能手动删 Actions 缓存才能恢复。
+          if [ ! -s Vendor/openssl/lib/libcrypto-device.a ] || [ ! -f Vendor/openssl/include/openssl/crypto.h ]; then
+            echo "OpenSSL 缓存不完整，就地重建"
+            rm -rf Vendor/openssl
+            bash scripts/build-openssl.sh
+          fi
+
+      - name: Save OpenSSL cache
+        # 拆分 restore/save：actions/cache@v4 的 post-step 在 job 失败乃至被
+        # cancel 时仍会保存（cancel-in-progress 下取消是常态），不完整产物会
+        # 持久污染后续所有 run。save 仅在成功后执行。
+        if: steps.cache-openssl.outputs.cache-hit != 'true' && success()
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            Vendor/openssl/lib
+            Vendor/openssl/include
+          key: openssl-ios-${{ runner.os }}-${{ hashFiles('scripts/build-openssl.sh') }}-v2
 
       - name: Generate Xcode Project
         run: xcodegen generate
@@ -102,6 +126,9 @@ jobs:
           grep -qE '"CFBundleVersion" => "${{ github.run_number }}"' /tmp/ipa-info.txt \
             || { echo "IPA 结构或版本校验失败，终止发布"; exit 1; }
           echo "IPA 校验通过：版本 1.0.${{ github.run_number }}（构建号 ${{ github.run_number }}）"
+          # 产物完整性基准：人工发布流程（下载 artifact -> gh release create 上传）
+          # 之间无可对照哈希时，无法发现 artifact 下载截断/损坏
+          shasum -a 256 "$IPA" | tee build/artifacts/SHA256SUMS
 
       - name: Upload Build Artifacts
         uses: actions/upload-artifact@v4

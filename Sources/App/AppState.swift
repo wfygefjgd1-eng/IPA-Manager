@@ -145,6 +145,14 @@ final class AppState: ObservableObject {
             return
         }
 
+        // tgz/tar/gz：当前解压引擎只支持 ZIP。此前这些扩展名也进入分类流程，
+        // 最终得到与实际格式不符的"不是有效的 ZIP 压缩包"，用户误以为文件损坏。
+        if ext != "zip" {
+            Logger.error("下载/外部打开的归档为暂不支持的格式: \(url.lastPathComponent) (.\(ext))")
+            completion?(.failure(AppError.operationFailed("暂不支持 .\(ext) 归档格式，请使用 .zip 或 .ipa 文件")))
+            return
+        }
+
         // 压缩包：后台先判断内容（证书包 / 应用包 / 未知），避免阻塞 UI。
         // 安全作用域在后台流程入口持有、defer 在闭包内释放，覆盖 classifyArchivedContent
         // 解压扫描与 convertToIPAIfNeeded 读取外部文件的全过程（文件 App 打开的
@@ -222,98 +230,86 @@ final class AppState: ObservableObject {
         }
     }
 
-    /// 把压缩包解压到临时目录后扫描内容，判断它属于证书包还是应用包。
-    /// 不做列表 API 依赖：ZipManager 只有 unzip/zip，因此采用“解压后扫目录”方案。
+    /// 按 zip 中央目录条目路径判断压缩包内容（证书包 / 应用包 / 内嵌 ipa），
+    /// 不再全量解压后扫目录：分类只需要扩展名与路径形状，2GB 包的自动导入此前
+    /// 要为看一眼文件名付整包解压的 IO 与双倍磁盘峰值（分类解压一遍 + 转换再解压一遍）。
+    /// 仅当判定为内嵌 .ipa 时才把该单个条目解出复制到 IPA 目录。
     private func classifyArchivedContent(at url: URL) throws -> DownloadedArchiveKind {
-        let tempDir = FileManager.default.temporaryDirectory
-            .appendingPathComponent("DLScan-\(UUID().uuidString)", isDirectory: true)
-        defer { try? FileManager.default.removeItem(at: tempDir) }
-
+        let entryPaths: [String]
         do {
-            try ZipManager.shared.unzip(archiveURL: url, destinationURL: tempDir)
+            // ZipManager 的 ZipError（"非 zip / 网页错误页 / 损坏不完整"，中文）
+            // 直接透传给上层展示
+            entryPaths = try ZipManager.shared.listEntryPaths(archiveURL: url)
         } catch {
-            // 透传 ZipManager 的 ZipError（errorDescription 已是中文，区分“非 zip / 网页错误页 / 损坏不完整”）：
-            // “该文件不是有效的 ZIP 压缩包” / “下载到的是网页而不是文件（…）” /
-            // “ZIP 文件已损坏或下载不完整，请删除后重新下载”
             Logger.error("压缩包分类失败: \(url.lastPathComponent) - \(error.localizedDescription)")
             throw error
         }
 
         var hasCertificate = false
         var hasAppBundle = false
-        // zip 内嵌的独立 .ipa 文件在 Documents/IPA 下的持久副本；nil 表示尚未发现或复制失败
-        var embeddedIPAURL: URL? = nil
-
-        guard let enumerator = FileManager.default.enumerator(at: tempDir, includingPropertiesForKeys: nil) else {
-            throw AppError.operationFailed("无法读取压缩包内容: \(url.lastPathComponent)")
-        }
-
-        while let element = enumerator.nextObject() as? URL {
-            let elementExt = element.pathExtension.lowercased()
-            if elementExt == "app" {
-                // 找到 .app 即视为应用包（无论位于 Payload/、Archive/ 还是根目录）
+        var embeddedIPAPath: String? = nil
+        for path in entryPaths {
+            let lower = path.lowercased()
+            if lower.hasSuffix(".app") || lower.contains(".app/") {
+                // 顶层或任意层级的 .app 应用包（目录条目本身或其内部文件）
                 hasAppBundle = true
-            } else if elementExt == "p12" || elementExt == "pfx" {
+            } else if lower.hasSuffix(".p12") || lower.hasSuffix(".pfx") {
                 hasCertificate = true
-            } else if elementExt == "mobileprovision" && !isInsideAppBundle(element) {
+            } else if lower.hasSuffix(".mobileprovision") && !lower.contains(".app/") {
                 // 排除 .app 内部的 embedded.mobileprovision，避免应用包被误判为证书包
                 hasCertificate = true
-            } else if elementExt == "ipa" && !isInsideAppBundle(element) {
-                // zip 内嵌 .ipa（GitHub release 常见格式：zip 包着 ipa + 校验 txt）。
-                // 临时目录会被本函数末尾的 defer 删除，因此必须立即复制到 Documents/IPA 持久位置，
-                // 否则返回的 URL 会在 defer 后失效。只记录第一个成功复制的副本。
-                guard embeddedIPAURL == nil else { continue }
-                // 数据安全：目标同名文件已存在时追加唯一后缀，绝不覆盖可能仍被其它记录
-                // 引用的旧文件（与 convertToIPAIfNeeded 的输出唯一化策略一致）。
-                let ipaBase = URL(fileURLWithPath: element.lastPathComponent).deletingPathExtension().lastPathComponent
-                var destURL = self.fileManager.directoryURL(.ipa)
-                    .appendingPathComponent(element.lastPathComponent)
-                if FileManager.default.fileExists(atPath: destURL.path) {
-                    destURL = self.fileManager.directoryURL(.ipa)
-                        .appendingPathComponent("\(ipaBase)-\(UUID().uuidString.prefix(8)).ipa")
-                    while FileManager.default.fileExists(atPath: destURL.path) {
-                        destURL = self.fileManager.directoryURL(.ipa)
-                            .appendingPathComponent("\(ipaBase)-\(UUID().uuidString.prefix(8)).ipa")
-                    }
-                }
-                // copyItem 不返回 URL，复制成功后用目标路径构造并校验文件已存在
-                if (try? self.fileManager.copyItem(from: element, to: destURL)) != nil,
-                   FileManager.default.fileExists(atPath: destURL.path) {
-                    embeddedIPAURL = destURL
-                    Logger.info("压缩包内检测到内嵌 .ipa，已复制到: \(destURL.lastPathComponent)")
-                }
-                // 复制失败：绝不返回临时目录路径，跳过，最终落 .unknown
+            } else if lower.hasSuffix(".ipa") && !lower.contains(".app/") && embeddedIPAPath == nil {
+                // zip 内嵌 .ipa（GitHub release 常见格式），只记录第一个
+                embeddedIPAPath = path
             }
         }
 
         if hasCertificate { return .certificateBundle }
         if hasAppBundle { return .appPackage }
-        if let embeddedURL = embeddedIPAURL { return .embeddedIPA(embeddedURL) }
-        // 压缩包能正常解压但内部既无 .app 也无证书结构 → 未知类型（下游会报“不是应用包也不是证书包”）
-        // 附上顶层内容摘要，说明“压缩包里到底有什么”（源码包 / 空包 / 其它结构）。
-        let summary = topLevelSummary(of: tempDir)
+
+        // 内嵌 .ipa：单条目解出并复制到 Documents/IPA 持久位置（唯一后缀，绝不覆盖旧文件）
+        if let ipaEntry = embeddedIPAPath {
+            let entryName = (ipaEntry as NSString).lastPathComponent
+            let ipaBase = (entryName as NSString).deletingPathExtension
+            let ipaDir = self.fileManager.directoryURL(.ipa)
+            var destURL = ipaDir.appendingPathComponent(entryName)
+            if FileManager.default.fileExists(atPath: destURL.path) {
+                destURL = ipaDir.appendingPathComponent("\(ipaBase)-\(UUID().uuidString.prefix(8)).ipa")
+                while FileManager.default.fileExists(atPath: destURL.path) {
+                    destURL = ipaDir.appendingPathComponent("\(ipaBase)-\(UUID().uuidString.prefix(8)).ipa")
+                }
+            }
+            do {
+                try ZipManager.shared.extractEntry(archiveURL: url, entryPath: ipaEntry, to: destURL)
+            } catch {
+                Logger.error("压缩包内嵌 .ipa 抽取失败: \(ipaEntry) - \(error.localizedDescription)")
+                return .unknown("内嵌 .ipa（\(entryName)）无法解出：\(error.localizedDescription)")
+            }
+            Logger.info("压缩包内检测到内嵌 .ipa，已复制到: \(destURL.lastPathComponent)")
+            return .embeddedIPA(destURL)
+        }
+
+        // 压缩包能正常读取但内部既无 .app 也无证书结构 → 未知类型（下游会报"不是应用包也不是证书包"）
+        let summary = Self.archiveTopLevelSummary(entryPaths)
         Logger.error("压缩包分类失败: \(url.lastPathComponent) - 压缩包内未发现 .app（应用包）或 .p12/.pfx/.mobileprovision（证书包）结构。\(summary)")
         return .unknown(summary)
     }
 
-    /// 列出解压目录顶层内容（最多 5 个 + 总数），用于错误信息中说明“压缩包里到底有什么”。
-    private func topLevelSummary(of dir: URL) -> String {
-        guard let items = try? FileManager.default.contentsOfDirectory(
-            at: dir,
-            includingPropertiesForKeys: nil
-        ) else {
-            return "压缩包内内容无法读取"
+    /// 压缩包顶层内容摘要（最多 5 个 + 总数），基于中央目录路径推导，
+    /// 用于错误信息中说明"压缩包里到底有什么"。
+    private static func archiveTopLevelSummary(_ entryPaths: [String]) -> String {
+        var tops: [String] = []
+        for path in entryPaths {
+            let top = path.split(separator: "/").first.map(String.init) ?? path
+            if !top.isEmpty && !tops.contains(top) {
+                tops.append(top)
+            }
         }
-        if items.isEmpty { return "压缩包内没有任何内容" }
-        let names = items.map { $0.lastPathComponent }
-        let shown = names.prefix(5).joined(separator: "、")
-        return names.count > 5
-            ? "压缩包内包含：\(shown) 等 \(names.count) 个条目"
+        if tops.isEmpty { return "压缩包内没有任何内容" }
+        let shown = tops.prefix(5).joined(separator: "、")
+        return tops.count > 5
+            ? "压缩包内包含：\(shown) 等 \(tops.count) 个顶层条目"
             : "压缩包内包含：\(shown)"
-    }
-
-    private func isInsideAppBundle(_ url: URL) -> Bool {
-        url.pathComponents.contains { $0.hasSuffix(".app") }
     }
 
     /// 更新导入进度（任意线程可调，内部切回主线程赋值 @Published，
@@ -321,6 +317,11 @@ final class AppState: ObservableObject {
     /// progress 为整体进度 0~1；阶段内由各阶段自身推进（解压按字节、其余按权重）。
     /// 节流：主线程内同阶段 progress 变化 <1% 时跳过，避免大包解压逐条目高频
     /// 刷新主队列（数万次 async 会造成 UI 掉帧）；首次进入阶段与跨阶段必更新。
+    /// 节流状态锁：节流比较在调用线程（importQueue 串行队列）完成，命中节流就
+    /// 直接返回、不再派发 main.async——大包解压逐条目回调（数万次）时，旧实现
+    /// 每次回调仍构造闭包并跨线程 dispatch 一次，节流只省掉了 @Published 写入，
+    /// 几万次队列跳转的分配开销照付。主线程 clearImportProgress 的重置经锁互斥。
+    private let importProgressStateLock = NSLock()
     private var lastImportProgressKey: String = ""
     private var lastImportProgressValue: Double = -1
     func updateImportProgress(
@@ -330,13 +331,17 @@ final class AppState: ObservableObject {
         phase: String,
         progress: Double = 0
     ) {
+        let key = "\(index)-\(total)-\(phase)"
+        importProgressStateLock.lock()
+        let shouldThrottle = key == lastImportProgressKey
+            && abs(lastImportProgressValue - progress) < ProgressWeight.throttleDelta
+        if !shouldThrottle {
+            lastImportProgressKey = key
+            lastImportProgressValue = progress
+        }
+        importProgressStateLock.unlock()
+        guard !shouldThrottle else { return }
         DispatchQueue.main.async {
-            let key = "\(index)-\(total)-\(phase)"
-            let shouldThrottle = key == self.lastImportProgressKey
-                && abs(self.lastImportProgressValue - progress) < ProgressWeight.throttleDelta
-            guard !shouldThrottle else { return }
-            self.lastImportProgressKey = key
-            self.lastImportProgressValue = progress
             self.importProgress = ImportProgress(
                 fileName: fileName,
                 currentIndex: index,
@@ -349,11 +354,12 @@ final class AppState: ObservableObject {
 
     /// 清除导入进度（导入成功/失败后调用，内部切回主线程赋值）。
     func clearImportProgress() {
+        importProgressStateLock.lock()
+        lastImportProgressKey = ""
+        lastImportProgressValue = -1
+        importProgressStateLock.unlock()
         DispatchQueue.main.async {
             self.importProgress = nil
-            // 重置节流状态：下一文件/下次导入的首档进度必须显示
-            self.lastImportProgressKey = ""
-            self.lastImportProgressValue = -1
         }
     }
 
@@ -440,8 +446,11 @@ final class AppState: ObservableObject {
                     var isSameApp = false
                     if FileManager.default.fileExists(atPath: destination.path) {
                         let existing = importedAppsSnapshot.first { $0.path == destination.path }
+                        // 轻量 bundleID 读取（zip 中央目录单条目，毫秒级）：旧实现为比对
+                        // bundleID 把新 IPA 整包解压一遍（1GB 包纯 IO 翻倍）。读取失败
+                        // 返回 nil，与原 parseAppInfo 失败同语义（视为不同应用走唯一后缀）。
                         isSameApp = existing != nil
-                            && existing?.bundleID == (try? self.parser.parseAppInfo(fileURL: importURL).bundleID)
+                            && existing?.bundleID == self.parser.lightweightAppInfo(from: importURL)?.bundleID
                         if !isSameApp {
                             let base = destination.deletingPathExtension().lastPathComponent
                             var candidate = self.fileManager.directoryURL(.ipa)
@@ -497,7 +506,9 @@ final class AppState: ObservableObject {
                 } else {
                     self.updateImportProgress(fileName: fileName, index: index, total: total, phase: "解析中…", progress: ProgressWeight.parseStartZip)
                 }
-                var app = try self.parser.parseAppInfo(fileURL: destination, progress: { p in
+                var app: AppInfo
+                let parsedRootURL: URL
+                let parsed = try self.parser.parseAppInfoWithRoot(fileURL: destination, progress: { p in
                     if isDirectIPA {
                         // .ipa 直接导入：5% → 98% 线性映射解压字节
                         self.updateImportProgress(fileName: fileName, index: index, total: total, phase: "解析中…", progress: ProgressWeight.parseStartDirect + p * ProgressWeight.parseRangeDirect)
@@ -506,6 +517,8 @@ final class AppState: ObservableObject {
                         self.updateImportProgress(fileName: fileName, index: index, total: total, phase: "解析中…", progress: ProgressWeight.parseStartZip + p * ProgressWeight.parseRangeZip)
                     }
                 })
+                app = parsed.info
+                parsedRootURL = parsed.rootURL
                 // skip-copy 分支唯一后缀保护：转换产物已直接写入 destination，但该路径若
                 // 已被其它 bundleID 的记录引用（如旧记录指向已丢失的文件、或转换输出恰好
                 // 撞上残留同名文件），把产物改名到唯一后缀，杜绝新旧两条记录指向同一文件。
@@ -544,6 +557,10 @@ final class AppState: ObservableObject {
                    ) {
                     app.iconPath = stablePath
                 }
+                // 解析与图标提取完成后，本次解压目录（Extracted/<base>-<uuid>，数百 MB~
+                // 数 GB 的完整副本）已无用：立即清理，与 zip 转换路径（convertToIPAIfNeeded）
+                // 的磁盘占用策略对齐——旧实现直接 .ipa 导入的解析目录要留到冷启动孤儿清扫。
+                try? FileManager.default.removeItem(at: parsedRootURL)
                 DispatchQueue.main.async {
                     // bundleID 为空（Info.plist 损坏/顶层非字典等异常）时不按空串去重：
                     // 否则第二个坏包会静默覆盖上一个坏包的记录且无任何提示
@@ -606,7 +623,13 @@ final class AppState: ObservableObject {
         signingTasks.append(task)
         saveState()
 
-        DispatchQueue.global(qos: .userInitiated).async {
+        // zsign 桥接层并发不安全（文件级 thread_local 缓冲之外的静态全局状态），
+        // 且注释明确写着"zsign 并发不安全"——但本方法此前派发到并发 global 队列，
+        // 手动签名可与自动签名队列的 zsign 任务并发执行（导入 B 触发自动签名期间
+        // 用户在 A 详情页点"开始签名"），两个 zsign_sign 并发 → 崩溃/产物损坏。
+        // 全局签名串行队列让自动/手动两条路径天然互斥；证书导入的 p12 解析
+        // （zsign_p12_info）也走同一队列，覆盖全部桥接入口。
+        SigningEngine.zsignQueue.async {
             DispatchQueue.main.async {
                 if let index = self.signingTasks.firstIndex(where: { $0.id == task.id }) {
                     self.signingTasks[index].status = .processing
@@ -664,15 +687,23 @@ final class AppState: ObservableObject {
         }
     }
 
-    func installApp(_ app: AppInfo, certificate: CertificateInfo) throws {
+    func installApp(
+        _ app: AppInfo,
+        certificate: CertificateInfo,
+        onInstallOpened: (() -> Void)? = nil
+    ) throws {
         guard app.isSigned else {
             throw AppError.installFailed("应用尚未签名")
         }
-        try Installer.shared.install(ipaPath: app.path, certificate: certificate)
+        try Installer.shared.install(ipaPath: app.path, certificate: certificate, onInstallOpened: onInstallOpened)
     }
 
-    func installSignedPath(_ ipaPath: String, certificate: CertificateInfo) throws {
-        try Installer.shared.install(ipaPath: ipaPath, certificate: certificate)
+    func installSignedPath(
+        _ ipaPath: String,
+        certificate: CertificateInfo,
+        onInstallOpened: (() -> Void)? = nil
+    ) throws {
+        try Installer.shared.install(ipaPath: ipaPath, certificate: certificate, onInstallOpened: onInstallOpened)
     }
 
     /// 签名完成后是否自动返回桌面（设置开关，默认开）。
@@ -764,22 +795,25 @@ final class AppState: ObservableObject {
         }
     }
 
-    /// 自动签名成功后：发起安装；若设置开启"签名完成自动返回桌面"，延迟回桌面
-    /// （iOS 随即弹出"是否安装"确认，省去手动点"返回"）。
+    /// 自动签名成功后：发起安装；若设置开启"签名完成自动返回桌面"，在 itms-services
+    /// open 成功后延迟回桌面（iOS 随即弹出"是否安装"确认，省去手动点"返回"）。
     private func autoSignAndInstallSucceeded(app: AppInfo, signedPath: String, certificate: CertificateInfo) {
         do {
-            try installSignedPath(signedPath, certificate: certificate)
-            Logger.info("自动签名并安装已发起: \(app.name)")
-            // 批量队列未清空时不回桌面：App 退后台后 UIApplication.open 发出的
-            // itms-services 链接系统不保证响应（后台态 open 常被忽略），第 2 个
-            // 之后的安装会在后台静默失败。保持前台逐个弹系统安装确认，最后一个
-            // 安装发起后才回桌面。
-            if store.autoReturnHomeAfterSigningEnabled() && autoSignQueue.isEmpty {
-                DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) { [weak self] in
+            try installSignedPath(signedPath, certificate: certificate) { [weak self] in
+                // itms-services open 成功后（主线程回调）才调度回桌面。此前固定 1.2s
+                // 计时从"发起安装请求"就开始跑，而本地服务器启动/元数据解析/manifest
+                // 生成常超 1.2s——App 先退到后台，open 随后才执行会被系统忽略
+                // （后台态 open 常被忽略），表现为"自动安装静默失败"。
+                guard let self = self else { return }
+                // 批量队列未清空时不回桌面：保持前台逐个弹系统安装确认，最后一个
+                // 安装发起后才回桌面。
+                guard self.store.autoReturnHomeAfterSigningEnabled(), self.autoSignQueue.isEmpty else { return }
+                DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) {
                     // 延迟让用户看到"签名完成"的过渡，再回桌面等 iOS 弹安装提示
-                    self?.minimizeToHomeScreen()
+                    self.minimizeToHomeScreen()
                 }
             }
+            Logger.info("自动签名并安装已发起: \(app.name)")
         } catch {
             Logger.error("自动签名完成但安装失败: \(app.name) - \(error.localizedDescription)")
             showToast("自动签名完成，安装失败：\(error.localizedDescription)")
@@ -929,10 +963,17 @@ final class AppState: ObservableObject {
                         profileURL: content.profileURL
                     )
                     DispatchQueue.main.async {
-                        // 描述文件
-                        if let profileURL = moved.profileURL,
-                           let profile = try? ProvisioningManager.shared.importProfile(from: profileURL) {
-                            self.addProfile(profile)
+                        // 描述文件：解析失败给明确反馈并清理托管副本（旧实现 try? 吞错，
+                        // 文案宣称"已导入描述文件"与实际不符，且明文副本残留 Documents）
+                        if let profileURL = moved.profileURL {
+                            do {
+                                let profile = try ProvisioningManager.shared.importProfile(from: profileURL)
+                                self.addProfile(profile)
+                            } catch {
+                                try? FileManager.default.removeItem(at: profileURL)
+                                Logger.error("zip 证书包描述文件导入失败: \(error)")
+                                self.showToast("描述文件导入失败：\(error.localizedDescription)")
+                            }
                         }
                         // 证书：尝试用常见密码 "1" 导入（兼容多数自签证书包），
                         // 失败则提示用户走证书页手动输入密码导入
@@ -1020,6 +1061,14 @@ final class AppState: ObservableObject {
         }
         if selectedProfile == nil {
             selectedProfile = profiles.first { $0.status == .valid } ?? profiles.first
+        }
+
+        // 启动清扫证书导入残留：上次会话若在"托管 P12 副本已复制、证书导入未完成"
+        // 的窗口被杀/崩溃，明文 cert-*.p12（含私钥材料，文件共享可导出）与
+        // bundle-extract-* 解压目录会永久残留。启动时无任何证书导入进行中，
+        // 这些副本必然无用（私钥已入 Keychain，或导入根本没发生）。
+        DispatchQueue.global(qos: .userInitiated).async {
+            CertificateBundleImporter.shared.sweepOrphanManagedArtifacts()
         }
     }
 
@@ -1118,6 +1167,13 @@ final class AppState: ObservableObject {
     /// 对每个签名 IPA 完整解析，拿到 bundleID / version / iconPath（修复“未知 Bundle ID”、
     /// 图标不显示）；解析失败时回退为旧逻辑（文件名 + isSigned）。
     /// 解析在串行后台队列执行（解压较慢，不可上主线程），最终 @Published 赋值回到主线程。
+    /// 已签应用解析缓存（仅在 installedAppsRefreshQueue 串行队列访问）：
+    /// key 为 IPA 绝对路径，值为 (修改时间, 大小, AppInfo)。签名产物文件名唯一且
+    /// 内容不变，(mtime,size) 未变即可复用——refreshInstalledApps 在每次签名完成/
+    /// 删除应用/启动后都会全量扫描，没有缓存时每个已签 IPA 都要重新整包解压一遍
+    /// （N 个大包 × 每次刷新 = 重复的 GB 级 IO）。
+    private var installedAppParseCache: [String: (mtime: Date, size: Int64, info: AppInfo)] = [:]
+
     func refreshInstalledApps(completion: (() -> Void)? = nil) {
         isRefreshingInstalledApps = true
         installedAppsRefreshQueue.async {
@@ -1130,7 +1186,7 @@ final class AppState: ObservableObject {
             }
             let apps = datedURLs
                 .sorted { $0.1 > $1.1 }
-                .map { self.makeInstalledAppInfo(from: $0.0) }
+                .map { self.makeInstalledAppInfo(from: $0.0, modifiedAt: $0.1) }
             DispatchQueue.main.async {
                 self.installedApps = apps
                 self.isRefreshingInstalledApps = false
@@ -1140,37 +1196,56 @@ final class AppState: ObservableObject {
     }
 
     /// 解析单个签名产物为完整 AppInfo；失败时回退旧逻辑（文件名 + isSigned）。
-    private func makeInstalledAppInfo(from url: URL) -> AppInfo {
-        // parseAppInfo 会解压 IPA 并读取 Info.plist / 提取图标
-        if var parsed = try? parser.parseAppInfo(fileURL: url) {
+    private func makeInstalledAppInfo(from url: URL, modifiedAt: Date) -> AppInfo {
+        let path = url.path
+        let size = fileManager.fileSize(at: url)
+        if let cached = installedAppParseCache[path], cached.mtime == modifiedAt, cached.size == size {
+            return cached.info
+        }
+
+        var result: AppInfo
+        var extractedRoot: URL? = nil
+        // parseAppInfoWithRoot 会解压 IPA 并读取 Info.plist / 提取图标
+        if let parsed = try? parser.parseAppInfoWithRoot(fileURL: url) {
+            var info = parsed.info
+            extractedRoot = parsed.rootURL
             // 覆盖回签名产物自身：parseAppInfo 返回的 path 是 .app 内部路径、
             // size 是 IPA 大小。其它调用方（AppDetailView 按 path 匹配已签名列表、
             // 详情/首页按 signedPath/path 取签名文件时间）依赖这些字段指向签名 IPA。
-            parsed.path = url.path
-            parsed.size = fileManager.fileSize(at: url)
-            parsed.isSigned = true
-            parsed.signedPath = url.path
+            info.path = path
+            info.size = size
+            info.isSigned = true
+            info.signedPath = path
             // extractIcon 返回的是 .app 内部路径，而解压目录（Extracted/<baseName>/）
-            // 会在下一轮解析时被整体清空重建，因此把图标复制到稳定位置再回填 iconPath，
+            // 会在解析后被清理，因此把图标复制到稳定位置再回填 iconPath，
             // 保证刷新后 iconPath 指向存在的文件。
-            if let iconPath = parsed.iconPath,
+            if let iconPath = info.iconPath,
                FileManager.default.fileExists(atPath: iconPath),
                let stablePath = persistInstalledAppIcon(
                    from: iconPath,
                    baseName: url.deletingPathExtension().lastPathComponent,
-                   app: parsed
+                   app: info
                ) {
-                parsed.iconPath = stablePath
+                info.iconPath = stablePath
             }
-            return parsed
+            result = info
+        } else {
+            var fallback = AppInfo()
+            fallback.name = url.deletingPathExtension().lastPathComponent
+            fallback.path = path
+            fallback.size = size
+            fallback.isSigned = true
+            result = fallback
         }
 
-        var fallback = AppInfo()
-        fallback.name = url.deletingPathExtension().lastPathComponent
-        fallback.path = url.path
-        fallback.size = fileManager.fileSize(at: url)
-        fallback.isSigned = true
-        return fallback
+        // 图标已持久化到 Extracted/Icons/ 稳定位置，本次解压目录（数百 MB~数 GB）
+        // 立即清理：旧实现要留到冷启动孤儿清扫，会话内每刷新一次就多攒一份。
+        if let extractedRoot = extractedRoot {
+            try? fileManager.removeItem(at: extractedRoot)
+        }
+        // 失败回退结果同样缓存：损坏产物每次刷新都重新解压一遍毫无意义
+        installedAppParseCache[path] = (modifiedAt, size, result)
+        return result
     }
 
     /// 把签名 IPA 解压出的图标复制到稳定位置 Extracted/Icons/<baseName>/<标识>-icon.<ext>，
@@ -1181,6 +1256,12 @@ final class AppState: ObservableObject {
     }
 
     func saveState() {
+        // 签名历史上限：只保留最近 300 条。signingTasks 此前只随"删除对应应用"
+        // 清理，长期使用后无限增长，而 saveState（每次导入/签名/证书变更都调用）
+        // 要对全部记录做全量 JSON 编码，数组越大主线程编码越慢。
+        if signingTasks.count > 300 {
+            signingTasks = Array(signingTasks.suffix(300))
+        }
         store.saveCertificates(certificates)
         store.saveProfiles(profiles)
         store.saveSigningTasks(signingTasks)

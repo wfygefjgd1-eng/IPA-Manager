@@ -25,10 +25,21 @@ final class LocalInstallServer {
     /// 最近一次安装活动时间（itms-services 打开成功 / 新连接 / 收到请求）：
     /// 回前台与保活超时据此判断安装是否仍在进行，绝不打断进行中的安装下载
     private var lastActivityDate: Date?
+    /// 上一个会话的 IPA 是否已完整发出（EOF）及发完时刻：连续安装的"等空闲"
+    /// 判定依据——整个 IPA 发完后 SpringBoard 不再需要旧服务器，可安全重启。
+    /// 仅在服务器串行队列读写（sendFileChunks 运行在该队列）。
+    private var transferCompletedDate: Date?
 
     /// 持有并发探测结果的盒子，避免在并发 Task 中直接捕获可变变量（Sendable 警告）。
     private final class ProbeHolder: @unchecked Sendable {
-        var logs: [String] = []
+        private let lock = NSLock()
+        private var _logs: [String] = []
+        /// 等待超时后调用线程仍会读取：读写在锁内完成，否则对非原子数组的
+        /// 无同步读写是 UB（Task 写 vs 调用线程读）。
+        var logs: [String] {
+            get { lock.lock(); defer { lock.unlock() }; return _logs }
+            set { lock.lock(); defer { lock.unlock() }; _logs = newValue }
+        }
     }
 
     /// ready 等待结果盒子：stateUpdateHandler 在服务器队列写入，调用线程在
@@ -129,7 +140,51 @@ final class LocalInstallServer {
         return logs.filter { !$0.isEmpty }
     }
 
+    /// 等待上一个安装会话空闲（连续/批量安装防互踩）。满足其一即空闲：
+    /// 1) 服务器未在运行（从未启动 / 已 stop）；
+    /// 2) 上一个会话的 IPA 已完整发出（EOF）且距今超过 5 秒——SpringBoard
+    ///    下载完成后不再需要旧服务器，可安全重启；
+    /// 3) 等待超过 15 分钟硬上限：用户把系统安装确认弹窗无限期挂着时放弃等待，
+    ///    由调用方给出明确错误（而不是掐死上一个安装）。
+    /// 期间并发 stop() 会把 isRunning 置 false，循环随即退出。
+    private func waitForPreviousInstallIdle() throws {
+        let hardCap: TimeInterval = 15 * 60
+        let began = Date()
+        while true {
+            var idle = false
+            ServerQueue.shared.queue.sync {
+                idle = !isRunning
+                    || (transferCompletedDate.map { Date().timeIntervalSince($0) >= 5 } ?? false)
+            }
+            if idle { return }
+            if Date().timeIntervalSince(began) >= hardCap {
+                throw AppError.installFailed("上一次安装仍在进行（已等待 15 分钟），请先完成或取消该安装再试")
+            }
+            Thread.sleep(forTimeInterval: 1.0)
+        }
+    }
+
     func start(ipaLocalURL: URL) throws -> URL {
+        try waitForPreviousInstallIdle()
+
+        // 端口重试：49152-65535 与系统临时源端口同段，偶发 EADDRINUSE
+        // （.failed 在 ready 等待中报告）。换随机端口重试最多 3 次，而不是
+        // 一次失败就让整个安装挂掉。
+        var lastDetail = "监听器未能在 \(Int(Timeouts.readyWait)) 秒内进入就绪状态"
+        for attempt in 1...3 {
+            do {
+                return try startOnce(ipaLocalURL: ipaLocalURL)
+            } catch let error as AppError {
+                lastDetail = error.localizedDescription
+                Logger.warning("本地安装服务器启动失败（第 \(attempt) 次尝试）: \(lastDetail)")
+            }
+        }
+        throw AppError.installFailed("本地安装服务器启动失败：\(lastDetail)")
+    }
+
+    /// 单次启动尝试（stop 旧会话 → 随机端口监听 → 等 ready → 探测 → 保活）。
+    /// 抛出的 AppError 描述为具体原因（无"启动失败"前缀），由 start 统一包装。
+    private func startOnce(ipaLocalURL: URL) throws -> URL {
         stop()
 
         let port = UInt16.random(in: 49152...65535)
@@ -150,6 +205,8 @@ final class LocalInstallServer {
         ServerQueue.shared.queue.sync {
             self.listener = listener
             self.servingIPA = ipaLocalURL
+            // 新会话：清空上一会话的传输完成标记（本会话的 EOF 由 sendFileChunks 重新写入）
+            self.transferCompletedDate = nil
         }
 
         listener.newConnectionHandler = { [weak self] connection in
@@ -208,7 +265,7 @@ final class LocalInstallServer {
             }
             stop()
             Logger.error("本地安装服务器启动失败: \(detail)")
-            throw AppError.installFailed("本地安装服务器启动失败：\(detail)")
+            throw AppError.installFailed(detail)
         }
 
         // 候选地址探测仅用于日志诊断（回环 + 前两个接口 IP，0.5s 并发）。
@@ -294,6 +351,7 @@ final class LocalInstallServer {
             lastBaseURL = nil
             isRunning = false
             startedDate = nil
+            transferCompletedDate = nil
         }
         if wasRunning {
             Logger.info("本地安装服务器已停止")
@@ -427,8 +485,15 @@ final class LocalInstallServer {
         // 慢速磁盘即可超过 150/240 秒）。本方法运行在服务器串行队列，直接写。
         lastActivityDate = Date()
         let chunkSize = 256 * 1024
-        let data = handle.readData(ofLength: chunkSize)
+        // readData(upToLength:) 是 throwing API：I/O 错误（非 EOF）时抛 NSFileHandleException，
+        // 旧实现 readData(ofLength:) 对 I/O 错误直接抛 ObjC 异常且未捕获 → 进程崩溃
+        // （EOF 正常返回空 Data）。这里把"错误"与"EOF"统一折叠为空 Data → 走下方
+        // 收尾分支（关句柄 + 断开），一次失败的安装好过整个 App 闪退。
+        let data = (try? handle.readData(upToLength: chunkSize)) ?? Data()
         if data.isEmpty {
+            // 整个 IPA 已完整发出：记录 EOF 时刻。连续安装的下一个 start()
+            // 据此判定"上一个会话已空闲"（见 waitForPreviousInstallIdle）。
+            transferCompletedDate = Date()
             try? handle.close()
             self.connections.removeAll { $0 === connection }
             connection.cancel()

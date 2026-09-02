@@ -7,7 +7,7 @@ import UIKit
 /// manifest 和 IPA 时就会"连不上 127.0.0.1"。通过 audio 后台模式播放一段
 /// 静音音频，让系统认为 App 正在播放音频，从而保持进程在后台持续运行，
 /// 直到安装完成（AI 助手下载 IPA 可能耗时数十秒，必须全程保活）。
-final class BackgroundAudioKeepAlive {
+final class BackgroundAudioKeepAlive: NSObject {
     static let shared = BackgroundAudioKeepAlive()
 
     private var player: AVAudioPlayer?
@@ -19,8 +19,21 @@ final class BackgroundAudioKeepAlive {
     /// 进行中的安装（大 IPA / 用户在安装确认弹窗停留的耗时可能远超固定时限）。
     private var autoStopWorkItem: DispatchWorkItem?
     private let autoStopInterval: TimeInterval = 5 * 60
+    /// 音频会话被系统中断（来电/闹钟/Siri）期间申请的后台时间：中断后没有活跃
+    /// 音频的进程几秒内就会被挂起（NWListener 停止收包 → 安装静默失败），
+    /// beginBackgroundTask 争取到的 ~30 秒足够撑过大多数中断并等待恢复播放。
+    private var emergencyBackgroundTask: UIBackgroundTaskIdentifier = .invalid
 
-    private init() {}
+    /// 中断通知只注册一次（单例生命周期与进程一致），处理内部切回主线程。
+    private override init() {
+        super.init()
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(handleAudioSessionInterruption(_:)),
+            name: AVAudioSession.interruptionNotification,
+            object: nil
+        )
+    }
 
     /// 开始保活：激活 playback AudioSession 并无限循环播放 1 秒静音 WAV。
     /// 幂等：已在保活时直接返回。本地服务器可能在后台队列启动（安装重活已移出
@@ -59,16 +72,70 @@ final class BackgroundAudioKeepAlive {
             scheduleAutoStop()
         } catch {
             Logger.warning("后台音频保活启动失败: \(error.localizedDescription)")
+            // 激活失败（会话被系统拒绝等）时进程退后台几秒内必被挂起、安装必败：
+            // 至少申请一段后台时间（~30 秒），足够 SpringBoard 拉取 manifest 并开始
+            // 下载，比秒级挂起强得多。
+            beginEmergencyBackgroundTask()
         }
     }
 
     private func startHeartbeat() {
         let t = Timer(timeInterval: 5.0, repeats: true) { _ in
-            let playing = BackgroundAudioKeepAlive.shared.player?.isPlaying ?? false
+            let keepAlive = BackgroundAudioKeepAlive.shared
+            let playing = keepAlive.player?.isPlaying ?? false
             Logger.debug("后台音频保活心跳: 进程存活, player.isPlaying=\(playing)")
+            // 自愈：中断结束后 player 未恢复（.ended 未带 shouldResume / 恢复播放
+            // 失败等）时，在心跳里重新激活会话并续播——否则进程无活跃音频，
+            // 数秒内被挂起，本地安装服务器失联、下载中的安装静默失败。
+            if !playing {
+                try? AVAudioSession.sharedInstance().setActive(true)
+                keepAlive.player?.play()
+            }
         }
         RunLoop.main.add(t, forMode: .common)
         heartbeatTimer = t
+    }
+
+    /// 音频会话中断处理（来电/闹钟/计时器/Siri 等）：
+    /// - began：系统会停掉 AVAudioPlayer；没有活跃音频的进程很快被挂起。
+    ///   申请后台时间争取撑到中断结束。
+    /// - ended（shouldResume）：重新激活会话并续播。旧实现完全没有中断处理，
+    ///   中断一次 = 安装静默失败（大包用蜂窝下载恰好最容易碰上来电/闹钟）。
+    @objc private func handleAudioSessionInterruption(_ notification: Notification) {
+        guard let info = notification.userInfo,
+              let typeRaw = info[AVAudioSessionInterruptionTypeKey] as? UInt,
+              let type = AVAudioSession.InterruptionType(rawValue: typeRaw) else { return }
+        DispatchQueue.main.async { [weak self] in
+            guard let self = self, self.isActive else { return }
+            switch type {
+            case .began:
+                self.beginEmergencyBackgroundTask()
+                Logger.warning("后台音频保活被系统中断（来电/闹钟等），已申请后台时间维持安装服务器")
+            case .ended:
+                let optionsRaw = (info[AVAudioSessionInterruptionOptionKey] as? UInt) ?? 0
+                let options = AVAudioSession.InterruptionOptions(rawValue: optionsRaw)
+                if options.contains(.shouldResume) {
+                    try? AVAudioSession.sharedInstance().setActive(true)
+                    self.player?.play()
+                    Logger.info("音频中断结束，后台保活已恢复播放")
+                }
+            @unknown default:
+                break
+            }
+        }
+    }
+
+    private func beginEmergencyBackgroundTask() {
+        guard emergencyBackgroundTask == .invalid else { return }
+        emergencyBackgroundTask = UIApplication.shared.beginBackgroundTask(withName: "InstallKeepAlive") { [weak self] in
+            self?.endEmergencyBackgroundTask()
+        }
+    }
+
+    private func endEmergencyBackgroundTask() {
+        guard emergencyBackgroundTask != .invalid else { return }
+        UIApplication.shared.endBackgroundTask(emergencyBackgroundTask)
+        emergencyBackgroundTask = .invalid
     }
 
     /// 启动最长时限自动停止（默认 5 分钟）：安装链路异常卡住时兜底停止保活，
@@ -118,6 +185,7 @@ final class BackgroundAudioKeepAlive {
         player?.stop()
         player = nil
         isActive = false
+        endEmergencyBackgroundTask()
         do {
             try AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
         } catch {
