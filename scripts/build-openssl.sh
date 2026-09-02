@@ -73,7 +73,7 @@ echo "==> 编译静态库"
 make -j"$(sysctl -n hw.ncpu)" build_generated
 make -j"$(sysctl -n hw.ncpu)" libcrypto.a || make libcrypto.a
 
-echo "==> 安装到 $DEVICE_OUT（libcrypto-only 手动安装）"
+echo "==> 安装到 ${DEVICE_OUT}（libcrypto-only 手动安装）"
 mkdir -p "$DEVICE_OUT/include" "$DEVICE_OUT/lib"
 rm -rf "$DEVICE_OUT/include/openssl"
 # 3.x 起生成的头文件（opensslconf.h/configuration.h 等）就在源码树 include/openssl 内，
