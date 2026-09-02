@@ -979,7 +979,10 @@ final class AppState: ObservableObject {
             handleDownloadedFile(
                 at: url,
                 completion: { result in
-                    inboxSettlement?(result.isSuccess ? "导入完成" : "导入失败")
+                    switch result {
+                    case .success: inboxSettlement?("导入完成")
+                    case .failure: inboxSettlement?("导入失败")
+                    }
                 },
                 onSettled: { inboxSettlement?("证书包导入完成") }
             )
