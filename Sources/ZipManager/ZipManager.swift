@@ -123,7 +123,7 @@ final class ZipManager {
     /// 目录还会再多一份 IPA 占位，进一步压缩空间。
     private static func isDiskFull(_ error: Error) -> Bool {
         let ns = error as NSError
-        return ns.domain == NSCocoaErrorDomain && ns.code == NSFileWriteOutOfSpace
+        return ns.domain == NSCocoaErrorDomain && ns.code == CocoaError.Code.fileWriteOutOfSpace.rawValue
     }
 
     /// 单次 Archive 打开完成全部条目级安全校验，并返回已校验的 Archive 与总解压体积。

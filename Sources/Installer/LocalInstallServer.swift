@@ -485,11 +485,11 @@ final class LocalInstallServer {
         // 慢速磁盘即可超过 150/240 秒）。本方法运行在服务器串行队列，直接写。
         lastActivityDate = Date()
         let chunkSize = 256 * 1024
-        // readData(upToLength:) 是 throwing API：I/O 错误（非 EOF）时抛 NSFileHandleException，
+        // read(upToCount:) 是 throwing API（iOS 13.4+）：I/O 错误（非 EOF）时抛错，
         // 旧实现 readData(ofLength:) 对 I/O 错误直接抛 ObjC 异常且未捕获 → 进程崩溃
-        // （EOF 正常返回空 Data）。这里把"错误"与"EOF"统一折叠为空 Data → 走下方
+        // （EOF 返回 nil）。这里把"错误"与"EOF"统一折叠为空 Data → 走下方
         // 收尾分支（关句柄 + 断开），一次失败的安装好过整个 App 闪退。
-        let data = (try? handle.readData(upToLength: chunkSize)) ?? Data()
+        let data = (try? handle.read(upToCount: chunkSize)) ?? Data()
         if data.isEmpty {
             // 整个 IPA 已完整发出：记录 EOF 时刻。连续安装的下一个 start()
             // 据此判定"上一个会话已空闲"（见 waitForPreviousInstallIdle）。

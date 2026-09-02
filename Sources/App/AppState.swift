@@ -1241,7 +1241,7 @@ final class AppState: ObservableObject {
         // 图标已持久化到 Extracted/Icons/ 稳定位置，本次解压目录（数百 MB~数 GB）
         // 立即清理：旧实现要留到冷启动孤儿清扫，会话内每刷新一次就多攒一份。
         if let extractedRoot = extractedRoot {
-            try? fileManager.removeItem(at: extractedRoot)
+            try? FileManager.default.removeItem(at: extractedRoot)
         }
         // 失败回退结果同样缓存：损坏产物每次刷新都重新解压一遍毫无意义
         installedAppParseCache[path] = (modifiedAt, size, result)
