@@ -65,10 +65,18 @@ mkdir -p "$DEVICE_OUT"
 
 echo "==> 编译静态库"
 # 仅构建 libcrypto：全库无任何 SSL_*/TLS_* 调用（签名只走 PKCS12/X509/EVP），
-# libssl 纯属白构建+白拷贝+白链接（约省 25-30% OpenSSL 编译时间）。构建目标从
-# build_libs 换成 build_libcrypto 后 install_dev 会安装已构建部分。
-make -j"$(sysctl -n hw.ncpu)" build_libcrypto || make build_libcrypto
-make install_dev
+# libssl 纯属白构建+白拷贝+白链接（约省 25-30% OpenSSL 编译时间）。
+# 注意：3.x 的 Makefile 没有 build_libcrypto 目标（只有 build_libs / 具体库名），
+# 且 install_dev 会因 libssl.a 缺失而失败——直接构建 libcrypto.a 并手动安装。
+make -j"$(sysctl -n hw.ncpu)" libcrypto.a || make libcrypto.a
+
+echo "==> 安装到 $DEVICE_OUT（libcrypto-only 手动安装）"
+mkdir -p "$DEVICE_OUT/include" "$DEVICE_OUT/lib"
+rm -rf "$DEVICE_OUT/include/openssl"
+# 3.x 起生成的头文件（opensslconf.h/configuration.h 等）就在源码树 include/openssl 内，
+# 与 install_dev 的复制来源一致
+cp -R "include/openssl" "$DEVICE_OUT/include/openssl"
+cp libcrypto.a "$DEVICE_OUT/lib/libcrypto.a"
 
 echo "==> 复制产物到 Vendor/openssl"
 mkdir -p "$VENDOR_INC" "$VENDOR_LIB"
