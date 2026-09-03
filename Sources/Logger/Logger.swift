@@ -137,12 +137,8 @@ enum Logger {
         } else {
             lines.append("App Group 共享容器：不可用")
         }
-        let profileGroups = AppGroup.profileAppGroupCandidates()
-        if profileGroups.isEmpty {
-            lines.append("描述文件内 App Groups：未发现（当前签名描述文件未授予任何 App Group——扩展无法交接文件，需更换含 App Group 的描述文件重签，或改用文件 App → 分享 → 拷贝到 IPA Manager）")
-        } else {
-            lines.append("描述文件内 App Groups：\(profileGroups.joined(separator: "、"))")
-        }
+        // 不再在诊断报告中显示 embedded.mobileprovision 中的 group 名称（该方法在重构中已移除）
+        // AppGroup.profileAppGroupCandidates 已移除，改用 AppGroup.resolvedIdentifier() 直接测试可访问性
 
         lines.append("")
         lines.append("由 IPA Manager 诊断功能导出")
