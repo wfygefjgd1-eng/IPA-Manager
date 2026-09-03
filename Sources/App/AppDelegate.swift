@@ -7,11 +7,8 @@ final class AppDelegate: NSObject, UIApplicationDelegate {
         didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]? = nil
     ) -> Bool {
         // 启动清理：本地服务器 TLS 身份遗留的钥匙串孤儿条目。
-        // 服务器已改明文 HTTP（NWParameters.tcp），旧版本 setIdentity 写入的
-        // "IPA Manager Server Cert" / "IPA Manager Server Identity <uuid>"
-        // 证书/私钥条目 App 卸载后不会自动清除，统一在启动时清理。
         CertificateManager.cleanupServerIdentityKeychainItems()
-        // 载入持久化投递追踪（先于任何 record，保证本会话事件与历史记录连续）
+        // 载入持久化投递追踪
         ExternalDeliveryJournal.load()
         // 冷启动分享投递兜底：分享面板「拷贝到 IPA Manager」冷启动 App 时，个别系统
         // 版本/时序下 application(_:open:) 与 onOpenURL 均不回调，open 事件丢失表现为
@@ -24,6 +21,12 @@ final class AppDelegate: NSObject, UIApplicationDelegate {
         } else {
             ExternalDeliveryJournal.record("冷启动：launchOptions 无 URL（普通启动）")
         }
+        // 【关键修复】冷启动主动扫描 Documents/Inbox 与 App Group 共享收件箱：
+        // 系统把文件拷入 Documents/Inbox 后并不总能保证 openURL 回调（尤其 iOS 17+、
+        // 企业签名、无场景代理时）。冷启动时若不扫描，文件会静默躺在 Inbox 里，
+        // 用户看到"打开 App 了但没反应"。此处主动扫描兜底，与回前台扫描逻辑复用，
+        // 内部有去重（processedInboxPaths / pendingInboxImports）不会重复导入。
+        AppState.shared.processInboxFilesIfNeeded()
         return true
     }
 

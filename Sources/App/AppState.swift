@@ -895,18 +895,24 @@ final class AppState: ObservableObject {
                 "共享容器：可用（组 \(identifier)）"
             } ?? "共享容器：不可用（描述文件未授予 App Group，分享扩展无法交接文件）")
         }
+        // 详细诊断：记录每个扫描目录的存在状态和文件数量
+        let inboxExists = FileManager.default.fileExists(atPath: inboxURL.path)
+        let groupInboxExists = AppGroup.inboxURLIfPresent.map { FileManager.default.fileExists(atPath: $0.path) } ?? false
+        let groupContainerExists = AppGroup.containerURL != nil
         let inboxFiles = (try? FileManager.default.contentsOfDirectory(
             at: inboxURL, includingPropertiesForKeys: [.contentModificationDateKey],
             options: [.skipsHiddenFiles])) ?? []
-        ExternalDeliveryJournal.record(inboxFiles.isEmpty
-            ? "回前台扫描：Inbox 无文件"
-            : "回前台扫描：Inbox \(inboxFiles.count) 项 [\(inboxFiles.map { $0.lastPathComponent }.joined(separator: "、"))]")
-
         let groupInboxFiles = AppGroup.inboxURLIfPresent.map { inbox -> [URL] in
             (try? FileManager.default.contentsOfDirectory(
                 at: inbox, includingPropertiesForKeys: [.contentModificationDateKey],
                 options: [.skipsHiddenFiles])) ?? []
         } ?? []
+        ExternalDeliveryJournal.record("扫描诊断：Documents/Inbox=\(inboxExists)(\(inboxFiles.count)项) AppGroup容器=\(groupContainerExists) 共享Inbox=\(groupInboxExists)(\(groupInboxFiles.count)项)")
+        
+        ExternalDeliveryJournal.record(inboxFiles.isEmpty
+            ? "回前台扫描：Inbox 无文件"
+            : "回前台扫描：Inbox \(inboxFiles.count) 项 [\(inboxFiles.map { $0.lastPathComponent }.joined(separator: "、"))]")
+
         if !groupInboxFiles.isEmpty {
             ExternalDeliveryJournal.record("回前台扫描：共享 Inbox \(groupInboxFiles.count) 项 [\(groupInboxFiles.map { $0.lastPathComponent }.joined(separator: "、"))]")
         }
