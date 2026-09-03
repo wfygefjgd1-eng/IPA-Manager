@@ -75,32 +75,24 @@ enum AppGroup {
     /// 解析当前签名实际可用的组名（进程内只解析一次）：
     /// 描述文件内声明的组 → 默认组名；逐个 containerURL 实测，取第一个可用者。
     /// 扩展进程无法直接读主 App 的 embedded.mobileprovision，因此：
-    /// 1. 主 App 先解析并写入 UserDefaults（standard）
-    /// 2. 扩展启动时优先读取该缓存
-    /// 3. 缓存无效时，扩展尝试自行解析（可能失败，再 fallback 到默认组名）
+    /// 1. 每次启动强制从 embedded.mobileprovision 重新解析（避免旧版缓存干扰）
+    /// 2. 解析成功后写入 UserDefaults 供扩展读取
+    /// 3. 扩展优先读缓存；缓存无效则重新解析
     static func resolvedIdentifier() -> String? {
         lock.lock()
         defer { lock.unlock() }
         if didResolve { return cachedIdentifier }
         didResolve = true
         
-        // 1. 先读缓存（主 App 解析后写入 standard UserDefaults）
-        if let cached = UserDefaults.standard.string(forKey: resolvedIdentifierKey),
-           FileManager.default.containerURL(forSecurityApplicationGroupIdentifier: cached) != nil {
-            cachedIdentifier = cached
-            return cachedIdentifier
-        }
-        
-        // 2. 自行解析（主 App 路径：读取自己的 embedded.mobileprovision）
+        // 强制从 embedded.mobileprovision 重新解析（忽略旧缓存，避免企业签组名不同时仍用旧缓存）
         var candidates = profileAppGroupCandidates()
         if !candidates.contains(defaultIdentifier) {
             candidates.append(defaultIdentifier)
         }
         for candidate in candidates {
-            // 直接检查容器是否存在，避免递归调用 containerURL 属性
             if FileManager.default.containerURL(forSecurityApplicationGroupIdentifier: candidate) != nil {
                 cachedIdentifier = candidate
-                // 3. 解析成功后写入缓存（standard + App Group 双写，确保跨进程可见）
+                // 解析成功后写入缓存（standard + App Group 双写，确保跨进程可见）
                 UserDefaults.standard.set(candidate, forKey: resolvedIdentifierKey)
                 UserDefaults(suiteName: candidate)?.set(candidate, forKey: resolvedIdentifierKey)
                 return cachedIdentifier
