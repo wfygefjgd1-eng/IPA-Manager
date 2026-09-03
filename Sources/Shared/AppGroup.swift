@@ -107,12 +107,24 @@ enum AppGroup {
     /// 提取后逐个实测可用性即可（未授予的组 containerURL 必为 nil，天然过滤误报）。
     /// 扩展包内若无 embedded.mobileprovision 则返回空，由默认组名兜底。
     static func profileAppGroupCandidates() -> [String] {
-        // 优先尝试读取主 App 的 bundle（通过 bundle identifier）
+        // 1. 优先尝试读取主 App 的 bundle（通过 bundle identifier）
         // 扩展的 Bundle.main 没有 mobileprovision，需找主 App 的
-        let mainBundle = Bundle(identifier: "com.ipamanager.app")
-        let sourceBundle = mainBundle ?? Bundle.main
+        var sourceBundle: Bundle? = Bundle(identifier: "com.ipamanager.app")
         
-        guard let url = sourceBundle.url(forResource: "embedded", withExtension: "mobileprovision"),
+        // 2. 如果通过 identifier 找不到，尝试所有已加载的 bundle
+        if sourceBundle == nil {
+            for bundle in Bundle.allBundles + Bundle.allFrameworks {
+                if bundle.bundleIdentifier == "com.ipamanager.app" {
+                    sourceBundle = bundle
+                    break
+                }
+            }
+        }
+        
+        // 3. 兜底使用 Bundle.main
+        let bundle = sourceBundle ?? Bundle.main
+        
+        guard let url = bundle.url(forResource: "embedded", withExtension: "mobileprovision"),
               let data = try? Data(contentsOf: url) else { return [] }
         let text = String(decoding: data, as: UTF8.self)
         guard let regex = try? NSRegularExpression(pattern: #"group\.[A-Za-z0-9._\-]{2,64}"#) else { return [] }
