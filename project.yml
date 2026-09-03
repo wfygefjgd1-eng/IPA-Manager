@@ -56,9 +56,12 @@ targets:
       - path: Vendor/zsign/ios
     dependencies:
       - package: ZIPFoundation
-      # 分享扩展：嵌入 PlugIns/，分享面板「IPA Manager」入口接收文件后经
-      # App Group 共享容器交给主 App（见 Sources/Shared/AppGroup.swift）
+      # 分享扩展 + 动作扩展：嵌入 PlugIns/。分享面板里「IPA Manager」应用行入口
+      # 与动作区入口（类似"QQ闪传分享"）都走同一接收逻辑：文件 → App Group 共享
+      # 容器 → 主 App 回前台扫描 → 自动导入→签名→安装
       - target: "IPA Manager Share"
+        embed: true
+      - target: "IPA Manager Action"
         embed: true
     entitlements:
       path: IPAManager.entitlements
@@ -195,6 +198,36 @@ targets:
             NSExtensionActivationSupportsFileWithMaxCount: 1
     entitlements:
       path: Sources/ShareExtension/IPAManagerShare.entitlements
+      properties:
+        com.apple.security.application-groups:
+          - group.com.ipamanager.app
+  IPA Manager Action:
+    # 动作扩展（com.apple.ui-services）：出现在分享面板动作区（与"QQ闪传分享"同级），
+    # 点按不跳转主 App，原地弹出接收面板；与分享扩展共用同一接收控制器与共享容器
+    type: app-extension
+    platform: iOS
+    sources:
+      - path: Sources/ShareExtension
+      - path: Sources/Shared
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.ipamanager.app.Action
+        INFOPLIST_FILE: Sources/ShareExtension/ActionInfo.plist
+        TARGETED_DEVICE_FAMILY: "1"
+    info:
+      path: Sources/ShareExtension/ActionInfo.plist
+      properties:
+        CFBundleDisplayName: IPA Manager
+        CFBundleShortVersionString: "$(MARKETING_VERSION)"
+        CFBundleVersion: "$(CURRENT_PROJECT_VERSION)"
+        NSExtension:
+          NSExtensionPointIdentifier: com.apple.ui-services
+          NSExtensionPrincipalClass: "$(PRODUCT_MODULE_NAME).ShareViewController"
+          NSExtensionActivationRule:
+            NSExtensionActivationDictionaryVersion: 2
+            NSExtensionActivationSupportsFileWithMaxCount: 1
+    entitlements:
+      path: Sources/ShareExtension/IPAManagerAction.entitlements
       properties:
         com.apple.security.application-groups:
           - group.com.ipamanager.app
