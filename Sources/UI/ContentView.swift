@@ -54,11 +54,6 @@ struct ContentView: View {
                         .padding(.bottom, 12)
                         .transition(.opacity.combined(with: .move(edge: .bottom)))
                 }
-                // 分享投递实时日志：折叠面板，仅在有事件时显示
-                if !appState.deliveryLogEntries.isEmpty {
-                    deliveryLogPanel(appState)
-                        .padding(.bottom, 12)
-                }
             }
             .padding(.bottom, 12)
         }
@@ -115,55 +110,4 @@ struct ContentView: View {
         .padding(.vertical, 12)
         .background(Capsule().fill(Color.black.opacity(0.8)))
     }
-    
-    /// 分享投递实时日志面板：显示最近 10 条 ExternalDeliveryJournal 事件
-    private func deliveryLogPanel(_ appState: AppState) -> some View {
-        VStack(alignment: .leading, spacing: 6) {
-            HStack {
-                Text("📥 分享投递日志")
-                    .font(.caption.weight(.medium))
-                    .foregroundColor(.accentColor)
-                Spacer()
-                Button {
-                    withAnimation(.easeInOut(duration: 0.2)) {
-                        appState.showDeliveryLog.toggle()
-                    }
-                } label: {
-                    Image(systemName: appState.showDeliveryLog ? "chevron.up" : "chevron.down")
-                        .font(.caption2)
-                        .foregroundColor(.secondary)
-                }
-            }
-            .padding(.horizontal, 12)
-            
-            if appState.showDeliveryLog {
-                ScrollView {
-                    VStack(alignment: .leading, spacing: 4) {
-                        ForEach(appState.deliveryLogEntries.prefix(10).reversed(), id: \.timestamp) { entry in
-                            Text("[\(entry.timestamp, formatter: Self.logTimeFormatter)] \(entry.event)")
-                                .font(.system(size: 10, design: .monospaced))
-                                .foregroundColor(.white.opacity(0.85))
-                                .frame(maxWidth: .infinity, alignment: .leading)
-                        }
-                    }
-                    .padding(.horizontal, 12)
-                    .padding(.vertical, 8)
-                }
-                .frame(maxHeight: 200)
-            }
-        }
-        .padding(.vertical, 8)
-        .background(
-            RoundedRectangle(cornerRadius: 12, style: .continuous)
-                .fill(Color.black.opacity(0.7))
-        )
-        .padding(.horizontal, 16)
-    }
-    
-    private static let logTimeFormatter: DateFormatter = {
-        let f = DateFormatter()
-        f.dateFormat = "HH:mm:ss"
-        f.locale = Locale(identifier: "en_US_POSIX")
-        return f
-    }()
 }

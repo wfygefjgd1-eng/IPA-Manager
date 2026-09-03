@@ -108,8 +108,7 @@ enum AppGroup {
                 cachedIdentifier = candidate
                 // 3. 解析成功后写入缓存（standard + App Group 双写，确保跨进程可见）
                 sharedDefaults?.set(candidate, forKey: resolvedIdentifierKey)
-                if let container = containerURL,
-                   let groupDefaults = UserDefaults(suiteName: candidate) {
+                if let groupDefaults = UserDefaults(suiteName: candidate) {
                     groupDefaults.set(candidate, forKey: resolvedIdentifierKey)
                 }
                 return cachedIdentifier
