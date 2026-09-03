@@ -90,7 +90,7 @@ xcodebuild -project "IPA Manager.xcodeproj" \
 
 ### 版本历史
 
-- **v1.0.128**（动作扩展版）：新增动作扩展（Action Extension，com.apple.ui-services）——分享面板**动作区**出现「IPA Manager」入口（与"QQ闪传分享"同级），点按不跳转主 App、原地弹出接收面板把文件收进 App Group 共享容器，打开 App 自动「导入→签名→安装」；与分享扩展（应用行入口）共用同一接收控制器。诊断报告「分享扩展状态」会列出全部随包扩展（应为 2 个）；若显示"未随包安装"＝签名工具剥离了扩展（iOS 不为被剥离/未签好的扩展显示任何入口，这正是"面板里只有一个跳 App 的图标、动作区为空"的根因），请用 IPA Manager 自己的签名引擎签本 App 或其它保留 PlugIns 的 zsign 系工具重签。
+- **v1.0.129**（动作扩展版）：新增动作扩展（Action Extension，com.apple.ui-services）——分享面板**动作区**出现「IPA Manager」入口（与"QQ闪传分享"同级），点按不跳转主 App、原地弹出接收面板把文件收进 App Group 共享容器，打开 App 自动「导入→签名→安装」；与分享扩展（应用行入口）共用同一接收控制器。诊断报告「分享扩展状态」会列出全部随包扩展（应为 2 个）；若显示"未随包安装"＝签名工具剥离了扩展（iOS 不为被剥离/未签好的扩展显示任何入口，这正是"面板里只有一个跳 App 的图标、动作区为空"的根因），请用 IPA Manager 自己的签名引擎签本 App 或其它保留 PlugIns 的 zsign 系工具重签。
 - **v1.0.126**（扩展可诊断版）：① 诊断报告新增「分享扩展状态」章节——直接列出已安装 IPA 内 PlugIns/*.appex 与 App Group 共享容器可用性：若显示"未随包安装"，说明所用签名工具在签名时剥离了扩展（iOS 不会为未签好/被剥离的扩展显示分享入口，这正是"分享面板只有一个跳 App 的入口而无扩展面板"的根因），需改用支持扩展的签名方式（例如用 IPA Manager 自己的签名引擎签本 App）；外部投递追踪在每次进程首次扫描时记录共享容器可用性。② 分享扩展接收兼容性增强：文件载体三级匹配（public.file-url → 任意 data 系 UTI 取原始字节 → public.url 包裹的本地文件路径），覆盖更多来源 App 的分享形态。
 
 - **v1.0.125**（分享扩展版）：新增分享扩展（Share Extension）——分享面板应用行出现「IPA Manager」入口（类似 QQ 邮箱/ChatGPT 的第三方入口），从电报/微信/文件等任意 App 分享 .ipa/.zip/证书文件点它即可接收，保存后打开 App 自动完成「导入 → 默认证书签名 → 发起安装 → 回桌面」一条龙。文件经 App Group 共享容器交接（扩展与主 App 沙盒隔离，无法直接传递）；若签名描述文件未包含 App Group 能力（通配符 profile 常见），扩展给出明确提示、主 App 跳过共享目录扫描，安装不受影响（zsign 按描述文件内嵌 entitlements 签名，签名结果与 profile 一致，不存在 entitlement 不匹配拒装问题）。同时修复扫描器触发点：诊断实测 iOS 27 不再回调 UIApplicationDelegate.applicationDidBecomeActive（冷启动有投递日志而回前台扫描无记录），回前台兜底扫描改挂 SwiftUI scenePhase（onOpenURL 同源通道实测可用），AppDelegate 回调保留作旧系统兜底；主 App 新增 ipamanager:// scheme，扩展保存成功后尝试直接拉起主 App 开始导入。

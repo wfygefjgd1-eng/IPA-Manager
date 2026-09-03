@@ -208,6 +208,10 @@ targets:
     platform: iOS
     sources:
       - path: Sources/ShareExtension
+        # 与分享扩展共用接收控制器目录；该目录内的 Info.plist 属于 Share target，
+        # 在此会被当资源拷贝并与本 target 的 Info.plist 产出路径冲突，必须排除
+        excludes:
+          - Info.plist
       - path: Sources/Shared
     settings:
       base:
