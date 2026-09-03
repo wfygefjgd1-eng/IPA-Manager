@@ -116,20 +116,36 @@ final class ShareViewController: UIViewController {
             let saved = try AppGroup.saveIncomingFile(at: url)
             DispatchQueue.main.async {
                 self.updateStatus(
-                    "已接收「\(saved.lastPathComponent)」\n\n请打开 IPA Manager，将自动完成\n导入 → 签名 → 安装",
+                    "已接收「\(saved.lastPathComponent)」\n\n正在拉起 IPA Manager…",
                     success: true
                 )
-                self.scheduleComplete(after: 3.0)
+                // 延长成功提示显示时间（5秒），让用户看清状态
+                self.scheduleComplete(after: 5.0)
                 // 尝试拉起主 App：历史系统版本对分享扩展不支持 open（失败无副作用）；
                 // 若系统支持则直接回到 App，回前台扫描随即开始导入
                 if let appURL = URL(string: "ipamanager://import") {
                     self.extensionContext?.open(appURL, completionHandler: nil)
                 }
             }
+        } catch let error as NSError {
+            DispatchQueue.main.async {
+                // App Group 不可用时给出明确中文提示
+                if error.domain == "AppGroup" && error.code == 1 {
+                    self.updateStatus(
+                        "⚠️ 共享容器不可用\n\n当前签名描述文件未包含 App Group 权限，\n分享扩展无法交接文件给主 App。\n\n请使用包含 App Group 的描述文件重新签名本 App，\n或在「设置」→「证书」中导入描述文件。",
+                        success: false
+                    )
+                    // 错误提示保持 6 秒，让用户有时间看清
+                    self.scheduleComplete(after: 6.0)
+                } else {
+                    self.updateStatus("保存失败：\(error.localizedDescription)", success: false)
+                    self.scheduleComplete(after: 4.0)
+                }
+            }
         } catch {
             DispatchQueue.main.async {
                 self.updateStatus("保存失败：\(error.localizedDescription)", success: false)
-                self.scheduleComplete(after: 3.0)
+                self.scheduleComplete(after: 4.0)
             }
         }
     }

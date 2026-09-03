@@ -6,6 +6,8 @@ struct SettingsView: View {
     @State private var shareItem: ShareItem?
     /// 诊断报告写入失败时的错误提示
     @State private var reportError: String?
+    /// 分享投递日志查看弹窗
+    @State private var showDeliveryLog = false
     /// 导入/下载完成后自动签名并安装（默认开）
     @AppStorage("setting_auto_sign_and_install") private var autoSignAndInstall = true
     /// 签名完成后自动返回桌面（默认开）
@@ -45,6 +47,17 @@ struct SettingsView: View {
                 }
 
                 Section {
+                    Button {
+                        showDeliveryLog = true
+                    } label: {
+                        actionRow(
+                            icon: "tray.and.arrow.down",
+                            tint: .purple,
+                            title: "查看分享投递日志",
+                            subtitle: "查看文件分享到 App 时的实时投递记录"
+                        )
+                    }
+                    .rowCard()
                     Button {
                         prepareReportForSharing()
                     } label: {
@@ -89,6 +102,10 @@ struct SettingsView: View {
                 Button("确定", role: .cancel) {}
             } message: {
                 Text(reportError ?? "")
+            }
+            // 分享投递日志查看弹窗
+            .sheet(isPresented: $showDeliveryLog) {
+                DeliveryLogView()
             }
             // 用 sheet(item:) 绑定 URL，避免旧实现“isPresented + sheet 内 if let”的时序问题：
             // 之前表现为“第一次点击分享是空白的，要返回再点才弹出”。

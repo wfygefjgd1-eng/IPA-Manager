@@ -960,6 +960,10 @@ final class AppState: ObservableObject {
         } else if !didJournalGroupAvailability {
             // 首次扫描且无文件：不提示，避免干扰
         }
+        // 实时同步投递日志到 UI
+        DispatchQueue.main.async {
+            self.deliveryLogEntries = ExternalDeliveryJournal.getEntries()
+        }
     }
 
     /// 外部打开文件去重：SwiftUI 生命周期下 application(_:open:) 与 onOpenURL 可能
