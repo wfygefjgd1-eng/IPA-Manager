@@ -22,19 +22,12 @@ enum AppGroup {
     
     /// 存储已解析组名的键（跨进程共享：主 App 解析后写入，扩展读取）
     private static let resolvedIdentifierKey = "resolved_app_group_identifier"
-    /// 存储用的 UserDefaults（App Group 容器，需先解析出组名才能访问，鸡生蛋问题）
-    /// 解决方案：优先用 standard（主 App/扩展都能访问），解析成功后回写到 App Group 容器
-    private static var sharedDefaults: UserDefaults? {
-        if let identifier = cachedIdentifier,
-           let url = FileManager.default.containerURL(forSecurityApplicationGroupIdentifier: identifier) {
-            return UserDefaults(suiteName: identifier)
-        }
-        return UserDefaults.standard
-    }
-
+    
     /// 当前签名实际可用的共享容器（描述文件未授予 App Group 时为 nil）
+    /// 注意：仅在 resolvedIdentifier() 调用之后安全调用
     static var containerURL: URL? {
-        guard let identifier = resolvedIdentifier() else { return nil }
+        let identifier = resolvedIdentifier()
+        guard let identifier else { return nil }
         return FileManager.default.containerURL(forSecurityApplicationGroupIdentifier: identifier)
     }
 
@@ -92,7 +85,7 @@ enum AppGroup {
         didResolve = true
         
         // 1. 先读缓存（主 App 解析后写入 standard UserDefaults）
-        if let cached = sharedDefaults?.string(forKey: resolvedIdentifierKey),
+        if let cached = UserDefaults.standard.string(forKey: resolvedIdentifierKey),
            FileManager.default.containerURL(forSecurityApplicationGroupIdentifier: cached) != nil {
             cachedIdentifier = cached
             return cachedIdentifier
@@ -104,13 +97,12 @@ enum AppGroup {
             candidates.append(defaultIdentifier)
         }
         for candidate in candidates {
+            // 直接检查容器是否存在，避免递归调用 containerURL 属性
             if FileManager.default.containerURL(forSecurityApplicationGroupIdentifier: candidate) != nil {
                 cachedIdentifier = candidate
                 // 3. 解析成功后写入缓存（standard + App Group 双写，确保跨进程可见）
-                sharedDefaults?.set(candidate, forKey: resolvedIdentifierKey)
-                if let groupDefaults = UserDefaults(suiteName: candidate) {
-                    groupDefaults.set(candidate, forKey: resolvedIdentifierKey)
-                }
+                UserDefaults.standard.set(candidate, forKey: resolvedIdentifierKey)
+                UserDefaults(suiteName: candidate)?.set(candidate, forKey: resolvedIdentifierKey)
                 return cachedIdentifier
             }
         }
