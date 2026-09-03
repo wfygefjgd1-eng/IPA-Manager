@@ -58,4 +58,11 @@ enum ExternalDeliveryJournal {
             .map { "[\(formatter.string(from: $0.timestamp))] \($0.event)" }
             .joined(separator: "\n")
     }
+    
+    /// 获取当前所有投递日志条目（按时间正序，供 UI 实时展示）
+    static func getEntries() -> [Entry] {
+        lock.lock()
+        defer { lock.unlock() }
+        return entries
+    }
 }

@@ -64,6 +64,12 @@ final class AppState: ObservableObject {
     @Published var autoSigningAppIDs: Set<UUID> = []
     private var autoSignQueue: [AppInfo] = []
     private var isAutoSigning = false
+    
+    /// 分享投递实时日志（供 ContentView 底部面板展示）：每条事件含时间戳与事件描述，
+    /// 用户分享文件到 App 后能实时看到投递链路发生了什么（扫描结果/保存成功/失败原因）。
+    @Published var deliveryLogEntries: [ExternalDeliveryJournal.Entry] = []
+    /// 日志面板展开状态（默认折叠）
+    @Published var showDeliveryLog: Bool = false
 
     /// 在任意线程设置全局轻提示（内部切回主线程并安排自动清除；重复设置会重置计时）。
     func showToast(_ message: String) {
@@ -885,9 +891,9 @@ final class AppState: ObservableObject {
     func processInboxFilesIfNeeded() {
         if !didJournalGroupAvailability {
             didJournalGroupAvailability = true
-            ExternalDeliveryJournal.record(AppGroup.containerURL != nil
-                ? "共享容器：可用"
-                : "共享容器：不可用（无 App Group 权限，分享扩展无法交接文件）")
+            ExternalDeliveryJournal.record(AppGroup.resolvedIdentifier().map { identifier in
+                "共享容器：可用（组 \(identifier)）"
+            } ?? "共享容器：不可用（描述文件未授予 App Group，分享扩展无法交接文件）")
         }
         let inboxFiles = (try? FileManager.default.contentsOfDirectory(
             at: inboxURL, includingPropertiesForKeys: [.contentModificationDateKey],
@@ -920,6 +926,9 @@ final class AppState: ObservableObject {
         }
 
         let now = Date()
+        var importedCount = 0
+        var skippedCount = 0
+        var errorCount = 0
         for file in inboxFiles.filter({ !$0.hasDirectoryPath })
             + groupInboxFiles.filter({ !$0.hasDirectoryPath })
             + documentsRootFiles {
@@ -934,12 +943,22 @@ final class AppState: ObservableObject {
                     store.saveProcessedInboxPaths(Array(processedInboxPaths))
                     Logger.info("清理超期分享投递残留: \(file.lastPathComponent)")
                 }
+                skippedCount += 1
                 continue
             }
             // 未登记 = open 事件丢失（正常投递的文件在结算时已自删，不会留到这里）。
             // 在途登记与重复投递拦截都在 handleFileOpenedFromOutside 内部完成。
             Logger.info("兜底导入（open 事件丢失）: \(file.lastPathComponent)")
             handleFileOpenedFromOutside(file)
+            importedCount += 1
+        }
+        // 可见化反馈：扫描结果让用户知道发生了什么
+        if importedCount > 0 {
+            showToast("收到 \(importedCount) 个分享文件，正在导入…")
+        } else if (inboxFiles.count + groupInboxFiles.count + documentsRootFiles.count) > 0 {
+            showToast("分享投递已处理过（或非待导入文件）")
+        } else if !didJournalGroupAvailability {
+            // 首次扫描且无文件：不提示，避免干扰
         }
     }
 

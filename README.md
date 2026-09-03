@@ -90,6 +90,7 @@ xcodebuild -project "IPA Manager.xcodeproj" \
 
 ### 版本历史
 
+- **v1.0.130**（App Group 自动发现版）：修复"扩展已随包安装但仍无法交接文件"的最后一步——诊断实测用户签名描述文件未授予本 App 默认组名（group.com.ipamanager.app），而扩展与主 App 之间的文件交接必须经 App Group（iOS 沙盒硬限制）。① 运行时从 embedded.mobileprovision 原始数据自动发现描述文件实际授予的 App Group 组名（企业签供应商常用任意组名），逐个 containerURL 实测可用性后采用；默认组名兜底；② 诊断报告新增「描述文件内 App Groups」行，直接显示描述文件授予了哪些组——"未发现"即描述文件完全无 App Group 能力，需更换含 App Group 的描述文件重签（找签名/企业签供应商开通），或改用文件 App → 分享 → 拷贝到 IPA Manager（不依赖 App Group）；外部投递追踪同步记录解析出的组名。
 - **v1.0.129**（动作扩展版）：新增动作扩展（Action Extension，com.apple.ui-services）——分享面板**动作区**出现「IPA Manager」入口（与"QQ闪传分享"同级），点按不跳转主 App、原地弹出接收面板把文件收进 App Group 共享容器，打开 App 自动「导入→签名→安装」；与分享扩展（应用行入口）共用同一接收控制器。诊断报告「分享扩展状态」会列出全部随包扩展（应为 2 个）；若显示"未随包安装"＝签名工具剥离了扩展（iOS 不为被剥离/未签好的扩展显示任何入口，这正是"面板里只有一个跳 App 的图标、动作区为空"的根因），请用 IPA Manager 自己的签名引擎签本 App 或其它保留 PlugIns 的 zsign 系工具重签。
 - **v1.0.126**（扩展可诊断版）：① 诊断报告新增「分享扩展状态」章节——直接列出已安装 IPA 内 PlugIns/*.appex 与 App Group 共享容器可用性：若显示"未随包安装"，说明所用签名工具在签名时剥离了扩展（iOS 不会为未签好/被剥离的扩展显示分享入口，这正是"分享面板只有一个跳 App 的入口而无扩展面板"的根因），需改用支持扩展的签名方式（例如用 IPA Manager 自己的签名引擎签本 App）；外部投递追踪在每次进程首次扫描时记录共享容器可用性。② 分享扩展接收兼容性增强：文件载体三级匹配（public.file-url → 任意 data 系 UTI 取原始字节 → public.url 包裹的本地文件路径），覆盖更多来源 App 的分享形态。
 

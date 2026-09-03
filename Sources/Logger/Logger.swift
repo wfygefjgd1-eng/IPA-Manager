@@ -133,9 +133,15 @@ enum Logger {
             lines.append("分享扩展：已安装 \(appexNames.count) 个：\(appexNames.joined(separator: "、"))")
         }
         if AppGroup.containerURL != nil {
-            lines.append("App Group 共享容器：可用（扩展 ↔ 主 App 文件交接正常）")
+            lines.append("App Group 共享容器：可用（运行时组：\(AppGroup.resolvedIdentifier() ?? "?")）")
         } else {
-            lines.append("App Group 共享容器：不可用（当前签名描述文件未包含 group.com.ipamanager.app，扩展将提示无法接收）")
+            lines.append("App Group 共享容器：不可用")
+        }
+        let profileGroups = AppGroup.profileAppGroupCandidates()
+        if profileGroups.isEmpty {
+            lines.append("描述文件内 App Groups：未发现（当前签名描述文件未授予任何 App Group——扩展无法交接文件，需更换含 App Group 的描述文件重签，或改用文件 App → 分享 → 拷贝到 IPA Manager）")
+        } else {
+            lines.append("描述文件内 App Groups：\(profileGroups.joined(separator: "、"))")
         }
 
         lines.append("")
