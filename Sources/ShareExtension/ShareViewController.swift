@@ -74,14 +74,16 @@ final class ShareViewController: UIViewController {
         if let provider = attachments.first(where: { $0.hasItemConformingToTypeIdentifier(UTType.fileURL.identifier) }) {
             receiveFile(from: provider, typeIdentifier: UTType.fileURL.identifier)
         } else if let provider = attachments.first(where: { $0.hasItemConformingToTypeIdentifier(UTType.data.identifier) }) {
+            // data 系载荷（QQ/微信可能不给 file-url，只给原始字节）：取文件表示，
+            // 落盘时按 suggestedName/UTI/魔数补回后缀（主 App 按后缀路由，丢后缀必失败）。
             receiveFile(from: provider, typeIdentifier: UTType.data.identifier)
         } else if let provider = attachments.first(where: { $0.hasItemConformingToTypeIdentifier(UTType.url.identifier) }) {
-            provider.loadItem(forTypeIdentifier: UTType.url.identifier, options: nil) { [weak self] item, error in
+            provider.loadItem(forTypeIdentifier: UTType.url.identifier, options: nil) { [weak self, provider] item, error in
                 guard let self else { return }
                 let url = item as? URL
                     ?? (item as? String).flatMap { URL(string: $0) }
                 if let url, url.isFileURL {
-                    self.saveAndFinish(url: url)
+                    self.saveAndFinish(url: url, provider: provider)
                 } else {
                     DispatchQueue.main.async {
                         self.updateStatus("未找到可导入的文件\n（URL 载荷不是本地文件）", success: false)
@@ -97,7 +99,7 @@ final class ShareViewController: UIViewController {
 
     /// 用 loadFileRepresentation 取文件：回调块结束时临时 url 即失效，必须当场复制
     private func receiveFile(from provider: NSItemProvider, typeIdentifier: String) {
-        provider.loadFileRepresentation(forTypeIdentifier: typeIdentifier) { [weak self] url, error in
+        provider.loadFileRepresentation(forTypeIdentifier: typeIdentifier) { [weak self, provider] url, error in
             guard let self else { return }
             guard let url else {
                 DispatchQueue.main.async {
@@ -106,14 +108,45 @@ final class ShareViewController: UIViewController {
                 }
                 return
             }
-            self.saveAndFinish(url: url)
+            self.saveAndFinish(url: url, provider: provider)
         }
     }
 
+    /// 解析落盘文件名：优先用系统给的 suggestedName；缺后缀时按 UTI/文件魔数补 .zip/.ipa。
+    /// QQ/微信等来源的 data 载荷经常没有文件名，主 App 按后缀路由（zip 走分类、其余走 IPA 解析），
+    /// 后缀丢失会导致“能收到但报解析失败”。这里尽量保住后缀。
+    private static func resolvedIncomingFileName(tempURL: URL, provider: NSItemProvider) -> String {
+        var base = (provider.suggestedName ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        if base.isEmpty { base = tempURL.lastPathComponent }
+        base = (base as NSString).lastPathComponent
+        if base.isEmpty { base = "shared-file" }
+        if !(base as NSString).pathExtension.isEmpty { return base }
+        let ids = provider.registeredTypeIdentifiers.map { $0.lowercased() }
+        if ids.contains(where: { $0.contains("zip") }) { return base + ".zip" }
+        if ids.contains(where: { $0.contains("ipa") }) { return base + ".ipa" }
+        // 兜底：读前 4 字节魔数，PK 开头即 zip（含 ipa，本体都是 zip，主 App 会再分类/转换）
+        if isZipMagic(tempURL) { return base + ".zip" }
+        return base
+    }
+
+    private static func isZipMagic(_ url: URL) -> Bool {
+        guard let handle = try? FileHandle(forReadingFrom: url) else { return false }
+        defer { try? handle.close() }
+        guard let data = try? handle.read(upToCount: 4), data.count == 4 else { return false }
+        let b0 = data[data.startIndex]
+        let b1 = data[data.startIndex + 1]
+        let b2 = data[data.startIndex + 2]
+        let b3 = data[data.startIndex + 3]
+        return b0 == 0x50 && b1 == 0x4B
+            && (b2 == 0x03 || b2 == 0x05 || b2 == 0x07)
+            && (b3 == 0x04 || b3 == 0x06 || b3 == 0x08)
+    }
+
     /// 复制进共享收件箱并展示结果（任意线程可调，UI 更新自动回主线程）
-    private func saveAndFinish(url: URL) {
+    private func saveAndFinish(url: URL, provider: NSItemProvider) {
+        let fileName = Self.resolvedIncomingFileName(tempURL: url, provider: provider)
         do {
-            let saved = try AppGroup.saveIncomingFile(at: url)
+            let saved = try AppGroup.saveIncomingFile(at: url, preferredFileName: fileName)
             DispatchQueue.main.async {
                 self.updateStatus(
                     "已接收「\(saved.lastPathComponent)」\n\n正在拉起 IPA Manager…",

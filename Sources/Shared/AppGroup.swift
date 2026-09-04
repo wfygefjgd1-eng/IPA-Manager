@@ -35,14 +35,17 @@ enum AppGroup {
         return inbox
     }
 
-    static func saveIncomingFile(at sourceURL: URL) throws -> URL {
+    static func saveIncomingFile(at sourceURL: URL, preferredFileName: String? = nil) throws -> URL {
         guard let inbox = ensureInboxURL() else {
             throw NSError(
                 domain: "AppGroup", code: 1,
                 userInfo: [NSLocalizedDescriptionKey: "共享容器不可用：当前签名描述文件未授予任何 App Group 能力，无法从分享面板接收文件。请更换含 App Group 的描述文件重签，或改用文件 App → 分享 → 拷贝到 IPA Manager"]
             )
         }
-        let baseName = sourceURL.lastPathComponent
+        var baseName = (preferredFileName ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        if baseName.isEmpty { baseName = sourceURL.lastPathComponent }
+        baseName = (baseName as NSString).lastPathComponent
+        if baseName.isEmpty { baseName = "shared-file" }
         let base = (baseName as NSString).deletingPathExtension
         let ext = (baseName as NSString).pathExtension
         var dest = inbox.appendingPathComponent(baseName)

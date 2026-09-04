@@ -997,6 +997,11 @@ final class AppState: ObservableObject {
 
         let ext = url.pathExtension.lowercased()
         Logger.info("外部打开文件: \(url.lastPathComponent)")
+        // 即时反馈：zip 分类在后台队列先跑，进度卡要等 importFile 启动才出现；
+        // 先给一句 toast，避免“点了分享、App 打开了却毫无动静”。
+        if ext == "ipa" || ext == "zip" {
+            showToast("已接收「\(url.lastPathComponent)」，正在导入…")
+        }
 
         // 分享/投递识别（Documents/Inbox 或 Documents 根目录的可导入文件）：在途登记 +
         // 结算落盘，open 事件与回前台扫描/冷启动 launchOptions 对同一文件的重复投递

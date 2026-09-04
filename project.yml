@@ -192,10 +192,10 @@ targets:
         NSExtension:
           NSExtensionPointIdentifier: com.apple.share-services
           NSExtensionPrincipalClass: "$(PRODUCT_MODULE_NAME).ShareViewController"
-          # 字典 v2 激活规则：任何本地文件类分享（ipa/zip/p12/…）都出现本入口
-          NSExtensionActivationRule:
-            NSExtensionActivationDictionaryVersion: 2
-            NSExtensionActivationSupportsFileWithMaxCount: 1
+          # 激活规则：TRUEPREDICATE（侧载工具专用取舍）——QQ/微信等宿主经常不以 file-url
+          # 形态给文件（data/链接/复合载荷），file-only 谓词会让入口直接不显示。
+          # 常显后，不支持的类型由扩展内明确提示，不会静默失败。
+          NSExtensionActivationRule: TRUEPREDICATE
     entitlements:
       path: Sources/ShareExtension/IPAManagerShare.entitlements
       properties:
@@ -221,15 +221,15 @@ targets:
     info:
       path: Sources/ShareExtension/ActionInfo.plist
       properties:
-        CFBundleDisplayName: IPA Manager
+        CFBundleDisplayName: IPA Manager・接收
         CFBundleShortVersionString: "$(MARKETING_VERSION)"
         CFBundleVersion: "$(CURRENT_PROJECT_VERSION)"
         NSExtension:
           NSExtensionPointIdentifier: com.apple.ui-services
           NSExtensionPrincipalClass: "$(PRODUCT_MODULE_NAME).ShareViewController"
-          NSExtensionActivationRule:
-            NSExtensionActivationDictionaryVersion: 2
-            NSExtensionActivationSupportsFileWithMaxCount: 1
+          # 与分享扩展同理：常显谓词，保证 QQ/微信等宿主的动作区里能找到入口；
+          # 不支持的类型由扩展内明确提示。
+          NSExtensionActivationRule: TRUEPREDICATE
     entitlements:
       path: Sources/ShareExtension/IPAManagerAction.entitlements
       properties:

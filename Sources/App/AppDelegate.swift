@@ -27,6 +27,10 @@ final class AppDelegate: NSObject, UIApplicationDelegate {
         // 用户看到"打开 App 了但没反应"。此处主动扫描兜底，与回前台扫描逻辑复用，
         // 内部有去重（processedInboxPaths / pendingInboxImports）不会重复导入。
         AppState.shared.processInboxFilesIfNeeded()
+        // 大包/慢拷贝兜底：系统偶发在 App 启动 10 秒后才完成 Inbox 落盘，再复查一次。
+        DispatchQueue.main.asyncAfter(deadline: .now() + 10) {
+            AppState.shared.processInboxFilesIfNeeded()
+        }
         return true
     }
 
