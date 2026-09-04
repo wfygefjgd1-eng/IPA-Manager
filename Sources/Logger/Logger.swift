@@ -125,20 +125,58 @@ enum Logger {
         lines.append(ExternalDeliveryJournal.reportText())
 
         lines.append("")
-        lines.append("===== 分享扩展状态 =====")
-        let appexNames = Bundle.main.urls(forResourcesWithExtension: "appex", subdirectory: "PlugIns")?.map { $0.lastPathComponent } ?? []
-        if appexNames.isEmpty {
+        lines.append("===== 分享扩展状态（逐个拆解）=====")
+        let appexURLs = Bundle.main.urls(forResourcesWithExtension: "appex", subdirectory: "PlugIns") ?? []
+        if appexURLs.isEmpty {
             lines.append("分享扩展：未随包安装（IPA 内无 PlugIns/*.appex——签名工具可能剥离了扩展，请用支持扩展的签名方式重签，例如用本 App 的签名引擎签本 App）")
         } else {
-            lines.append("分享扩展：已安装 \(appexNames.count) 个：\(appexNames.joined(separator: "、"))")
+            lines.append("分享扩展：已安装 \(appexURLs.count) 个")
         }
+        let mainGroup = AppGroup.resolvedIdentifier()
         if AppGroup.containerURL != nil {
-            lines.append("App Group 共享容器：可用（运行时组：\(AppGroup.resolvedIdentifier() ?? "?")）")
+            lines.append("App Group 共享容器：可用（运行时组：\(mainGroup ?? "?")）")
         } else {
             lines.append("App Group 共享容器：不可用")
         }
-        // 不再在诊断报告中显示 embedded.mobileprovision 中的 group 名称（该方法在重构中已移除）
-        // AppGroup.profileAppGroupCandidates 已移除，改用 AppGroup.resolvedIdentifier() 直接测试可访问性
+        // 主 App 自身描述文件里的组（与扩展的逐个比对，揪出“组错位”）
+        let mainProfileGroups = Self.scanGroupsInMobileProvision(
+            Bundle.main.url(forResource: "embedded", withExtension: "mobileprovision"))
+        lines.append("主 App 描述文件组：\(mainProfileGroups.isEmpty ? "读不到" : mainProfileGroups.joined(separator: "、"))")
+        for appexURL in appexURLs {
+            lines.append("── \(appexURL.lastPathComponent)")
+            // 1) Info.plist：扩展点 / 主类 / 激活规则（原样打印，排查生成期写错）
+            if let infoURL = Optional(appexURL.appendingPathComponent("Info.plist")),
+               let data = try? Data(contentsOf: infoURL),
+               let plist = try? PropertyListSerialization.propertyList(from: data, options: [], format: nil),
+               let dict = plist as? [String: Any] {
+                lines.append("  BundleID：\(dict["CFBundleIdentifier"] as? String ?? "?")")
+                lines.append("  显示名：\(dict["CFBundleDisplayName"] as? String ?? "?")")
+                if let ext = dict["NSExtension"] as? [String: Any] {
+                    lines.append("  扩展点：\(ext["NSExtensionPointIdentifier"] as? String ?? "缺失！")")
+                    lines.append("  主类：\(ext["NSExtensionPrincipalClass"] as? String ?? "缺失！")")
+                    if let rule = ext["NSExtensionActivationRule"] {
+                        lines.append("  激活规则：\(Self.compactActivationRule(rule))")
+                    } else {
+                        lines.append("  激活规则：缺失！（iOS 不会显示该入口）")
+                    }
+                } else {
+                    lines.append("  NSExtension：缺失！（该 appex 不是合法扩展）")
+                }
+            } else {
+                lines.append("  Info.plist：读取失败")
+            }
+            // 2) 签名：_CodeSignature 缺失则 iOS 拒绝加载扩展（点图标无反应/直接开主 App 的嫌疑之一）
+            let hasSig = FileManager.default.fileExists(
+                atPath: appexURL.appendingPathComponent("_CodeSignature").path)
+            lines.append("  签名：\(hasSig ? "有 _CodeSignature" : "无 _CodeSignature（未签名，iOS 会拒绝加载！）")")
+            // 3) 扩展自身描述文件里的组：与主 App 的组交叉比对
+            let extGroups = Self.scanGroupsInMobileProvision(
+                appexURL.appendingPathComponent("embedded.mobileprovision"))
+            lines.append("  描述文件组：\(extGroups.isEmpty ? "无/读不到" : extGroups.joined(separator: "、"))")
+            if let mainGroup, !extGroups.isEmpty, !extGroups.contains(mainGroup) {
+                lines.append("  ⚠️组错位：该扩展的描述文件里没有主 App 正在用的组，主 App 永远读不到它存的文件！")
+            }
+        }
 
         lines.append("")
         lines.append("===== 分享扩展日志（共享容器 ExtensionLog.txt）=====")
@@ -152,6 +190,35 @@ enum Logger {
         lines.append("由 IPA Manager 诊断功能导出")
 
         return lines.joined(separator: "\n")
+    }
+
+    /// 从 mobileprovision 原始数据里提取 group.* 组名（CMS 包裹，组名以明文存在，
+    /// 正则提取即可；读不到/无组返回空数组）。仅用于诊断展示，不参与运行时决策。
+    private static func scanGroupsInMobileProvision(_ url: URL?) -> [String] {
+        guard let url,
+              let data = try? Data(contentsOf: url),
+              let regex = try? NSRegularExpression(pattern: #"group\.[A-Za-z0-9._\-]{2,64}"#) else { return [] }
+        // CMS 二进制包裹：非法字节按替换字符解码即可，组名本身是 ASCII 明文
+        let text = String(decoding: data, as: UTF8.self)
+        let range = NSRange(text.startIndex..., in: text)
+        var seen = Set<String>()
+        var result: [String] = []
+        for match in regex.matches(in: text, range: range) {
+            guard let matchRange = Range(match.range, in: text) else { continue }
+            let name = String(text[matchRange])
+            if seen.insert(name).inserted { result.append(name) }
+            if result.count >= 10 { break }
+        }
+        return result
+    }
+
+    /// 激活规则摘要：字符串谓词原样打印；字典只列键（全量打印太长）。
+    private static func compactActivationRule(_ rule: Any) -> String {
+        if let s = rule as? String { return s }
+        if let dict = rule as? [String: Any] {
+            return "字典{\(dict.keys.sorted().joined(separator: ","))}"
+        }
+        return "\(type(of: rule))"
     }
 }
 
