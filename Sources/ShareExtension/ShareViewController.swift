@@ -73,17 +73,28 @@ final class ShareViewController: UIViewController {
         }
         let items = context.inputItems.compactMap { $0 as? NSExtensionItem }
         let attachments = items.flatMap { $0.attachments ?? [] }
-        // 三级载体匹配：本地文件 URL（文件类分享标准载体）→ 任意 data 系 UTI
-        //（可取原始字节）→ public.url（部分来源以 URL 对象包裹本地文件路径）
-        if let provider = attachments.first(where: { $0.hasItemConformingToTypeIdentifier(UTType.fileURL.identifier) }) {
-            AppGroup.appendExtensionLog("载体=fileURL（\(provider.suggestedName ?? "?")）")
-            receiveFile(from: provider, typeIdentifier: UTType.fileURL.identifier)
-        } else if let provider = attachments.first(where: { $0.hasItemConformingToTypeIdentifier(UTType.data.identifier) }) {
-            // data 系载荷（QQ/微信可能不给 file-url，只给原始字节）：取文件表示，
-            // 落盘时按 suggestedName/UTI/魔数补回后缀（主 App 按后缀路由，丢后缀必失败）。
-            AppGroup.appendExtensionLog("载体=data（\(provider.suggestedName ?? "?")，\(provider.registeredTypeIdentifiers.joined(separator: ","))）")
-            receiveFile(from: provider, typeIdentifier: UTType.data.identifier)
-        } else if let provider = attachments.first(where: { $0.hasItemConformingToTypeIdentifier(UTType.url.identifier) }) {
+        // 收集全部可处理载体（支持一次多选分享：fileURL 优先，其次 data；同一 provider 只处理一次）。
+        // 一次选 N 个文件是常见操作，只取第一个会导致“点了没反应”的误解；
+        // 且文档直达在多文件时可能直接空手打开主 App，扩展侧必须自己全收。
+        var seen = Set<ObjectIdentifier>()
+        var jobs: [(NSItemProvider, String)] = []
+        for provider in attachments where provider.hasItemConformingToTypeIdentifier(UTType.fileURL.identifier) {
+            seen.insert(ObjectIdentifier(provider))
+            jobs.append((provider, UTType.fileURL.identifier))
+        }
+        for provider in attachments where !seen.contains(ObjectIdentifier(provider))
+            && provider.hasItemConformingToTypeIdentifier(UTType.data.identifier) {
+            seen.insert(ObjectIdentifier(provider))
+            jobs.append((provider, UTType.data.identifier))
+        }
+        if !jobs.isEmpty {
+            // data 系载荷（QQ/微信可能不给 file-url，只给原始字节）：落盘时按
+            // suggestedName/UTI/魔数补回后缀（主 App 按后缀路由，丢后缀必失败）。
+            AppGroup.appendExtensionLog("待接收 \(jobs.count) 个文件")
+            receiveFiles(jobs)
+            return
+        }
+        if let provider = attachments.first(where: { $0.hasItemConformingToTypeIdentifier(UTType.url.identifier) }) {
             AppGroup.appendExtensionLog("载体=url")
             provider.loadItem(forTypeIdentifier: UTType.url.identifier, options: nil) { [weak self, provider] item, error in
                 guard let self else { return }
@@ -105,19 +116,56 @@ final class ShareViewController: UIViewController {
         }
     }
 
-    /// 用 loadFileRepresentation 取文件：回调块结束时临时 url 即失效，必须当场复制
-    private func receiveFile(from provider: NSItemProvider, typeIdentifier: String) {
+    /// 逐个取文件表示并保存（串行：扩展内存/IO 配额有限，大包并发复制易被系统杀掉；
+    /// 每一步都是新的异步回调，不占用调用栈，文件再多也不会栈溢出）。
+    /// 用 loadFileRepresentation 取文件：回调块结束时临时 url 即失效，必须当场复制。
+    private func receiveFiles(_ jobs: [(NSItemProvider, String)], index: Int = 0, saved: [String] = [], failed: Int = 0) {
+        guard index < jobs.count else {
+            finishReceiving(saved: saved, failed: failed, total: jobs.count)
+            return
+        }
+        let (provider, typeIdentifier) = jobs[index]
         provider.loadFileRepresentation(forTypeIdentifier: typeIdentifier) { [weak self, provider] url, error in
             guard let self else { return }
-            guard let url else {
-                AppGroup.appendExtensionLog("失败：读取文件失败（\(error?.localizedDescription ?? "未知错误")）")
-                DispatchQueue.main.async {
-                    self.updateStatus("读取文件失败：\(error?.localizedDescription ?? "未知错误")", success: false)
-                    self.scheduleComplete(after: 3.0)
+            var saved = saved
+            var failed = failed
+            if let url {
+                let fileName = Self.resolvedIncomingFileName(tempURL: url, provider: provider)
+                do {
+                    let dest = try AppGroup.saveIncomingFile(at: url, preferredFileName: fileName)
+                    AppGroup.appendExtensionLog("已保存(\(index + 1)/\(jobs.count))：\(dest.lastPathComponent)")
+                    saved.append(dest.lastPathComponent)
+                } catch {
+                    AppGroup.appendExtensionLog("失败：保存失败（\(error.localizedDescription)）")
+                    failed += 1
                 }
+            } else {
+                AppGroup.appendExtensionLog("失败：读取文件失败（\(error?.localizedDescription ?? "未知错误")）")
+                failed += 1
+            }
+            self.receiveFiles(jobs, index: index + 1, saved: saved, failed: failed)
+        }
+    }
+
+    /// 全部收完后统一展示汇总并拉起主 App（只拉起一次，避免多文件连跳）。
+    private func finishReceiving(saved: [String], failed: Int, total: Int) {
+        DispatchQueue.main.async {
+            guard !saved.isEmpty else {
+                self.updateStatus("接收失败，共 \(total) 个文件均未保存", success: false)
+                self.scheduleComplete(after: 4.0)
                 return
             }
-            self.saveAndFinish(url: url, provider: provider)
+            let shown = saved.prefix(3).joined(separator: "、")
+            let more = saved.count > 3 ? " 等 \(saved.count) 个" : ""
+            var text = "已接收「\(shown)\(more)」\n\n正在拉起 IPA Manager…"
+            if failed > 0 { text += "\n（\(failed) 个失败）" }
+            self.updateStatus(text, success: true)
+            self.scheduleComplete(after: 5.0)
+            // 尝试拉起主 App：历史系统版本对分享扩展不支持 open（失败无副作用）；
+            // 若系统支持则直接回到 App，回前台扫描随即开始导入
+            if let appURL = URL(string: "ipamanager://import") {
+                self.extensionContext?.open(appURL, completionHandler: nil)
+            }
         }
     }
 
