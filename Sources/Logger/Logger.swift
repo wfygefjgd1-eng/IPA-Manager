@@ -141,6 +141,14 @@ enum Logger {
         // AppGroup.profileAppGroupCandidates 已移除，改用 AppGroup.resolvedIdentifier() 直接测试可访问性
 
         lines.append("")
+        lines.append("===== 分享扩展日志（共享容器 ExtensionLog.txt）=====")
+        if let extLog = AppGroup.readExtensionLog() {
+            lines.append(extLog)
+        } else {
+            lines.append("（无扩展日志——扩展进程从未成功写入共享容器：可能从未被唤起、启动即崩，或与主 App 解析到了不同的组）")
+        }
+
+        lines.append("")
         lines.append("由 IPA Manager 诊断功能导出")
 
         return lines.joined(separator: "\n")

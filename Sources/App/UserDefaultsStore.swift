@@ -21,6 +21,9 @@ final class UserDefaultsStore {
         /// 分享面板「拷贝到 App」已处理的 Inbox 投递路径（去重缓存，非业务数据：
         /// 丢失的代价只是对残留文件多导入一次，importFile 按 bundleID 去重，无副作用）
         static let processedInboxPaths = "processed_inbox_paths"
+        /// 已消费的扩展日志字符偏移（扩展是独立进程，主 App 每次扫描只吞入新增行，
+        /// 避免重复刷屏；丢失的代价只是重复显示几行日志，无副作用）
+        static let extensionLogOffset = "extension_log_offset"
         /// 所有需要检查 TTL 的持久化键集合
         static let allPersistedKeys: [String] = [
             certificates, profiles, signingTasks, downloadTasks, importedApps
@@ -124,6 +127,16 @@ final class UserDefaultsStore {
         // 上限截断：异常堆积时仅保留最近记录（投递频度低，64 条远超实际需要；
         // 记录丢失的代价只是对残留文件多导入一次，importFile 按 bundleID 去重）
         save(Array(paths.suffix(64)), key: Keys.processedInboxPaths)
+    }
+
+    // MARK: - 扩展日志消费偏移
+
+    func loadExtensionLogOffset() -> Int {
+        defaults.integer(forKey: Keys.extensionLogOffset)
+    }
+
+    func saveExtensionLogOffset(_ offset: Int) {
+        defaults.set(offset, forKey: Keys.extensionLogOffset)
     }
 
     // MARK: - 自动流程开关（默认开启）

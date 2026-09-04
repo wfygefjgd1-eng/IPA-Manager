@@ -966,9 +966,36 @@ final class AppState: ObservableObject {
         } else if !didJournalGroupAvailability {
             // 首次扫描且无文件：不提示，避免干扰
         }
+        // 跨进程可见性：吞入扩展进程写入共享容器的新增日志行（扩展与主 App 是两个进程，
+        // 主 App 的投递日志天然看不到扩展；这里按字符偏移增量消费，避免重复刷屏）。
+        ingestExtensionLogIfNeeded()
         // 实时同步投递日志到 UI
         DispatchQueue.main.async {
             self.deliveryLogEntries = ExternalDeliveryJournal.getEntries()
+        }
+    }
+
+    /// 吞入共享容器中的扩展日志新增行：扩展每次被分享面板唤起都会先写“扩展启动”，
+    /// 主 App 读到即证明扩展进程活着（入口可见且能启动）；读不到则入口缺失或启动即崩。
+    private func ingestExtensionLogIfNeeded() {
+        guard let logURL = AppGroup.extensionLogURLIfPresent,
+              let data = try? Data(contentsOf: logURL),
+              !data.isEmpty else { return }
+        var offset = store.loadExtensionLogOffset()
+        // 日志被截断/轮转后文件变短：偏移复位，避免永远读不到新行
+        if offset > data.count { offset = 0 }
+        guard offset < data.count else {
+            store.saveExtensionLogOffset(data.count)
+            return
+        }
+        let slice = Data(data[offset...])
+        store.saveExtensionLogOffset(data.count)
+        guard let text = String(data: slice, encoding: .utf8),
+              !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
+        for line in text.components(separatedBy: "\n") {
+            let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmed.isEmpty else { continue }
+            ExternalDeliveryJournal.record("扩展：\(trimmed)")
         }
     }
 

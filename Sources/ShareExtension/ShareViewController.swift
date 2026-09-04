@@ -13,6 +13,9 @@ final class ShareViewController: UIViewController {
     override func viewDidLoad() {
         super.viewDidLoad()
         setupUI()
+        // 跨进程可见性：扩展启动即在共享容器落一条日志，主 App 诊断可读。
+        // 主 App 的投递日志看不到扩展进程，这是之前“日志永远不变”的盲区。
+        AppGroup.appendExtensionLog("扩展启动（\(Bundle.main.bundleIdentifier ?? "?")）")
         receiveSharedFile()
     }
 
@@ -63,6 +66,7 @@ final class ShareViewController: UIViewController {
 
     private func receiveSharedFile() {
         guard let context = extensionContext else {
+            AppGroup.appendExtensionLog("失败：无 extensionContext")
             updateStatus("无法访问分享上下文", success: false)
             scheduleComplete(after: 2.5)
             return
@@ -72,12 +76,15 @@ final class ShareViewController: UIViewController {
         // 三级载体匹配：本地文件 URL（文件类分享标准载体）→ 任意 data 系 UTI
         //（可取原始字节）→ public.url（部分来源以 URL 对象包裹本地文件路径）
         if let provider = attachments.first(where: { $0.hasItemConformingToTypeIdentifier(UTType.fileURL.identifier) }) {
+            AppGroup.appendExtensionLog("载体=fileURL（\(provider.suggestedName ?? "?")）")
             receiveFile(from: provider, typeIdentifier: UTType.fileURL.identifier)
         } else if let provider = attachments.first(where: { $0.hasItemConformingToTypeIdentifier(UTType.data.identifier) }) {
             // data 系载荷（QQ/微信可能不给 file-url，只给原始字节）：取文件表示，
             // 落盘时按 suggestedName/UTI/魔数补回后缀（主 App 按后缀路由，丢后缀必失败）。
+            AppGroup.appendExtensionLog("载体=data（\(provider.suggestedName ?? "?")，\(provider.registeredTypeIdentifiers.joined(separator: ","))）")
             receiveFile(from: provider, typeIdentifier: UTType.data.identifier)
         } else if let provider = attachments.first(where: { $0.hasItemConformingToTypeIdentifier(UTType.url.identifier) }) {
+            AppGroup.appendExtensionLog("载体=url")
             provider.loadItem(forTypeIdentifier: UTType.url.identifier, options: nil) { [weak self, provider] item, error in
                 guard let self else { return }
                 let url = item as? URL
@@ -92,6 +99,7 @@ final class ShareViewController: UIViewController {
                 }
             }
         } else {
+            AppGroup.appendExtensionLog("失败：无匹配载体（attachments=\(attachments.count)）")
             updateStatus("未找到可导入的文件\n（请分享 .ipa / .zip / 证书文件）", success: false)
             scheduleComplete(after: 2.5)
         }
@@ -102,6 +110,7 @@ final class ShareViewController: UIViewController {
         provider.loadFileRepresentation(forTypeIdentifier: typeIdentifier) { [weak self, provider] url, error in
             guard let self else { return }
             guard let url else {
+                AppGroup.appendExtensionLog("失败：读取文件失败（\(error?.localizedDescription ?? "未知错误")）")
                 DispatchQueue.main.async {
                     self.updateStatus("读取文件失败：\(error?.localizedDescription ?? "未知错误")", success: false)
                     self.scheduleComplete(after: 3.0)
@@ -147,6 +156,7 @@ final class ShareViewController: UIViewController {
         let fileName = Self.resolvedIncomingFileName(tempURL: url, provider: provider)
         do {
             let saved = try AppGroup.saveIncomingFile(at: url, preferredFileName: fileName)
+            AppGroup.appendExtensionLog("已保存：\(saved.lastPathComponent)")
             DispatchQueue.main.async {
                 self.updateStatus(
                     "已接收「\(saved.lastPathComponent)」\n\n正在拉起 IPA Manager…",
@@ -161,6 +171,7 @@ final class ShareViewController: UIViewController {
                 }
             }
         } catch let error as NSError {
+            AppGroup.appendExtensionLog("失败：保存失败（\(error.localizedDescription)）")
             DispatchQueue.main.async {
                 // App Group 不可用时给出明确中文提示
                 if error.domain == "AppGroup" && error.code == 1 {
@@ -176,6 +187,7 @@ final class ShareViewController: UIViewController {
                 }
             }
         } catch {
+            AppGroup.appendExtensionLog("失败：保存失败（\(error.localizedDescription)）")
             DispatchQueue.main.async {
                 self.updateStatus("保存失败：\(error.localizedDescription)", success: false)
                 self.scheduleComplete(after: 4.0)
