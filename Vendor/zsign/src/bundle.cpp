@@ -405,39 +405,57 @@ bool ZBundle::SignNode(jvalue& jvNode)
 	// generated: the seal hashes every file in the bundle, so a profile
 	// written after sealing leaves the bundle failing Apple's verifier with
 	// "a sealed resource is missing or invalid" (codesign --verify --strict).
-	if (m_pSignAssets) {
+	//
+	// Per-bundle provisioning: pick the asset whose application-identifier
+	// covers this bundle and write its profile into the bundle folder.
+	// CRITICAL: the root bundle's profile is written unconditionally in
+	// SignFolder; nested bundles only received one under the LIST overload
+	// (m_pSignAssets set). Our in-app engine calls the SINGLE-asset overload
+	// where m_pSignAssets stays NULL (constructor), so this whole block never
+	// ran and nested bundles NEVER got any profile — modern iOS then refuses
+	// to load profile-less extensions. Match on m_pSignAsset (always set) and
+	// use the list only as the multi-profile source when present.
+	// Top-level app extensions additionally need the fallback rule: their
+	// bundle id EXTENDS the app id (com.x.y -> com.x.y.Share), so the stock
+	// endsWith rule never matches; match when the profile's bundle-id part
+	// (after the team prefix) is a prefix of the extension id, or "*".
+	if (m_pSignAsset != NULL && "/" != strFolder) {
 		auto endsWith = [](const string& str, const string& suffix) {
 			return str.size() >= suffix.size() && 0 == str.compare(str.size()-suffix.size(), suffix.size(), suffix);
 		};
-		for (auto it = m_pSignAssets->rbegin(); it != m_pSignAssets->rend(); ++it) {
-			m_pSignAsset = &(*it);
-			bool bProvisionMatch = endsWith(m_pSignAsset->m_strApplicationId, strBundleId);
-			// Top-level app extensions (PlugIns/*.appex) get nothing under the
-			// original endsWith rule: their bundle id EXTENDS the app id
-			// (com.x.y -> com.x.y.Share) while application-identifier only
-			// covers com.x.y, so the profile was never written into the appex
-			// and modern iOS refuses to load a profile-less extension (share
-			// entry taps silently do nothing). Fallback for top-level appexes:
-			// match when the profile's bundle-id part (after the team prefix)
-			// is a prefix of the extension id, or is the "*" wildcard — same
-			// layout legit resign tools produce (profile embedded in every
-			// top-level extension).
-			if (!bProvisionMatch && IsAppExtensionPath(strFolder)) {
-				const string& strAppId = m_pSignAsset->m_strApplicationId;
-				size_t dot = strAppId.find('.');
-				if (dot != string::npos) {
-					const string strIdPart = strAppId.substr(dot + 1);
-					bProvisionMatch = (strIdPart == "*") || (strBundleId.rfind(strIdPart, 0) == 0);
+		auto matchesBundle = [&](const ZSignAsset& asset) {
+			if (endsWith(asset.m_strApplicationId, strBundleId)) {
+				return true;
+			}
+			if (!IsAppExtensionPath(strFolder)) {
+				return false;
+			}
+			const string& strAppId = asset.m_strApplicationId;
+			const size_t dot = strAppId.find('.');
+			if (dot == string::npos) {
+				return false;
+			}
+			const string strIdPart = strAppId.substr(dot + 1);
+			return (strIdPart == "*") || (strBundleId.rfind(strIdPart, 0) == 0);
+		};
+		const ZSignAsset* matched = NULL;
+		if (m_pSignAssets != NULL) {
+			for (auto it = m_pSignAssets->rbegin(); it != m_pSignAssets->rend(); ++it) {
+				if (matchesBundle(*it)) {
+					matched = &(*it);
+					break;
 				}
 			}
-			if (bProvisionMatch) {
-				if (!ZFile::WriteFileV(m_pSignAsset->m_strProvData, "%s/%s/embedded.mobileprovision", m_strAppFolder.c_str(), strFolder.c_str())) {
-					ZLog::ErrorV(">>> Can't write embedded.mobileprovision!\n");
-					return false;
-				}
-				bForceSign = true;
-				break;
+		} else if (matchesBundle(*m_pSignAsset)) {
+			matched = m_pSignAsset;
+		}
+		if (matched != NULL) {
+			if (!ZFile::WriteFileV(matched->m_strProvData, "%s/%s/embedded.mobileprovision", m_strAppFolder.c_str(), strFolder.c_str())) {
+				ZLog::ErrorV(">>> Can't write embedded.mobileprovision!\n");
+				return false;
 			}
+			ZLog::PrintV(">>> ProvisionProfile: \t%s\n", strFolder.c_str());
+			bForceSign = true;
 		}
 	}
 

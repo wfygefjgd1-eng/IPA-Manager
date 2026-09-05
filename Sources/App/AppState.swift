@@ -990,22 +990,36 @@ final class AppState: ObservableObject {
     /// （分享扩展接收的文件，扇入枚举全部容器）、或 Documents 内任意层级的可导入
     /// 文件（用户经文件 App 放入/保存，v1.0.142 起扫描扩展到子目录，识别口径与
     /// 扫描一致；本 App 管理目录内的产物不算投递）。
+    /// 路径归一化：iOS 上不同 FileManager API 返回的容器路径可能带 /private
+    /// 前缀（实测：contentsOfDirectory 对 Documents 返回 /private/var/mobile/...，
+    /// 而 urls(for:.documentDirectory) 返回 /var/mobile/...）。直接 hasPrefix
+    /// 永远失配——Documents 内的文件"投递识别=否"、永不结算、每次回前台重复
+    /// 导入+重复签名（用户实测"跳转后一直发呆"的根因）。比较前统一剥前缀。
+    private static func normalizedDeliveryPath(_ path: String) -> String {
+        path.hasPrefix("/private/") ? String(path.dropFirst("/private".count)) : path
+    }
+
+    /// url 是否位于 directory 之下（/private 前缀归一化后比较）
+    private static func isPath(_ url: URL, under directory: URL) -> Bool {
+        normalizedDeliveryPath(url.path).hasPrefix(normalizedDeliveryPath(directory.path) + "/")
+    }
+
     private func isDeliveryPath(_ url: URL) -> Bool {
-        if url.path.hasPrefix(inboxURL.path + "/") { return true }
+        if isPath(url, under: inboxURL) { return true }
         // Incoming 接收队列：扩展落盘的任务文件（结算语义与投递一致——成功删源、
         // 失败保留，任务 JSON 的终态由结算钩子回写）
         for incoming in AppGroup.allIncomingURLsIfPresent
-        where url.path.hasPrefix(incoming.path + "/") {
+        where isPath(url, under: incoming) {
             return true
         }
         for groupInbox in AppGroup.allInboxURLsIfPresent
-        where url.path.hasPrefix(groupInbox.path + "/") {
+        where isPath(url, under: groupInbox) {
             return true
         }
         guard Self.deliveryExtensions.contains(url.pathExtension.lowercased()) else { return false }
-        let documentsPath = fileManager.documentsURL.path
-        guard url.path.hasPrefix(documentsPath + "/") else { return false }
-        let relative = String(url.path.dropFirst(documentsPath.count + 1))
+        guard isPath(url, under: fileManager.documentsURL) else { return false }
+        let relative = String(normalizedDeliveryPath(url.path)
+            .dropFirst(normalizedDeliveryPath(fileManager.documentsURL.path).count + 1))
         guard let topDir = relative.split(separator: "/").first else { return false }
         return !Self.managedDocumentsDirs.contains(String(topDir))
     }
@@ -1109,7 +1123,7 @@ final class AppState: ObservableObject {
             // 系统投递（Documents/Inbox）优先视为有效输入、跳过指纹拦截——出现在
             // Inbox 里本身就是一次新的用户投递，指纹拦截会把"主动重投同一文件"
             // 静默吞掉；Documents 内长存文件才需要指纹兜底防反复导入
-            let isInSystemInbox = file.path.hasPrefix(inboxURL.path + "/")
+            let isInSystemInbox = isPath(file, under: inboxURL)
             let identity = Self.deliveryIdentity(for: file)
             // 失败重试限流（对全部投递来源生效）：达上限的不再自动重试；节流窗口
             // 内不重试——一次回前台最多触发 4 次扫描，没有窗口时坏文件每次进 App
