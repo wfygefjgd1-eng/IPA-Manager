@@ -129,6 +129,31 @@ jobs:
           #    的已知根因（iOS 不为缺失的扩展显示任何入口），产物侧先兜住
           APPEX_COUNT="$(unzip -Z1 "$IPA" | grep -oE '^Payload/[^/]+\.app/PlugIns/[^/]+\.appex/' | sort -u | wc -l | tr -d ' ')"
           [ "$APPEX_COUNT" -ge 2 ] || { echo "IPA 结构校验失败：PlugIns 扩展缺失（应含 2 个 appex，实际 $APPEX_COUNT）"; exit 1; }
+          # f) 扩展 Info.plist 级校验：激活规则的文件计数 key 必须是【单数 File】
+          #    （NSExtensionActivationSupportsFileWithMaxCount，Apple 文档原文）；
+          #    复数 Files 不是有效 key，系统按未声明处理 → 文件载荷永远无法命中
+          #    激活规则（分享入口出现却收不到文件）。bundle id 必须是主 App 子级。
+          #    注：embedded.mobileprovision/_CodeSignature 由用户侧签名注入，未签名
+          #    产物不含，无法在此校验——签名后的产物校验由 App 内"签名产物校验"
+          #    （SigningEngine.verifyAppexProvisioning）与诊断报告的扩展章节覆盖。
+          rm -rf /tmp/ipa-plist && mkdir -p /tmp/ipa-plist
+          unzip -q "$IPA" 'Payload/*.app/PlugIns/*.appex/Info.plist' -d /tmp/ipa-plist
+          APPEX_INFOS="$(find /tmp/ipa-plist -name 'Info.plist' | sort)"
+          [ "$(echo "$APPEX_INFOS" | grep -c .)" -eq "$APPEX_COUNT" ] \
+            || { echo "IPA 校验失败：扩展 Info.plist 数量（$(echo "$APPEX_INFOS" | grep -c .)）与 appex 数量（$APPEX_COUNT）不符"; exit 1; }
+          for PLIST in $APPEX_INFOS; do
+            APPEX_NAME="$(basename "$(dirname "$PLIST")")"
+            # 构建产物中的 Info.plist 可能已被 Xcode 转为二进制格式，先转 XML 再 grep
+            plutil -convert xml1 -o /tmp/ext-info.plist "$PLIST" || { echo "IPA 校验失败：$APPEX_NAME Info.plist 无法解析"; exit 1; }
+            if grep -q 'NSExtensionActivationSupportsFilesWithMaxCount' /tmp/ext-info.plist; then
+              echo "IPA 校验失败：$APPEX_NAME 激活规则使用了无效的复数 Files key"; exit 1
+            fi
+            grep -q 'NSExtensionActivationSupportsFileWithMaxCount' /tmp/ext-info.plist \
+              || { echo "IPA 校验失败：$APPEX_NAME 激活规则缺少单数 File key"; exit 1; }
+            grep -q 'com\.ipamanager\.app' /tmp/ext-info.plist \
+              || { echo "IPA 校验失败：$APPEX_NAME bundle id 不是主 App 子级"; exit 1; }
+            echo "扩展 plist 校验通过：$APPEX_NAME（激活规则单数 File key + bundle id）"
+          done
           echo "IPA 校验通过：版本 1.0.${{ github.run_number }}（构建号 ${{ github.run_number }}），扩展 $APPEX_COUNT 个"
           # 产物完整性基准：人工发布流程（下载 artifact -> gh release create 上传）
           # 之间无可对照哈希时，无法发现 artifact 下载截断/损坏

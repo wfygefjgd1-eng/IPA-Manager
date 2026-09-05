@@ -338,9 +338,32 @@ bool ZArchO::BuildCodeSignature(ZSignAsset* pSignAsset,
 	string strDerEntitlementsSlot;
 
 	string strEmptyEntitlements = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n<plist version=\"1.0\">\n<dict/>\n</plist>\n";
+	// App extension binaries used to be signed with the profile's entitlements
+	// verbatim, leaving application-identifier pointing at the main app id
+	// (TEAM.com.x.y) while the appex bundle id is com.x.y.Share. Legit resign
+	// tools rewrite the id part to the bundle being signed; do the same here.
+	// Only rewrite when the bundle id EXTENDS the profile's app id (extension
+	// of it); the main app itself yields an empty suffix and keeps the original
+	// entitlements byte-for-byte. Team prefix and app groups stay untouched:
+	// the match is anchored on the full value (>id<), so keychain-access-groups
+	// entries (TEAM.id.<group>) are never affected.
+	string strEntitleData = IsExecute() ? pSignAsset->m_strEntitleData : string();
+	if (!strEntitleData.empty() && !strBundleId.empty() && !pSignAsset->m_strApplicationId.empty()) {
+		const string& strAppId = pSignAsset->m_strApplicationId;
+		const size_t dot = strAppId.find('.');
+		if (dot != string::npos) {
+			const string strIdPart = strAppId.substr(dot + 1);
+			if (strBundleId.rfind(strIdPart, 0) == 0) {
+				const string strSuffix = strBundleId.substr(strIdPart.size());
+				if (!strSuffix.empty()) {
+					ZUtil::StringReplace(strEntitleData, ">" + strAppId + "<", ">" + strAppId + strSuffix + "<");
+				}
+			}
+		}
+	}
 	ZSign::SlotBuildRequirements(strBundleId, pSignAsset->m_strSubjectCN, strRequirementsSlot);
-	ZSign::SlotBuildEntitlements(IsExecute() ? pSignAsset->m_strEntitleData : strEmptyEntitlements, strEntitlementsSlot);
-	ZSign::SlotBuildDerEntitlements(IsExecute() ? pSignAsset->m_strEntitleData : "", strDerEntitlementsSlot);
+	ZSign::SlotBuildEntitlements(strEntitleData.empty() ? strEmptyEntitlements : strEntitleData, strEntitlementsSlot);
+	ZSign::SlotBuildDerEntitlements(strEntitleData, strDerEntitlementsSlot);
 
 	string strRequirementsSlotSHA1;
 	string strRequirementsSlotSHA256;

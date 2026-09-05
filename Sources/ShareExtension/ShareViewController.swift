@@ -130,12 +130,17 @@ final class ShareViewController: UIViewController {
             return
         }
         let (provider, typeIdentifier) = jobs[index]
+        AppGroup.appendExtensionLog("[provider] typeIdentifier=\(typeIdentifier) suggestedName=\(provider.suggestedName ?? "无")")
         provider.loadFileRepresentation(forTypeIdentifier: typeIdentifier) { [weak self, provider] url, error in
             guard let self else { return }
             var saved = saved
             var failed = failed
             var failures = failures
             if let url {
+                // 临时文件信息：loadFileRepresentation 回调返回后临时 URL 随时可能
+                // 失效，这里当场取大小留痕（复制在回调内同步完成，绝不延迟）
+                let tempSize = ((try? FileManager.default.attributesOfItem(atPath: url.path))?[.size] as? Int64) ?? -1
+                AppGroup.appendExtensionLog("[provider] 临时文件 URL=\(url.lastPathComponent) 大小=\(tempSize)B")
                 // 安全作用域：文件 Provider 投递的临时 URL 可能需要显式授权，
                 // 沙盒严格时无作用域直接拷贝会 POSIX EPERM；非作用域 URL 调用
                 // 返回 false，成对 stop 无副作用

@@ -31,6 +31,9 @@ final class UserDefaultsStore {
         /// 防线——路径会因移动/重命名/结算删除失败而失效，内容身份与路径无关，
         /// 保证同一个文件（即使换位置）不会被反复导入
         static let importedDeliveryIdentities = "imported_delivery_identities"
+        /// 投递导入失败记录（内容身份 → 次数+时间）：失败不写已结算标记（保留
+        /// 重试机会），由这里限流并在连续失败达上限后停止自动重试
+        static let failedDeliveryRecords = "failed_delivery_records"
         /// 所有需要检查 TTL 的持久化键集合
         static let allPersistedKeys: [String] = [
             certificates, profiles, signingTasks, downloadTasks, importedApps
@@ -168,6 +171,18 @@ final class UserDefaultsStore {
         // 上限截断：身份串短（<100 字节），200 条足够回溯；超限丢最旧的，
         // 代价只是极旧文件再导入一次
         save(Array(identities.suffix(200)), key: Keys.importedDeliveryIdentities)
+    }
+
+    /// 投递导入失败记录（内容身份 → 次数+时间）
+    func loadFailedDeliveryRecords() -> [String: AppState.FailedDeliveryRecord] {
+        load([String: AppState.FailedDeliveryRecord].self, key: Keys.failedDeliveryRecords) ?? [:]
+    }
+
+    func saveFailedDeliveryRecords(_ records: [String: AppState.FailedDeliveryRecord]) {
+        // 上限截断：失败文件是少数，128 条足够；超限丢最旧（重新计入重试次数）
+        let trimmed = records.sorted { $0.value.lastAttempt > $1.value.lastAttempt }
+            .prefix(128)
+        save(Dictionary(uniqueKeysWithValues: trimmed), key: Keys.failedDeliveryRecords)
     }
 
     // MARK: - 自动流程开关（默认开启）

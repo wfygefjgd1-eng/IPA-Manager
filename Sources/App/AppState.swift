@@ -117,6 +117,7 @@ final class AppState: ObservableObject {
     init() {
         processedInboxPaths = Set(store.loadProcessedInboxPaths())
         importedDeliveryIdentities = Set(store.loadImportedDeliveryIdentities())
+        failedDeliveryRecords = store.loadFailedDeliveryRecords()
         loadPersistedState()
         // 启动孤儿清扫放在首次“已签应用”扫描完成之后执行：refreshInstalledApps
         // 的解析会创建新的解压目录，且 installedApps 到此刻才就绪——若清扫与
@@ -145,7 +146,7 @@ final class AppState: ObservableObject {
     func handleDownloadedFile(
         at url: URL,
         completion: ((Result<AppInfo, Error>) -> Void)? = nil,
-        onSettled: (() -> Void)? = nil
+        onSettled: ((Bool) -> Void)? = nil
     ) {
         Logger.info("下载完成，自动解析: \(url.lastPathComponent)")
         let ext = url.pathExtension.lowercased()
@@ -934,6 +935,19 @@ final class AppState: ObservableObject {
     /// 再次主动投递是用户明确意图，静默过滤表现为"分享了毫无反应"。
     private var importedDeliveryIdentities: Set<String> = []
 
+    /// 投递导入失败记录（持久化，仅主线程读写）：内容身份 → 失败次数 + 最近一次
+    /// 时间。与 processed/内容身份去重职责分离：失败不写 processed（保留重试
+    /// 机会），由这里限流——节流窗口内多次生命周期扫描只重试一次，连续失败达
+    /// 上限后登记 processed 停止自动重试（防坏文件每次进 App 无限重试）。
+    struct FailedDeliveryRecord: Codable {
+        var count: Int
+        var lastAttempt: Date
+    }
+
+    private var failedDeliveryRecords: [String: FailedDeliveryRecord] = [:]
+    /// 同一文件自动重试上限：超过后停止（源文件保留，等待用户手动处理）
+    private static let maxDeliveryRetries = 3
+
     /// 投递文件内容身份：与路径无关的"同一文件"判据
     private static func deliveryIdentity(for url: URL) -> String {
         let attrs = try? FileManager.default.attributesOfItem(atPath: url.path)
@@ -1079,13 +1093,23 @@ final class AppState: ObservableObject {
             // 静默吞掉；Documents 内长存文件才需要指纹兜底防反复导入
             let isInSystemInbox = file.path.hasPrefix(inboxURL.path + "/")
             let identity = Self.deliveryIdentity(for: file)
+            // 失败重试限流（对全部投递来源生效）：达上限的不再自动重试；节流窗口
+            // 内不重试——一次回前台最多触发 4 次扫描，没有窗口时坏文件每次进 App
+            // 会被连续导入 4 遍
+            if let record = failedDeliveryRecords[identity] {
+                if record.count >= Self.maxDeliveryRetries { continue }
+                if Date().timeIntervalSince(record.lastAttempt) < Timeouts.deliveryRetryThrottle {
+                    Logger.info("投递重试节流中（上次失败距今过近）: \(file.lastPathComponent)")
+                    continue
+                }
+            }
             if !isInSystemInbox && importedDeliveryIdentities.contains(identity) {
                 Logger.info("跳过重复投递（同内容文件已导入过）: \(file.lastPathComponent)")
                 continue
             }
             // 未登记 = open 事件丢失（正常投递的文件在结算时已自删，不会留到这里）。
             // 在途登记与重复投递拦截都在 handleFileOpenedFromOutside 内部完成。
-            Logger.info("兜底导入（open 事件丢失）: \(file.lastPathComponent)")
+            Logger.info("投递候选进入导入（candidate）: \(file.lastPathComponent)")
             handleFileOpenedFromOutside(file, force: isInSystemInbox)
             importedCount += 1
         }
@@ -1148,10 +1172,14 @@ final class AppState: ObservableObject {
 
     /// - Parameter force: 系统主动投递的 open 事件（launchOptions/openURL/onOpenURL）
     ///   传 true：用户主动分享是明确意图，绕过已结算拦截重新导入；回前台扫描
-    ///   兜底路径传 false，维持既有去重语义
+    ///   兜底路径传 false，维持既有去重语义。
+    ///   注意顺序：URL 事件去重只拦非强制触发——force 必须能穿透它，否则"强制"
+    ///   语义在函数最前面就被吞掉（先 dedupe 后判断 force 的结构里 force 从未
+    ///   真正生效过）。
     func handleFileOpenedFromOutside(_ url: URL, force: Bool = false) {
         let now = Date()
-        if url.absoluteString == lastOpenedExternalURL,
+        if !force,
+           url.absoluteString == lastOpenedExternalURL,
            now.timeIntervalSince(lastOpenedExternalDate) < Timeouts.externalOpenDedupe {
             Logger.info("外部打开文件去重跳过: \(url.lastPathComponent)")
             return
@@ -1183,10 +1211,14 @@ final class AppState: ObservableObject {
         //   中途被杀时投递未结算，下次启动仍会重新导入（若投递即落盘，该文件会
         //   永远不再导入、只能等 24h 清扫）。
         let isInboxDelivery = isDeliveryPath(url)
-        ExternalDeliveryJournal.record("处理外部文件: \(url.lastPathComponent)（ext=\(ext)，投递识别=\(isInboxDelivery ? "是" : "否")）")
-        var inboxSettlement: ((String) -> Void)? = nil
+        ExternalDeliveryJournal.record("处理外部文件: \(url.lastPathComponent)（ext=\(ext)，投递识别=\(isInboxDelivery ? "是" : "否")，force=\(force)）")
+        // 结算闭包（note, succeeded）：职责严格区分——成功才写 processed/内容身份
+        // 并删除源文件；失败保留源文件、只累计失败次数（限次重试），绝不把失败
+        // 记成"已处理"（旧版成功失败都结算删除，一个导入失败的文件从此再无重试
+        // 机会，且用户投递的文件凭空消失）。
+        var inboxSettlement: ((String, Bool) -> Void)? = nil
         if isInboxDelivery {
-            // 已结算（此前导入成功/失败并落盘标记）：默认跳过（残留由扫描清扫）；
+            // 已结算（此前导入成功并落盘标记）：默认跳过（残留由扫描清扫）；
             // force=true 表示用户主动投递的 open 事件，同文件再分享是明确意图，
             // 绕过已结算拦截重新导入
             if !force && processedInboxPaths.contains(url.path) {
@@ -1198,29 +1230,48 @@ final class AppState: ObservableObject {
                 Logger.info("分享投递已在途，跳过: \(url.lastPathComponent)")
                 return
             }
-            // 结算闭包：导入链路（成功/失败）走完后调用——删除投递源文件（文件已
-            // 复制进 IPA 目录/入库，源文件保留只会被重复导入并占用空间；删除失败极罕见，
-            // 由回前台扫描的 24h 残留清扫兜底）并持久化已结算标记。
-            inboxSettlement = { [weak self] note in
+            inboxSettlement = { [weak self] note, succeeded in
                 guard let self = self else { return }
                 self.pendingInboxImports.remove(url.path)
-                self.processedInboxPaths.insert(url.path)
-                self.store.saveProcessedInboxPaths(Array(self.processedInboxPaths))
-                // 内容身份在删除前取（删除后属性读不到）：结算即登记，无论源文件
-                // 删除成败，同一文件都不会再被扫描导入
+                // 内容身份在删除前取（删除后属性读不到）
                 let identity = Self.deliveryIdentity(for: url)
-                self.importedDeliveryIdentities.insert(identity)
-                self.store.saveImportedDeliveryIdentities(Array(self.importedDeliveryIdentities))
-                var settleNote = note
-                do {
-                    try FileManager.default.removeItem(at: url)
-                } catch {
-                    // 删除失败必须留痕：文件残留时用户会看到"每次进 App 重复导入"，
-                    // 报告里能看到真实原因而不是只有一句已删
-                    Logger.error("投递源文件删除失败: \(url.lastPathComponent) - \(error.localizedDescription)")
-                    settleNote = "\(note)；源文件删除失败：\(error.localizedDescription)"
+                if succeeded {
+                    self.processedInboxPaths.insert(url.path)
+                    self.store.saveProcessedInboxPaths(Array(self.processedInboxPaths))
+                    self.importedDeliveryIdentities.insert(identity)
+                    self.store.saveImportedDeliveryIdentities(Array(self.importedDeliveryIdentities))
+                    self.failedDeliveryRecords.removeValue(forKey: identity)
+                    self.store.saveFailedDeliveryRecords(self.failedDeliveryRecords)
+                    var settleNote = note
+                    do {
+                        try FileManager.default.removeItem(at: url)
+                    } catch {
+                        // 删除失败必须留痕：文件残留时用户会看到"每次进 App 重复导入"，
+                        // 报告里能看到真实原因而不是只有一句已删
+                        Logger.error("投递源文件删除失败: \(url.lastPathComponent) - \(error.localizedDescription)")
+                        settleNote = "\(note)；源文件删除失败：\(error.localizedDescription)"
+                    }
+                    Logger.info("投递导入成功结算: \(url.lastPathComponent)（\(settleNote)）")
+                    ExternalDeliveryJournal.record("投递结算（成功）: \(url.lastPathComponent)（\(settleNote)）", level: .ok)
+                } else {
+                    // 失败：不写 processed/内容身份（保留重试机会），只累计失败次数
+                    let previous = self.failedDeliveryRecords[identity]
+                        ?? FailedDeliveryRecord(count: 0, lastAttempt: .distantPast)
+                    let record = FailedDeliveryRecord(count: previous.count + 1, lastAttempt: Date())
+                    self.failedDeliveryRecords[identity] = record
+                    self.store.saveFailedDeliveryRecords(self.failedDeliveryRecords)
+                    if record.count >= Self.maxDeliveryRetries {
+                        // 连续失败达上限：登记 processed 停止自动重试（否则每次进 App
+                        // 都会重试同一个坏文件），源文件保留供用户手动处理或删除
+                        self.processedInboxPaths.insert(url.path)
+                        self.store.saveProcessedInboxPaths(Array(self.processedInboxPaths))
+                        Logger.error("投递连续 \(record.count) 次导入失败，停止自动重试（源文件保留待手动处理）: \(url.lastPathComponent)（\(note)）")
+                        ExternalDeliveryJournal.record("投递失败（连续 \(record.count) 次，停止自动重试，源文件保留）: \(url.lastPathComponent)（\(note)）", level: .error)
+                    } else {
+                        Logger.error("投递导入失败（第 \(record.count) 次，保留源文件待重试）: \(url.lastPathComponent)（\(note)）")
+                        ExternalDeliveryJournal.record("投递失败（第 \(record.count) 次，保留源文件待重试）: \(url.lastPathComponent)（\(note)）", level: .error)
+                    }
                 }
-                ExternalDeliveryJournal.record("投递结算: \(url.lastPathComponent)（\(settleNote)）", level: .ok)
             }
         }
 
@@ -1237,16 +1288,16 @@ final class AppState: ObservableObject {
                 at: url,
                 completion: { result in
                     switch result {
-                    case .success: inboxSettlement?("导入完成")
-                    case .failure: inboxSettlement?("导入失败")
+                    case .success: inboxSettlement?("导入完成", true)
+                    case .failure(let error): inboxSettlement?("导入失败：\(error.localizedDescription)", false)
                     }
                 },
-                onSettled: { inboxSettlement?("证书包导入完成") }
+                onSettled: { inboxSettlement?("证书包导入完成", true) }
             )
         case "p12", "pfx", "mobileprovision":
             // 单个证书相关文件保持原逻辑（zip 才是证书包载体）；onSettled 由证书
-            // 导入收尾回调（含失败），用于投递的源文件删除与已结算落盘。
-            importCertificateBundleOrFile(url, onSettled: { inboxSettlement?("证书导入完成") })
+            // 导入收尾回调（含成败标记），用于投递的源文件删除与已结算落盘。
+            importCertificateBundleOrFile(url, onSettled: { inboxSettlement?("证书导入完成", $0) })
         default:
             importFile(from: url) { result in
                 switch result {
@@ -1254,11 +1305,11 @@ final class AppState: ObservableObject {
                     // 外部打开的应用导入成功后，切到首页并提示（用户可进详情签名）
                     self.selectedTab = 0
                     Logger.info("外部打开文件导入成功: \(app.name)")
-                    inboxSettlement?("导入成功: \(app.name)")
+                    inboxSettlement?("导入成功: \(app.name)", true)
                 case .failure(let error):
                     // 外部打开失败必须给反馈（否则用户在文件 App 里点了毫无反应）
                     self.showToast("导入失败: \(error.localizedDescription)")
-                    inboxSettlement?("导入失败")
+                    inboxSettlement?("导入失败：\(error.localizedDescription)", false)
                 }
             }
         }
@@ -1270,7 +1321,7 @@ final class AppState: ObservableObject {
     /// - mobileprovision：无需密码，直接导入描述文件；成功/失败均给 toast 反馈。
     /// 注：CertificateManager / ProvisioningManager 在各自内部持有安全作用域，
     /// 这里无需再 startAccessing。
-    private func handleSingleCertificateFile(_ url: URL, onSettled: (() -> Void)? = nil) {
+    private func handleSingleCertificateFile(_ url: URL, onSettled: ((Bool) -> Void)? = nil) {
         let ext = url.pathExtension.lowercased()
         switch ext {
         case "p12", "pfx":
@@ -1280,12 +1331,13 @@ final class AppState: ObservableObject {
                     case .success(let cert):
                         self.addCertificate(cert)
                         self.showToast("已导入证书文件，请到证书页查看")
-                    case .failure:
+                    case .failure(let error):
                         self.showToast("请在证书页手动导入该文件")
                         self.selectedTab = 3
+                        Logger.warning("证书文件自动导入失败（保留源文件待重试）: \(error.localizedDescription)")
                     }
-                    // 分享投递（Inbox）结算：导入收尾（含失败）后删源文件 + 已结算落盘
-                    onSettled?()
+                    // 分享投递（Inbox）结算：成功才删源文件；失败保留待限次重试
+                    onSettled?(result.isSuccess)
                 }
             }
         case "mobileprovision":
@@ -1305,13 +1357,13 @@ final class AppState: ObservableObject {
                             self.addProfile(profile)
                         }
                         self.showToast("已导入描述文件，请到证书页查看")
-                        onSettled?()
+                        onSettled?(true)
                     }
                 } catch {
                     DispatchQueue.main.async {
                         self.showToast("描述文件导入失败，请在证书页手动导入该文件")
                         self.selectedTab = 3
-                        onSettled?()
+                        onSettled?(false)
                     }
                 }
             }
@@ -1343,7 +1395,7 @@ final class AppState: ObservableObject {
         }
     }
 
-    private func importCertificateBundleOrFile(_ url: URL, onSettled: (() -> Void)? = nil) {
+    private func importCertificateBundleOrFile(_ url: URL, onSettled: ((Bool) -> Void)? = nil) {
         switch url.pathExtension.lowercased() {
         case "zip":
             let importer = CertificateBundleImporter.shared
@@ -1406,8 +1458,10 @@ final class AppState: ObservableObject {
                             self.showToast("已导入描述文件；压缩包内未找到证书 (.p12)")
                         }
                         Logger.info("zip 证书包导入完成")
-                        // 分享投递（Inbox）结算：解压/归档已完成，Inbox 源文件可删
-                        onSettled?()
+                        // 分享投递（Inbox）结算：解压/归档已完成，内容已转入托管位置，
+                        // 源 zip 可删（内层证书密码不匹配属"转手动"而非投递失败——
+                        // 重试同一个密码结果不会变，且解出副本已保留供手动导入）
+                        onSettled?(true)
                     }
                 } catch {
                     // 解压/移动失败：同样清理。extract 抛错时拿不到确切解压目录
@@ -1422,9 +1476,9 @@ final class AppState: ObservableObject {
                     // 失败给用户可见反馈（旧实现只写日志——从文件 App/下载链路进来时
                     // 界面毫无反应，用户以为导入成功但列表为空）
                     self.showToast("证书包导入失败：\(error.localizedDescription)")
-                    // 分享投递（Inbox）结算：失败同样结算（删源文件 + 已结算落盘），
-                    // 避免每次启动对同一损坏包重复尝试导入
-                    DispatchQueue.main.async { onSettled?() }
+                    // 分享投递（Inbox）结算：失败不删除源文件、不写已结算标记，
+                    // 记入失败记录限次重试（见 inboxSettlement 的失败分支）
+                    DispatchQueue.main.async { onSettled?(false) }
                 }
             }
         default:

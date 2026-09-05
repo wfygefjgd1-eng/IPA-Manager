@@ -233,22 +233,24 @@ enum AppGroup {
         }
         let attrs = try? FileManager.default.attributesOfItem(atPath: sourceURL.path)
         let size = (attrs?[.size] as? Int64) ?? 0
+        appendExtensionLog("[receive] 源=\(sourceURL.lastPathComponent) 大小=\(size)B 目标容器=\(containers.count)个")
         var primaryDestination: URL?
         var failures: [String] = []
         for container in containers {
             // 主容器未成功前逐个尝试；成功后仅小文件继续向其余容器冗余
             if primaryDestination != nil && size > fanOutMaxBytes { break }
+            appendExtensionLog("[copy] 开始复制 → 组 \(container.identifier)")
             do {
                 let dest = try copyIntoInbox(of: container, sourceURL: sourceURL, preferredFileName: preferredFileName)
                 if primaryDestination == nil {
                     primaryDestination = dest
-                    appendExtensionLog("已保存到主容器（组 \(container.identifier)）：\(dest.lastPathComponent)")
+                    appendExtensionLog("[copy] 复制成功（主容器 组 \(container.identifier)）：\(dest.lastPathComponent)")
                 } else {
-                    appendExtensionLog("冗余写入容器（组 \(container.identifier)）：\(dest.lastPathComponent)")
+                    appendExtensionLog("[copy] 冗余复制成功（组 \(container.identifier)）：\(dest.lastPathComponent)")
                 }
-            } catch {
-                failures.append("组 \(container.identifier)：\(error.localizedDescription)")
-                appendExtensionLog("写入容器失败（组 \(container.identifier)）：\(error.localizedDescription)")
+            } catch let error as NSError {
+                failures.append("组 \(container.identifier)：\(error.localizedDescription)（domain=\(error.domain) code=\(error.code)）")
+                appendExtensionLog("[copy] 复制失败（组 \(container.identifier)）：\(error.localizedDescription) code=\(error.code)")
             }
         }
         guard let primaryDestination else {
@@ -261,7 +263,9 @@ enum AppGroup {
         return primaryDestination
     }
 
-    /// 单容器收件箱复制：收件箱不存在则创建，重名不覆盖（追加序号）
+    /// 单容器收件箱复制：收件箱不存在则创建，重名不覆盖（追加序号）。
+    /// 复制返回 ≠ 可靠落盘——复制后必须校验目标存在、大于 0 字节且与源等大，
+    /// 否则删除半成品并抛错（扩展绝不把未落盘当成功后结束请求）。
     private static func copyIntoInbox(of container: Container, sourceURL: URL, preferredFileName: String?) throws -> URL {
         guard let inbox = ensureInboxURL(in: container) else {
             throw NSError(domain: "AppGroup", code: 3,
@@ -280,6 +284,15 @@ enum AppGroup {
             dest = inbox.appendingPathComponent(ext.isEmpty ? "\(base)-\(attempt)" : "\(base)-\(attempt).\(ext)")
         }
         try FileManager.default.copyItem(at: sourceURL, to: dest)
+        let srcSize = ((try? FileManager.default.attributesOfItem(atPath: sourceURL.path))?[.size] as? Int64) ?? -1
+        let destSize = ((try? FileManager.default.attributesOfItem(atPath: dest.path))?[.size] as? Int64) ?? -1
+        guard FileManager.default.fileExists(atPath: dest.path), destSize > 0, destSize == srcSize else {
+            try? FileManager.default.removeItem(at: dest)
+            throw NSError(
+                domain: "AppGroup", code: 4,
+                userInfo: [NSLocalizedDescriptionKey: "落盘校验失败（源 \(srcSize)B / 目标 \(destSize)B）"]
+            )
+        }
         return dest
     }
 

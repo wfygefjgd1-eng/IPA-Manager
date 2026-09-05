@@ -202,7 +202,43 @@ final class SigningEngine: SigningEngineProtocol {
         // 若不主动告知，smoother 的蠕动定时器会继续空转（泄漏 + UI 空转）。
         smoother.complete()
         Logger.info("签名完成: \(outputURL.path)")
+        // 签名产物级校验（以最终 IPA 为准）：每个 PlugIns/*.appex 必须嵌入
+        // embedded.mobileprovision——iOS 17+ 拒绝加载无描述文件的扩展（分享入口
+        // 点了毫无反应的直接原因）。只读 zip 中央目录，毫秒级，不解压整包。
+        Self.verifyAppexProvisioning(in: outputURL)
         return outputURL.path
+    }
+
+    /// 校验签名产物内每个顶层扩展都嵌入了描述文件；缺失说明签名引擎未带
+    /// "扩展 profile 回退写入"修复（旧版 zsign 只给主 App 写 profile），
+    /// 在日志与失败专区留下可操作记录而不是产出静默不可用的包。
+    private static func verifyAppexProvisioning(in ipaURL: URL) {
+        guard let entries = try? ZipManager.shared.listEntryPaths(archiveURL: ipaURL) else {
+            Logger.warning("签名产物校验：无法读取 IPA 中央目录，跳过扩展描述文件检查")
+            return
+        }
+        // 从任意条目推导扩展目录（zip 可能不含显式目录条目）：
+        // "Payload/App.app/PlugIns/X.appex/Info.plist" → "Payload/App.app/PlugIns/X.appex/"
+        var appexDirs = Set<String>()
+        for path in entries {
+            guard let range = path.range(of: ".appex/") else { continue }
+            let dir = String(path[...range.upperBound])
+            if dir.contains("/PlugIns/") {
+                appexDirs.insert(dir)
+            }
+        }
+        guard !appexDirs.isEmpty else {
+            Logger.warning("签名产物校验：IPA 内未发现 PlugIns/*.appex（签名工具可能剥离了扩展，分享入口将不存在）")
+            return
+        }
+        let entrySet = Set(entries)
+        let missing = appexDirs.sorted().filter { !entrySet.contains($0 + "embedded.mobileprovision") }
+        if missing.isEmpty {
+            Logger.info("签名产物校验通过: \(appexDirs.count) 个扩展全部嵌入 embedded.mobileprovision")
+        } else {
+            let names = missing.map { $0.split(separator: "/").last.map(String.init) ?? $0 }.joined(separator: "、")
+            Logger.error("签名产物校验: \(missing.count)/\(appexDirs.count) 个扩展缺少 embedded.mobileprovision（iOS 17+ 将拒绝加载该扩展）: \(names)")
+        }
     }
 
     /// 用系统 Security 框架（SecPKCS12Import）解开 p12 并把私钥导出为 PEM 文件。
