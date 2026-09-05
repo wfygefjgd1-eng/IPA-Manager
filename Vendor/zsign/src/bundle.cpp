@@ -423,7 +423,7 @@ bool ZBundle::SignNode(jvalue& jvNode)
 		auto endsWith = [](const string& str, const string& suffix) {
 			return str.size() >= suffix.size() && 0 == str.compare(str.size()-suffix.size(), suffix.size(), suffix);
 		};
-		const ZSignAsset* matched = NULL;
+		ZSignAsset* matched = NULL;
 		if (m_pSignAssets != NULL) {
 			for (auto it = m_pSignAssets->rbegin(); it != m_pSignAssets->rend(); ++it) {
 				if (endsWith(it->m_strApplicationId, strBundleId)) {
