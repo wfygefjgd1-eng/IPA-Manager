@@ -179,10 +179,8 @@ final class UserDefaultsStore {
     }
 
     func saveFailedDeliveryRecords(_ records: [String: AppState.FailedDeliveryRecord]) {
-        // 上限截断：失败文件是少数，128 条足够；超限丢最旧（重新计入重试次数）
-        let trimmed = records.sorted { $0.value.lastAttempt > $1.value.lastAttempt }
-            .prefix(128)
-        save(Dictionary(uniqueKeysWithValues: trimmed), key: Keys.failedDeliveryRecords)
+        // 体量天然有限（仅导入失败的文件计入，身份串短），整体落盘不做截断
+        save(records, key: Keys.failedDeliveryRecords)
     }
 
     // MARK: - 自动流程开关（默认开启）

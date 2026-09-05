@@ -1292,7 +1292,7 @@ final class AppState: ObservableObject {
                     case .failure(let error): inboxSettlement?("导入失败：\(error.localizedDescription)", false)
                     }
                 },
-                onSettled: { inboxSettlement?("证书包导入完成", true) }
+                onSettled: { inboxSettlement?("证书包导入完成", $0) }
             )
         case "p12", "pfx", "mobileprovision":
             // 单个证书相关文件保持原逻辑（zip 才是证书包载体）；onSettled 由证书
@@ -1331,13 +1331,15 @@ final class AppState: ObservableObject {
                     case .success(let cert):
                         self.addCertificate(cert)
                         self.showToast("已导入证书文件，请到证书页查看")
+                        // 分享投递（Inbox）结算：成功才删源文件
+                        onSettled?(true)
                     case .failure(let error):
                         self.showToast("请在证书页手动导入该文件")
                         self.selectedTab = 3
                         Logger.warning("证书文件自动导入失败（保留源文件待重试）: \(error.localizedDescription)")
+                        // 失败保留源文件待限次重试（Result 无 isSuccess，分支内给出）
+                        onSettled?(false)
                     }
-                    // 分享投递（Inbox）结算：成功才删源文件；失败保留待限次重试
-                    onSettled?(result.isSuccess)
                 }
             }
         case "mobileprovision":
