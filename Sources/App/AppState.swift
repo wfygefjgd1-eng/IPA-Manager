@@ -118,6 +118,7 @@ final class AppState: ObservableObject {
         processedInboxPaths = Set(store.loadProcessedInboxPaths())
         importedDeliveryIdentities = Set(store.loadImportedDeliveryIdentities())
         failedDeliveryRecords = store.loadFailedDeliveryRecords()
+        pendingAutoSignPaths = Set(store.loadPendingAutoSignPaths())
         loadPersistedState()
         // 启动孤儿清扫放在首次“已签应用”扫描完成之后执行：refreshInstalledApps
         // 的解析会创建新的解压目录，且 installedApps 到此刻才就绪——若清扫与
@@ -790,6 +791,12 @@ final class AppState: ObservableObject {
     private var recentAutoSignBundleIDs: [String: Date] = [:]
     private static let autoSignCooldown: TimeInterval = 60
 
+    /// 待续跑的自动签名源路径（持久化）：入队时登记、签名出结果即移除。
+    /// 用途：自动签名/安装进行到一半时 App 被替换（用户重装新版、系统更新），
+    /// 进程死亡流水线中断——重启后据此自动续跑，下载一条龙不会不了了之
+    /// （实测场景：下载新版 zip → 同时重装新版 → 签名被杀 → 没有安装）。
+    private var pendingAutoSignPaths: Set<String> = []
+
     /// 导入/下载/外部打开导入成功后调用：若设置开启且存在有效默认证书/描述文件，
     /// 自动签名并自动安装（一条龙），满足"下载完/导入完直接签名安装"的需求。
     /// 串行队列逐条处理（zsign 并发不安全）；失败时 toast 具体中文原因，不静默。
@@ -838,6 +845,10 @@ final class AppState: ObservableObject {
         }
         autoSignQueue.append(app)
         autoSigningAppIDs.insert(app.id)
+        // 登记"待续跑"：自动签名/安装中途 App 被替换（重装新版）进程死亡时，
+        // 重启后自动续跑（见 loadPersistedState 尾部的 resume）
+        pendingAutoSignPaths.insert(app.path)
+        store.savePendingAutoSignPaths(Array(pendingAutoSignPaths))
         pumpAutoSignQueue()
         return true
     }
@@ -875,6 +886,9 @@ final class AppState: ObservableObject {
             self.isAutoSigning = false
             self.currentAutoSignBundleID = nil
             self.autoSigningAppIDs.remove(app.id)
+            // 无论成败都解除"待续跑"登记（失败已 toast，续跑不再盲目重试）
+            self.pendingAutoSignPaths.remove(app.path)
+            self.store.savePendingAutoSignPaths(Array(self.pendingAutoSignPaths))
             switch result {
             case .success(let signedPath):
                 if !app.bundleID.isEmpty {
@@ -1588,6 +1602,27 @@ final class AppState: ObservableObject {
         // 这些副本必然无用（私钥已入 Keychain，或导入根本没发生）。
         DispatchQueue.global(qos: .userInitiated).async {
             CertificateBundleImporter.shared.sweepOrphanManagedArtifacts()
+        }
+
+        // 断点续跑：上次进程在自动签名/安装中途死亡（典型：用户下载新版 zip 触发
+        // 自动一条龙的同时重装了新版 App，进程被替换杀死），重启后对仍未签名的
+        // 应用自动续跑；失败会 toast 具体原因，不静默
+        resumePendingAutoSigns()
+    }
+
+    /// 续跑上次中断的自动签名（App 被替换重装导致的流水线中断）
+    private func resumePendingAutoSigns() {
+        guard !pendingAutoSignPaths.isEmpty else { return }
+        let paths = pendingAutoSignPaths
+        pendingAutoSignPaths.removeAll()
+        store.savePendingAutoSignPaths([])
+        for path in paths {
+            guard FileManager.default.fileExists(atPath: path),
+                  let app = importedApps.first(where: { $0.path == path }),
+                  !app.isSigned else { continue }
+            Logger.info("续跑上次中断的自动签名: \(app.name)")
+            ExternalDeliveryJournal.record("续跑上次中断的自动签名: \(app.name)")
+            enqueueAutoSignAndInstall(app)
         }
     }
 

@@ -34,6 +34,9 @@ final class UserDefaultsStore {
         /// 投递导入失败记录（内容身份 → 次数+时间）：失败不写已结算标记（保留
         /// 重试机会），由这里限流并在连续失败达上限后停止自动重试
         static let failedDeliveryRecords = "failed_delivery_records"
+        /// 待续跑的自动签名源路径：App 在自动签名/安装中途被替换（重装新版）时
+        /// 进程死亡，重启后据此自动续跑，下载一条龙不会因更新 App 而不了了之
+        static let pendingAutoSignPaths = "pending_auto_sign_paths"
         /// 所有需要检查 TTL 的持久化键集合
         static let allPersistedKeys: [String] = [
             certificates, profiles, signingTasks, downloadTasks, importedApps
@@ -181,6 +184,17 @@ final class UserDefaultsStore {
     func saveFailedDeliveryRecords(_ records: [String: AppState.FailedDeliveryRecord]) {
         // 体量天然有限（仅导入失败的文件计入，身份串短），整体落盘不做截断
         save(records, key: Keys.failedDeliveryRecords)
+    }
+
+    // MARK: - 待续跑自动签名（App 被替换时的断点续作）
+
+    func loadPendingAutoSignPaths() -> [String] {
+        load([String].self, key: Keys.pendingAutoSignPaths) ?? []
+    }
+
+    func savePendingAutoSignPaths(_ paths: [String]) {
+        // 上限截断：16 条远超正常用量；超限丢最旧（代价是该应用不再自动续跑）
+        save(Array(paths.suffix(16)), key: Keys.pendingAutoSignPaths)
     }
 
     // MARK: - 自动流程开关（默认开启）
