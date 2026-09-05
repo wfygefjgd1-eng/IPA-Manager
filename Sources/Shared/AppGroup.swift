@@ -204,6 +204,36 @@ enum AppGroup {
         usableContainers().compactMap { inboxURLIfPresent(in: $0) }
     }
 
+    /// 全部可用容器的 Incoming 接收队列目录（存在才返回）。
+    /// Incoming 是 v1.0.151 起的统一接收区：扩展把文件（UUID 前缀命名）与任务
+    /// JSON（Incoming/Tasks/）写在这里，主 App 扫描任务认领处理。
+    static var allIncomingURLsIfPresent: [URL] {
+        usableContainers().compactMap { incomingURLIfPresent(in: $0) }
+    }
+
+    private static func incomingURLIfPresent(in container: Container?) -> URL? {
+        guard let container else { return nil }
+        let incoming = container.url.appendingPathComponent("Incoming", isDirectory: true)
+        var isDirectory: ObjCBool = false
+        guard FileManager.default.fileExists(atPath: incoming.path, isDirectory: &isDirectory), isDirectory.boolValue else {
+            return nil
+        }
+        return incoming
+    }
+
+    /// 确保 Incoming（含 Tasks 子目录）存在；不存在则创建
+    @discardableResult
+    static func ensureIncomingURL(in container: Container) -> URL? {
+        let incoming = container.url.appendingPathComponent("Incoming", isDirectory: true)
+        let tasks = incoming.appendingPathComponent("Tasks", isDirectory: true)
+        do {
+            try FileManager.default.createDirectory(at: tasks, withIntermediateDirectories: true)
+        } catch {
+            return nil
+        }
+        return incoming
+    }
+
     private static func ensureInboxURL(in container: Container?) -> URL? {
         guard let container else { return nil }
         let inbox = container.url.appendingPathComponent("Inbox", isDirectory: true)
@@ -217,13 +247,15 @@ enum AppGroup {
         return inbox
     }
 
-    /// 把外部文件复制进**全部**可用容器的收件箱（写入侧扇出）：
+    /// 把外部文件复制进**全部**可用容器的 Incoming 接收队列（写入侧扇出）：
+    /// - 存储名带 UUID 前缀（防同名覆盖/特殊字符/路径冲突，任务记录据此定位）；
     /// - 主容器必须成功，全部容器都失败时抛出携带完整诊断信息的错误（扩展 UI
     ///   直接展示，不再静默）；
     /// - 其余容器 best-effort 冗余写入（小文件才扇出，大文件只落主容器），
     ///   任一容器成功即保证主 App 扫得到（读取侧枚举全部容器）。
+    /// - Returns: 主容器落盘 URL 与存储名（任务记录引用）
     @discardableResult
-    static func saveIncomingFile(at sourceURL: URL, preferredFileName: String? = nil) throws -> URL {
+    static func saveIncomingFile(at sourceURL: URL, preferredFileName: String? = nil) throws -> (url: URL, storedFileName: String) {
         let containers = usableContainers()
         guard !containers.isEmpty else {
             throw NSError(
@@ -235,15 +267,17 @@ enum AppGroup {
         let size = (attrs?[.size] as? Int64) ?? 0
         appendExtensionLog("[receive] 源=\(sourceURL.lastPathComponent) 大小=\(size)B 目标容器=\(containers.count)个")
         var primaryDestination: URL?
+        var primaryStoredName = ""
         var failures: [String] = []
         for container in containers {
             // 主容器未成功前逐个尝试；成功后仅小文件继续向其余容器冗余
             if primaryDestination != nil && size > fanOutMaxBytes { break }
             appendExtensionLog("[copy] 开始复制 → 组 \(container.identifier)")
             do {
-                let dest = try copyIntoInbox(of: container, sourceURL: sourceURL, preferredFileName: preferredFileName)
+                let (dest, storedName) = try copyIntoIncoming(of: container, sourceURL: sourceURL, preferredFileName: preferredFileName)
                 if primaryDestination == nil {
                     primaryDestination = dest
+                    primaryStoredName = storedName
                     appendExtensionLog("[copy] 复制成功（主容器 组 \(container.identifier)）：\(dest.lastPathComponent)")
                 } else {
                     appendExtensionLog("[copy] 冗余复制成功（组 \(container.identifier)）：\(dest.lastPathComponent)")
@@ -260,29 +294,23 @@ enum AppGroup {
                     + failures.joined(separator: "\n")]
             )
         }
-        return primaryDestination
+        return (primaryDestination, primaryStoredName)
     }
 
-    /// 单容器收件箱复制：收件箱不存在则创建，重名不覆盖（追加序号）。
+    /// 单容器 Incoming 复制：UUID 前缀命名保证不与任何既有文件冲突。
     /// 复制返回 ≠ 可靠落盘——复制后必须校验目标存在、大于 0 字节且与源等大，
     /// 否则删除半成品并抛错（扩展绝不把未落盘当成功后结束请求）。
-    private static func copyIntoInbox(of container: Container, sourceURL: URL, preferredFileName: String?) throws -> URL {
-        guard let inbox = ensureInboxURL(in: container) else {
+    private static func copyIntoIncoming(of container: Container, sourceURL: URL, preferredFileName: String?) throws -> (url: URL, storedFileName: String) {
+        guard let incoming = ensureIncomingURL(in: container) else {
             throw NSError(domain: "AppGroup", code: 3,
-                          userInfo: [NSLocalizedDescriptionKey: "收件箱目录创建失败"])
+                          userInfo: [NSLocalizedDescriptionKey: "Incoming 目录创建失败"])
         }
         var baseName = (preferredFileName ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
         if baseName.isEmpty { baseName = sourceURL.lastPathComponent }
         baseName = (baseName as NSString).lastPathComponent
         if baseName.isEmpty { baseName = "shared-file" }
-        let base = (baseName as NSString).deletingPathExtension
-        let ext = (baseName as NSString).pathExtension
-        var dest = inbox.appendingPathComponent(baseName)
-        var attempt = 0
-        while FileManager.default.fileExists(atPath: dest.path) {
-            attempt += 1
-            dest = inbox.appendingPathComponent(ext.isEmpty ? "\(base)-\(attempt)" : "\(base)-\(attempt).\(ext)")
-        }
+        let storedName = "\(UUID().uuidString)-\(baseName)"
+        let dest = incoming.appendingPathComponent(storedName)
         try FileManager.default.copyItem(at: sourceURL, to: dest)
         let srcSize = ((try? FileManager.default.attributesOfItem(atPath: sourceURL.path))?[.size] as? Int64) ?? -1
         let destSize = ((try? FileManager.default.attributesOfItem(atPath: dest.path))?[.size] as? Int64) ?? -1
@@ -293,7 +321,7 @@ enum AppGroup {
                 userInfo: [NSLocalizedDescriptionKey: "落盘校验失败（源 \(srcSize)B / 目标 \(destSize)B）"]
             )
         }
-        return dest
+        return (dest, storedName)
     }
 
     /// 共享容器完全不可用时的用户可读诊断（扩展 UI 与错误信息共用）。

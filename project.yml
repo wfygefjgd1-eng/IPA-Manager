@@ -186,6 +186,8 @@ targets:
           - ActionInfo.plist
           - "*.entitlements"
       - path: Sources/Shared
+      # 导入任务模型与存储：扩展负责在 App Group 内创建任务 JSON
+      - path: Sources/ImportPipeline
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.ipamanager.app.Share
@@ -230,6 +232,8 @@ targets:
           - ActionInfo.plist
           - "*.entitlements"
       - path: Sources/Shared
+      # 导入任务模型与存储：动作扩展与分享扩展共用同一接收逻辑
+      - path: Sources/ImportPipeline
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.ipamanager.app.Action

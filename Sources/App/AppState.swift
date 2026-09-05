@@ -139,6 +139,8 @@ final class AppState: ObservableObject {
         /// zip 内嵌 .ipa（GitHub release 常见格式：zip 包着 ipa + 校验 txt）；
         /// 携带已复制到 Documents/IPA 持久位置的 .ipa 文件 URL（不会是临时目录内的路径）
         case embeddedIPA(URL)
+        /// zip 内嵌多个 .ipa 且无 .app：不随机选一个，交给上层明确告知用户
+        case multipleIPAs([String])
         /// 压缩包能正常解压但既非应用包也非证书包；携带顶层内容摘要，便于定位真实结构
         case unknown(String)
     }
@@ -221,9 +223,17 @@ final class AppState: ObservableObject {
                             completion?(result)
                         }
                     }
+                case .multipleIPAs(let paths):
+                    // 多个内嵌 .ipa：绝不静默随机选一个，把全部候选明确告知用户
+                    let names = paths.map { ($0 as NSString).lastPathComponent }.joined(separator: "、")
+                    let message = "该 ZIP 内发现 \(paths.count) 个 IPA 文件：\(names)。为避免装错应用，不会随机选择——请解压后在文件 App 中分享要安装的那个 IPA。"
+                    DispatchQueue.main.async {
+                        Logger.error("自动解析失败（多 IPA 归档）: \(url.lastPathComponent) - \(message)")
+                        completion?(.failure(AppError.operationFailed(message)))
+                    }
                 case .unknown(let summary):
                     // 保留原始分类信息，并附上“压缩包内包含：…”内容摘要，方便定位真实结构
-                    let message = "该 ZIP 不是应用包（未发现 .app 应用包或 .ipa 文件）也不是证书包（无 .p12/.mobileprovision）。\(summary)"
+                    let message = "ZIP 中未找到 IPA 文件：该 ZIP 不是应用包（未发现 .app 应用包或 .ipa 文件）也不是证书包（无 .p12/.mobileprovision）。\(summary)"
                     DispatchQueue.main.async {
                         Logger.error("自动解析失败: \(url.lastPathComponent) - \(message)")
                         completion?(.failure(AppError.operationFailed(message)))
@@ -266,7 +276,7 @@ final class AppState: ObservableObject {
 
         var hasCertificate = false
         var hasAppBundle = false
-        var embeddedIPAPath: String? = nil
+        var embeddedIPAPaths: [String] = []
         for path in entryPaths {
             let lower = path.lowercased()
             if lower.hasSuffix(".app") || lower.contains(".app/") {
@@ -277,17 +287,19 @@ final class AppState: ObservableObject {
             } else if lower.hasSuffix(".mobileprovision") && !lower.contains(".app/") {
                 // 排除 .app 内部的 embedded.mobileprovision，避免应用包被误判为证书包
                 hasCertificate = true
-            } else if lower.hasSuffix(".ipa") && !lower.contains(".app/") && embeddedIPAPath == nil {
-                // zip 内嵌 .ipa（GitHub release 常见格式），只记录第一个
-                embeddedIPAPath = path
+            } else if lower.hasSuffix(".ipa") && !lower.contains(".app/") {
+                // zip 内嵌 .ipa（GitHub release 常见格式）：全部记录，多个时不随机选
+                embeddedIPAPaths.append(path)
             }
         }
 
         if hasCertificate { return .certificateBundle }
         if hasAppBundle { return .appPackage }
+        // 多个内嵌 .ipa：绝不静默随机选择，交上层明确告知用户全部候选
+        if embeddedIPAPaths.count > 1 { return .multipleIPAs(embeddedIPAPaths) }
 
         // 内嵌 .ipa：单条目解出并复制到 Documents/IPA 持久位置（唯一后缀，绝不覆盖旧文件）
-        if let ipaEntry = embeddedIPAPath {
+        if let ipaEntry = embeddedIPAPaths.first {
             let entryName = (ipaEntry as NSString).lastPathComponent
             let ipaBase = (entryName as NSString).deletingPathExtension
             let ipaDir = self.fileManager.directoryURL(.ipa)
@@ -980,6 +992,12 @@ final class AppState: ObservableObject {
     /// 扫描一致；本 App 管理目录内的产物不算投递）。
     private func isDeliveryPath(_ url: URL) -> Bool {
         if url.path.hasPrefix(inboxURL.path + "/") { return true }
+        // Incoming 接收队列：扩展落盘的任务文件（结算语义与投递一致——成功删源、
+        // 失败保留，任务 JSON 的终态由结算钩子回写）
+        for incoming in AppGroup.allIncomingURLsIfPresent
+        where url.path.hasPrefix(incoming.path + "/") {
+            return true
+        }
         for groupInbox in AppGroup.allInboxURLsIfPresent
         where url.path.hasPrefix(groupInbox.path + "/") {
             return true
@@ -1113,8 +1131,14 @@ final class AppState: ObservableObject {
             handleFileOpenedFromOutside(file, force: isInSystemInbox)
             importedCount += 1
         }
-        // 可见化反馈：只在真的开始导入时提示（旧版"已处理过"分支每次回前台都弹，
-        // 属于打扰）
+        // Incoming 接收队列扫描：认领扩展落盘的待处理任务（含上次进程死亡滞留的
+        // processing），逐个交给统一导入入口；任务终态由结算钩子回写
+        for (task, fileURL) in IncomingFileScanner.scanAndClaim() {
+            ExternalDeliveryJournal.record("接收任务开始处理: \(task.originalFileName)（id \(task.id.uuidString.prefix(8))）")
+            Logger.info("接收任务进入流水线: \(task.originalFileName) type=\(task.type)")
+            handleFileOpenedFromOutside(fileURL, force: true, taskID: task.id)
+            importedCount += 1
+        }
         if importedCount > 0 {
             showToast("收到 \(importedCount) 个分享文件，正在导入…")
         }
@@ -1172,11 +1196,12 @@ final class AppState: ObservableObject {
 
     /// - Parameter force: 系统主动投递的 open 事件（launchOptions/openURL/onOpenURL）
     ///   传 true：用户主动分享是明确意图，绕过已结算拦截重新导入；回前台扫描
-    ///   兜底路径传 false，维持既有去重语义。
-    ///   注意顺序：URL 事件去重只拦非强制触发——force 必须能穿透它，否则"强制"
-    ///   语义在函数最前面就被吞掉（先 dedupe 后判断 force 的结构里 force 从未
-    ///   真正生效过）。
-    func handleFileOpenedFromOutside(_ url: URL, force: Bool = false) {
+    ///   兜底路径传 false，维持既有去重语义。URL 事件去重只拦非强制触发——
+    ///   force 必须能穿透它，否则"强制"语义在函数最前面就被吞掉。
+    /// - Parameter taskID: 由 Incoming 接收队列（Share Extension 落盘的任务 JSON）
+    ///   认领而来的任务 id；结算时回写任务终态（completed/failed+原因），
+    ///   让任务列表能跨进程反映全流程结果
+    func handleFileOpenedFromOutside(_ url: URL, force: Bool = false, taskID: UUID? = nil) {
         let now = Date()
         if !force,
            url.absoluteString == lastOpenedExternalURL,
@@ -1233,6 +1258,8 @@ final class AppState: ObservableObject {
             inboxSettlement = { [weak self] note, succeeded in
                 guard let self = self else { return }
                 self.pendingInboxImports.remove(url.path)
+                // 接收任务终态回写：Incoming 队列的任务随导入结果完结
+                ImportTaskStore.finish(taskID: taskID, succeeded: succeeded, note: note)
                 // 内容身份在删除前取（删除后属性读不到）
                 let identity = Self.deliveryIdentity(for: url)
                 if succeeded {

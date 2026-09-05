@@ -152,9 +152,18 @@ final class ShareViewController: UIViewController {
                 }
                 let fileName = Self.resolvedIncomingFileName(tempURL: url, provider: provider)
                 do {
-                    let dest = try AppGroup.saveIncomingFile(at: url, preferredFileName: fileName)
-                    AppGroup.appendExtensionLog("已保存(\(index + 1)/\(jobs.count))：\(dest.lastPathComponent)")
-                    saved.append(dest.lastPathComponent)
+                    // 接收三步：复制（UUID 命名）→ 创建任务 JSON → 读回验证。
+                    // 三步全部成功才算接收完成；任务未持久化绝不结束请求，
+                    // 否则会出现"有时候能用有时候没反应/主 App 找不到文件"
+                    let (dest, storedName) = try AppGroup.saveIncomingFile(at: url, preferredFileName: fileName)
+                    let taskType = (fileName as NSString).pathExtension.lowercased()
+                    let task = ImportTask(originalFileName: fileName, storedFileName: storedName, type: taskType)
+                    guard ImportTaskStore.create(task) else {
+                        throw NSError(domain: "ImportTask", code: 1,
+                                      userInfo: [NSLocalizedDescriptionKey: "任务记录写入失败（任务未持久化，拒绝结束请求）"])
+                    }
+                    AppGroup.appendExtensionLog("[task] created id=\(task.id.uuidString.prefix(8)) file=\(storedName) type=\(taskType)")
+                    saved.append(fileName)
                 } catch {
                     AppGroup.appendExtensionLog("失败：保存失败（\(error.localizedDescription)）")
                     failed += 1
@@ -239,11 +248,18 @@ final class ShareViewController: UIViewController {
         }
         let fileName = Self.resolvedIncomingFileName(tempURL: url, provider: provider)
         do {
-            let saved = try AppGroup.saveIncomingFile(at: url, preferredFileName: fileName)
-            AppGroup.appendExtensionLog("已保存：\(saved.lastPathComponent)")
+            // 接收三步：复制（UUID 命名）→ 创建任务 JSON → 读回验证（见 receiveFiles）
+            let (dest, storedName) = try AppGroup.saveIncomingFile(at: url, preferredFileName: fileName)
+            let taskType = (fileName as NSString).pathExtension.lowercased()
+            let task = ImportTask(originalFileName: fileName, storedFileName: storedName, type: taskType)
+            guard ImportTaskStore.create(task) else {
+                throw NSError(domain: "ImportTask", code: 1,
+                              userInfo: [NSLocalizedDescriptionKey: "任务记录写入失败（任务未持久化，拒绝结束请求）"])
+            }
+            AppGroup.appendExtensionLog("[task] created id=\(task.id.uuidString.prefix(8)) file=\(storedName) type=\(taskType)")
             DispatchQueue.main.async {
                 self.updateStatus(
-                    "已接收「\(saved.lastPathComponent)」\n\n正在拉起 IPA Manager…",
+                    "已接收「\(fileName)」\n\n正在拉起 IPA Manager…",
                     success: true
                 )
                 // 延长成功提示显示时间（5秒），让用户看清状态

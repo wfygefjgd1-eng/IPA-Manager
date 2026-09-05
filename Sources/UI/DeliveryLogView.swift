@@ -15,6 +15,14 @@ struct DeliveryLogView: View {
     @ObservedObject private var appState = AppState.shared
     /// 过滤器：全部 / 仅扩展 / 仅异常
     @State private var filter: Filter = .all
+    /// 最近导入任务（Incoming 接收队列的任务 JSON，跨进程持久）
+    @State private var importTasks: [ImportTask] = []
+
+    /// 手动刷新：触发一轮投递扫描 + 重载任务列表
+    private func reload() {
+        appState.processInboxFilesIfNeeded()
+        importTasks = ImportTaskStore.recentTasks(limit: 5)
+    }
 
     enum Filter: String, CaseIterable {
         case all = "全部"
@@ -41,6 +49,12 @@ struct DeliveryLogView: View {
                     .padding(.horizontal, 16)
                     .padding(.top, 12)
 
+                if !importTasks.isEmpty {
+                    importTasksCard
+                        .padding(.horizontal, 16)
+                        .padding(.top, 10)
+                }
+
                 Picker("过滤", selection: $filter) {
                     ForEach(Filter.allCases, id: \.self) { filter in
                         Text(filter.rawValue).tag(filter)
@@ -50,8 +64,10 @@ struct DeliveryLogView: View {
                 .padding(.horizontal, 16)
                 .padding(.vertical, 10)
 
-                if visibleEntries.isEmpty {
+                if visibleEntries.isEmpty && importTasks.isEmpty {
                     emptyState
+                } else if visibleEntries.isEmpty {
+                    Spacer()
                 } else {
                     entryList
                 }
@@ -63,7 +79,7 @@ struct DeliveryLogView: View {
                     Button {
                         // 手动触发一轮投递扫描（含扩展日志吞入与 UI 同步），
                         // 排查时不必切后台再回前台来触发扫描
-                        appState.processInboxFilesIfNeeded()
+                        reload()
                     } label: {
                         Image(systemName: "arrow.clockwise")
                     }
@@ -93,7 +109,7 @@ struct DeliveryLogView: View {
             }
             .onAppear {
                 // 打开页面即扫描一次：用户从分享动作直接进日志页时立刻看到最新状态
-                appState.processInboxFilesIfNeeded()
+                reload()
             }
         }
     }
@@ -151,6 +167,68 @@ struct DeliveryLogView: View {
             Text(value)
                 .font(.caption)
                 .textSelection(.enabled)
+        }
+    }
+
+    // MARK: - 导入任务列表
+
+    /// 最近导入任务卡：Incoming 队列的任务跨进程持久（扩展写入 pending →
+    /// 主 App 认领处理 → 结算回写 completed/failed+原因），让"分享出去的那次
+    /// 投递"在 App 里有一个明确的归宿，而不是只留下一条日志。
+    private var importTasksCard: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text("最近导入任务")
+                .font(.caption.weight(.semibold))
+                .foregroundColor(.secondary)
+            ForEach(Array(importTasks.enumerated()), id: \.offset) { _, task in
+                VStack(alignment: .leading, spacing: 2) {
+                    HStack(spacing: 6) {
+                        Text(taskStatusText(task.status))
+                            .font(.caption2.weight(.medium))
+                            .foregroundColor(taskStatusColor(task.status))
+                        Text(task.originalFileName)
+                            .font(.caption)
+                            .lineLimit(1)
+                            .truncationMode(.middle)
+                    }
+                    if let error = task.error {
+                        Text(error)
+                            .font(.caption2)
+                            .foregroundColor(.red)
+                            .lineLimit(2)
+                    }
+                }
+            }
+        }
+        .padding(12)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(
+            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                .fill(Color(UIColor.systemGray6))
+        )
+    }
+
+    private func taskStatusText(_ status: ImportTask.Status) -> String {
+        switch status {
+        case .pending: return "待处理"
+        case .copying: return "复制中"
+        case .copied: return "已接收"
+        case .processing: return "导入中"
+        case .extracting: return "解压中"
+        case .parsing: return "解析中"
+        case .signing: return "签名中"
+        case .signed: return "签名完成"
+        case .installing: return "安装中"
+        case .completed: return "完成"
+        case .failed: return "失败"
+        }
+    }
+
+    private func taskStatusColor(_ status: ImportTask.Status) -> Color {
+        switch status {
+        case .completed: return .green
+        case .failed: return .red
+        default: return .secondary
         }
     }
 
