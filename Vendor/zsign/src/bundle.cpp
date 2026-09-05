@@ -438,7 +438,7 @@ bool ZBundle::SignNode(jvalue& jvNode)
 			const string strIdPart = strAppId.substr(dot + 1);
 			return (strIdPart == "*") || (strBundleId.rfind(strIdPart, 0) == 0);
 		};
-		const ZSignAsset* matched = NULL;
+		ZSignAsset* matched = NULL;
 		if (m_pSignAssets != NULL) {
 			for (auto it = m_pSignAssets->rbegin(); it != m_pSignAssets->rend(); ++it) {
 				if (matchesBundle(*it)) {
