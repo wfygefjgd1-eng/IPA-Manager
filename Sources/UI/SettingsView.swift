@@ -69,6 +69,17 @@ struct SettingsView: View {
                         )
                     }
                     .rowCard()
+                    Button {
+                        clearDiagnosticCaches()
+                    } label: {
+                        actionRow(
+                            icon: "paintbrush",
+                            tint: .orange,
+                            title: "清除诊断缓存",
+                            subtitle: "清空投递日志、失败记录与最近日志缓冲"
+                        )
+                    }
+                    .rowCard()
                 } header: {
                     sectionHeader(icon: "wrench.and.screwdriver", title: "诊断与反馈")
                 }
@@ -291,6 +302,20 @@ struct SettingsView: View {
             Logger.error("诊断报告写入失败: \(error.localizedDescription)")
             reportError = "诊断报告生成失败: \(error.localizedDescription)"
         }
+    }
+
+    /// 清除诊断缓存：投递日志（含扩展吞入记录）、失败专区（内存+持久化）、
+    /// 最近日志缓冲、已导出的临时报告文件。让下一轮排查从干净状态开始，
+    /// 不会被历史噪音淹没。
+    private func clearDiagnosticCaches() {
+        ExternalDeliveryJournal.clear()
+        Logger.clearAll()
+        if let last = Self.lastReportURL {
+            try? FileManager.default.removeItem(at: last)
+            Self.lastReportURL = nil
+        }
+        reportError = nil
+        AppState.shared.showToast("诊断缓存已清空")
     }
 }
 

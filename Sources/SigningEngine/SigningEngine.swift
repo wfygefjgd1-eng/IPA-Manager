@@ -234,10 +234,16 @@ final class SigningEngine: SigningEngineProtocol {
         let entrySet = Set(entries)
         let missing = appexDirs.sorted().filter { !entrySet.contains($0 + "embedded.mobileprovision") }
         if missing.isEmpty {
-            Logger.info("签名产物校验通过: \(appexDirs.count) 个扩展全部嵌入 embedded.mobileprovision")
+            let note = "签名产物校验通过: \(appexDirs.count) 个扩展全部嵌入 embedded.mobileprovision"
+            Logger.info(note)
+            // 持久化到投递日志（Logger 的 INFO 是进程内存态，重装后即丢；
+            // 校验结论必须跨启动可查，才能确认"扩展描述文件"修复在真机上生效）
+            ExternalDeliveryJournal.record(note, level: .ok)
         } else {
             let names = missing.map { $0.split(separator: "/").last.map(String.init) ?? $0 }.joined(separator: "、")
-            Logger.error("签名产物校验: \(missing.count)/\(appexDirs.count) 个扩展缺少 embedded.mobileprovision（iOS 17+ 将拒绝加载该扩展）: \(names)")
+            let note = "签名产物校验: \(missing.count)/\(appexDirs.count) 个扩展缺少 embedded.mobileprovision（iOS 17+ 将拒绝加载该扩展）: \(names)"
+            Logger.error(note)
+            ExternalDeliveryJournal.record(note, level: .error)
         }
     }
 

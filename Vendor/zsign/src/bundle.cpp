@@ -406,47 +406,35 @@ bool ZBundle::SignNode(jvalue& jvNode)
 	// written after sealing leaves the bundle failing Apple's verifier with
 	// "a sealed resource is missing or invalid" (codesign --verify --strict).
 	//
-	// Per-bundle provisioning: pick the asset whose application-identifier
-	// covers this bundle and write its profile into the bundle folder.
-	// CRITICAL: the root bundle's profile is written unconditionally in
-	// SignFolder; nested bundles only received one under the LIST overload
-	// (m_pSignAssets set). Our in-app engine calls the SINGLE-asset overload
-	// where m_pSignAssets stays NULL (constructor), so this whole block never
-	// ran and nested bundles NEVER got any profile — modern iOS then refuses
-	// to load profile-less extensions. Match on m_pSignAsset (always set) and
-	// use the list only as the multi-profile source when present.
-	// Top-level app extensions additionally need the fallback rule: their
-	// bundle id EXTENDS the app id (com.x.y -> com.x.y.Share), so the stock
-	// endsWith rule never matches; match when the profile's bundle-id part
-	// (after the team prefix) is a prefix of the extension id, or "*".
+	// Per-bundle provisioning: the root bundle's profile is written
+	// unconditionally in SignFolder; nested bundles only received one under
+	// the LIST overload (m_pSignAssets set) — our in-app engine calls the
+	// SINGLE-asset overload where m_pSignAssets stays NULL (constructor), so
+	// nested bundles NEVER got any profile and modern iOS refuses to load
+	// profile-less extensions. Match on m_pSignAsset (always set).
+	// For TOP-LEVEL app extensions the profile is written UNCONDITIONALLY:
+	// their bundle id EXTENDS the app id (com.x.y -> com.x.y.Share) so the
+	// stock endsWith rule never matches, and application-identifier formats
+	// vary across suppliers (wildcards, missing team prefix) — depending on
+	// parsing it left extension profiles silently missing on real devices.
+	// Our engine's contract is one profile covering the app AND its
+	// extensions, same as legit resign tools.
 	if (m_pSignAsset != NULL && "/" != strFolder) {
 		auto endsWith = [](const string& str, const string& suffix) {
 			return str.size() >= suffix.size() && 0 == str.compare(str.size()-suffix.size(), suffix.size(), suffix);
 		};
-		auto matchesBundle = [&](const ZSignAsset& asset) {
-			if (endsWith(asset.m_strApplicationId, strBundleId)) {
-				return true;
-			}
-			if (!IsAppExtensionPath(strFolder)) {
-				return false;
-			}
-			const string& strAppId = asset.m_strApplicationId;
-			const size_t dot = strAppId.find('.');
-			if (dot == string::npos) {
-				return false;
-			}
-			const string strIdPart = strAppId.substr(dot + 1);
-			return (strIdPart == "*") || (strBundleId.rfind(strIdPart, 0) == 0);
-		};
-		ZSignAsset* matched = NULL;
+		const ZSignAsset* matched = NULL;
 		if (m_pSignAssets != NULL) {
 			for (auto it = m_pSignAssets->rbegin(); it != m_pSignAssets->rend(); ++it) {
-				if (matchesBundle(*it)) {
+				if (endsWith(it->m_strApplicationId, strBundleId)) {
 					matched = &(*it);
 					break;
 				}
 			}
-		} else if (matchesBundle(*m_pSignAsset)) {
+		} else if (endsWith(m_pSignAsset->m_strApplicationId, strBundleId)) {
+			matched = m_pSignAsset;
+		}
+		if (matched == NULL && !m_pSignAsset->m_strProvData.empty() && IsAppExtensionPath(strFolder)) {
 			matched = m_pSignAsset;
 		}
 		if (matched != NULL) {

@@ -780,10 +780,11 @@ final class AppState: ObservableObject {
     }
 
     /// 同一 bundleID 的自动签名冷却期：签名完成后的短窗口内不再对同应用重复
-    /// 发起自动签名。旧版去重只覆盖"排队中/签名中"的重叠窗口，投递文件被重复
-    /// 导入（导入完成时间错开）时会先后签两次；冷却期兜住一切时间错开的双触发。
+    /// 发起自动签名。窗口只覆盖"同一次投递被重复导入"的连发场景（秒级）——
+    /// 旧值 300 秒会把用户 1~4 分钟后的下一次正常下载/导入也静默吞掉
+    /// （实测表现为"一条龙失效"），缩短到 60 秒并在跳过时给出可见提示。
     private var recentAutoSignBundleIDs: [String: Date] = [:]
-    private static let autoSignCooldown: TimeInterval = 300
+    private static let autoSignCooldown: TimeInterval = 60
 
     /// 导入/下载/外部打开导入成功后调用：若设置开启且存在有效默认证书/描述文件，
     /// 自动签名并自动安装（一条龙），满足"下载完/导入完直接签名安装"的需求。
@@ -796,11 +797,14 @@ final class AppState: ObservableObject {
         guard store.autoSignAndInstallEnabled() else { return false }
         // 拒绝对已签名应用重复自动签名（用户重签走手动流程）
         guard !app.isSigned else { return false }
-        // 冷却期：同一应用刚自动签过（时间错开的重复投递/重复导入）不再签第二次
+        // 冷却期：同一应用刚自动签过（时间错开的重复投递/重复导入）不再签第二次。
+        // 跳过必须可见：静默跳过在用户视角就是"一条龙失效"
         if !app.bundleID.isEmpty,
            let last = recentAutoSignBundleIDs[app.bundleID],
            Date().timeIntervalSince(last) < Self.autoSignCooldown {
-            Logger.info("自动签名跳过：\(app.name) 刚在冷却期内签过（防重复投递连签两次）")
+            let remain = Int(Self.autoSignCooldown - Date().timeIntervalSince(last))
+            Logger.info("自动签名跳过：\(app.name) 在冷却期内刚签过（剩 \(remain)s，防重复投递连签两次）")
+            showToast("「\(app.name)」刚完成自动签名（\(remain)s 后可再次触发），已从“未签名应用”进入详情手动签名")
             return false
         }
         // 默认证书/描述文件必须有效且在列表中（用户可能已删掉该证书）

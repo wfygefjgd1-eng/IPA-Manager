@@ -67,6 +67,16 @@ enum Logger {
         failureEntries = stored
     }
 
+    /// 清空全部诊断缓冲（设置页"清除诊断缓存"）：内存最近日志、失败专区
+    /// 与其持久化副本一并清空；投递日志由 ExternalDeliveryJournal.clear() 负责
+    static func clearAll() {
+        lock.lock()
+        defer { lock.unlock() }
+        recentEntries.removeAll()
+        failureEntries.removeAll()
+        UserDefaults.standard.removeObject(forKey: failureStorageKey)
+    }
+
     /// 失败专区落盘（调用方必须已持锁；环形上限与内存一致）
     private static func persistFailuresLocked() {
         if let data = try? JSONEncoder().encode(failureEntries) {
