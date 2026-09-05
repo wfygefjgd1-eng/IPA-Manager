@@ -41,6 +41,10 @@ final class Installer: Installing {
         var serverStarted = false
         do {
             let ipaURL = URL(fileURLWithPath: ipaPath)
+            // 安装全生命周期持久化留痕（跨启动可查）："弹不出安装界面"这类问题
+            // 只能靠这条链路定位——open 是否受理、SpringBoard 是否来拉取、传输
+            // 是否完成，任何一环断了报告直接可见
+            ExternalDeliveryJournal.record("安装流程开始: \(ipaURL.lastPathComponent)")
             // 本地服务器只负责流式提供 IPA；manifest 走公网 HTTPS
             // （api.palera.in /genPlist 生成，Feather 同款），绕开 iOS 27
             // 系统安装进程拒绝本地 HTTP manifest、以及蜂窝 CGNAT IP 本机
@@ -132,11 +136,13 @@ final class Installer: Installing {
                         // 记录"安装已发起"活动：回前台/保活超时据此识别安装仍在进行，
                         // 不停服务器（用户在系统安装弹窗停留时切回 App 是常见操作）
                         LocalInstallServer.shared.noteInstallOpened()
+                        ExternalDeliveryJournal.record("安装链接已打开（itms），等待系统安装弹窗", level: .ok)
                         // open 成功后才通知调用方（如"自动回桌面"的调度锚点）：
                         // 主线程回调
                         onInstallOpened?()
                     } else {
                         Logger.error("无法打开 itms-services 链接")
+                        ExternalDeliveryJournal.record("安装链接打开失败（itms open 被系统拒绝）", level: .error)
                         // 后台失败同步抛不回去，补一条用户可见反馈
                         AppState.shared.showToast("安装失败：无法打开安装链接")
                         self?.stopServer()

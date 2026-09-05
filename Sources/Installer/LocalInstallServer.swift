@@ -149,8 +149,12 @@ final class LocalInstallServer {
     ///    （ready 等待，最长 5 秒）isRunning 仍为 false，不能据此判空闲；
     /// 2) 上一个会话的 IPA 已完整发出（EOF / 传输中止）且距今超过 5 秒——
     ///    SpringBoard 下载完成后（或已断开）不再需要旧服务器，可安全重启；
-    /// 3) 等待超过 15 分钟硬上限：用户把系统安装确认弹窗无限期挂着时放弃等待，
-    ///    由调用方给出明确错误（而不是掐死上一个安装）。
+    /// 3) **死会话解锁**：open 已发起但 SpringBoard 从未前来拉取（无任何请求/
+    ///    分块活动超过 45 秒）——该会话已无存在意义（典型成因：回桌面后进程
+    ///    被挂起、系统静默忽略弹窗），绝不能让下一次安装为它空等 15 分钟
+    ///    （实测"重新签名并安装/连续安装全部卡死、只有重启 App 才恢复"的根因；
+    ///    健康传输的分块活动会持续刷新活动时间戳，不受此规则影响）；
+    /// 4) 等待超过 15 分钟硬上限：兜底放弃等待，由调用方给出明确错误。
     /// 期间并发 stop() 会把 isRunning 置 false，循环随即退出。
     private func waitForPreviousInstallIdle() throws {
         let hardCap: TimeInterval = 15 * 60
@@ -160,6 +164,7 @@ final class LocalInstallServer {
             ServerQueue.shared.queue.sync {
                 idle = (!isRunning && !isStarting)
                     || (transferCompletedDate.map { Date().timeIntervalSince($0) >= 5 } ?? false)
+                    || (lastActivityDate.map { Date().timeIntervalSince($0) >= 45 } ?? false)
             }
             if idle { return }
             if Date().timeIntervalSince(began) >= hardCap {
@@ -451,10 +456,12 @@ final class LocalInstallServer {
         if path == "/manifest.plist" {
             let manifest = manifestData ?? Data()
             Logger.info("响应 manifest.plist: \(manifest.count) 字节")
+            ExternalDeliveryJournal.record("SpringBoard 已拉取 manifest.plist（弹窗即将出现）", level: .ok)
             let response = httpResponse(status: 200, contentType: "application/xml", body: manifest)
             sendAndClose(response, connection: connection)
         } else if path.hasSuffix(".ipa") {
             Logger.info("开始流式发送 IPA: \(servingIPA?.lastPathComponent ?? "unknown")")
+            ExternalDeliveryJournal.record("SpringBoard 开始拉取 IPA")
             streamIPA(connection: connection)
         } else {
             Logger.info("未知路径 404: \(path)")
@@ -488,6 +495,7 @@ final class LocalInstallServer {
                 // 15 分钟硬上限。完成回调运行在服务器串行队列，直接写安全。
                 if error != nil {
                     self?.transferCompletedDate = Date()
+                    ExternalDeliveryJournal.record("IPA 传输中断（头部发送失败）: \(error!.localizedDescription)", level: .error)
                 }
                 return
             }
@@ -511,6 +519,7 @@ final class LocalInstallServer {
             // 整个 IPA 已完整发出：记录 EOF 时刻。连续安装的下一个 start()
             // 据此判定"上一个会话已空闲"（见 waitForPreviousInstallIdle）。
             transferCompletedDate = Date()
+            ExternalDeliveryJournal.record("IPA 传输完成（等待用户在系统弹窗确认安装）", level: .ok)
             try? handle.close()
             self.connections.removeAll { $0 === connection }
             connection.cancel()
@@ -532,6 +541,7 @@ final class LocalInstallServer {
                 // 取消时多写一次无害：stop 已置 isRunning=false，判定照样视为空闲。
                 if error != nil {
                     self?.transferCompletedDate = Date()
+                    ExternalDeliveryJournal.record("IPA 传输中断（对端断开: \(error!.localizedDescription)）", level: .error)
                 }
                 return
             }
