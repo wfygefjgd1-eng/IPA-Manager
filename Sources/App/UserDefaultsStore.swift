@@ -27,6 +27,10 @@ final class UserDefaultsStore {
         /// 上次记录到投递日志的共享容器组集合：组集合变化（重签换描述文件/组漂移）
         /// 才记日志，避免每次冷启动都重复"共享容器：可用"刷屏
         static let lastKnownContainerSet = "last_known_container_set"
+        /// 已导入投递文件的内容身份（文件名|大小|mtime）：路径去重之外的最后一道
+        /// 防线——路径会因移动/重命名/结算删除失败而失效，内容身份与路径无关，
+        /// 保证同一个文件（即使换位置）不会被反复导入
+        static let importedDeliveryIdentities = "imported_delivery_identities"
         /// 所有需要检查 TTL 的持久化键集合
         static let allPersistedKeys: [String] = [
             certificates, profiles, signingTasks, downloadTasks, importedApps
@@ -152,6 +156,18 @@ final class UserDefaultsStore {
 
     func saveLastKnownContainerSet(_ value: String) {
         defaults.set(value, forKey: Keys.lastKnownContainerSet)
+    }
+
+    // MARK: - 已导入投递文件内容身份
+
+    func loadImportedDeliveryIdentities() -> [String] {
+        load([String].self, key: Keys.importedDeliveryIdentities) ?? []
+    }
+
+    func saveImportedDeliveryIdentities(_ identities: [String]) {
+        // 上限截断：身份串短（<100 字节），200 条足够回溯；超限丢最旧的，
+        // 代价只是极旧文件再导入一次
+        save(Array(identities.suffix(200)), key: Keys.importedDeliveryIdentities)
     }
 
     // MARK: - 自动流程开关（默认开启）

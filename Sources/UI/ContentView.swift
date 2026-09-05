@@ -36,13 +36,16 @@ struct ContentView: View {
                 }
                 .tag(4)
         }
-        // 统一浮层：导入进度卡与全局 toast 同挂一个容器、垂直排布。
+        // 统一浮层：导入进度卡/自动流水线卡/全局 toast 同挂一个容器、垂直排布。
         // 旧实现分挂 ContentView / HomeView 两个容器还互设 zIndex——zIndex 只在
         // 同级兄弟间排序，跨容器必然叠压（批量导入时黑色胶囊直接叠在一起）。
         .overlay(alignment: .bottom) {
             VStack(spacing: 8) {
                 if let progress = appState.importProgress {
                     importProgressCard(progress)
+                }
+                if let pipeline = appState.autoPipelineStatus {
+                    pipelineCard(pipeline)
                 }
                 if let message = appState.toastMessage {
                     Text(message)
@@ -59,6 +62,7 @@ struct ContentView: View {
         }
         .animation(.easeInOut(duration: 0.25), value: appState.toastMessage)
         .animation(.easeInOut(duration: 0.25), value: appState.importProgress)
+        .animation(.easeInOut(duration: 0.25), value: appState.autoPipelineStatus)
         .onChange(of: scenePhase) { phase in
             // 回前台兜底扫描的主触发点：iOS 27 实测不再回调 UIApplicationDelegate 的
             // applicationDidBecomeActive（冷启动有投递日志而回前台扫描无记录），而
@@ -102,6 +106,43 @@ struct ContentView: View {
                     Text("\(progress.phase) \(Int((progress.progress * 100).rounded()))%")
                         .font(.caption2)
                         .opacity(0.85)
+                }
+            }
+            .foregroundColor(.white)
+        }
+        .padding(.horizontal, 16)
+        .padding(.vertical, 12)
+        .background(Capsule().fill(Color.black.opacity(0.8)))
+    }
+
+    /// 自动一条龙流水线状态卡：签名与发起安装阶段原本完全无反馈（大包 20-60 秒
+    /// 空白，用户以为卡死、切后台会掐断整条流水线），与导入进度卡同容器展示。
+    private func pipelineCard(_ pipeline: AppState.AutoPipelineStatus) -> some View {
+        HStack(spacing: 12) {
+            ZStack {
+                Circle()
+                    .fill(Color.blue.opacity(0.85))
+                    .frame(width: 40, height: 40)
+                Image(systemName: "hammer.fill")
+                    .font(.system(size: 16, weight: .semibold))
+                    .foregroundColor(.white)
+            }
+            VStack(alignment: .leading, spacing: 3) {
+                Text("\(pipeline.phase) \(pipeline.appName)")
+                    .font(.footnote)
+                    .fontWeight(.medium)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                if !pipeline.detail.isEmpty {
+                    Text(pipeline.detail)
+                        .font(.caption2)
+                        .opacity(0.85)
+                        .lineLimit(1)
+                }
+                if let progress = pipeline.progress {
+                    ProgressView(value: progress)
+                        .progressViewStyle(.linear)
+                        .tint(.white)
                 }
             }
             .foregroundColor(.white)

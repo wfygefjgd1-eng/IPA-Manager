@@ -116,6 +116,7 @@ final class AppState: ObservableObject {
 
     init() {
         processedInboxPaths = Set(store.loadProcessedInboxPaths())
+        importedDeliveryIdentities = Set(store.loadImportedDeliveryIdentities())
         loadPersistedState()
         // 启动孤儿清扫放在首次“已签应用”扫描完成之后执行：refreshInstalledApps
         // 的解析会创建新的解压目录，且 installedApps 到此刻才就绪——若清扫与
@@ -735,6 +736,42 @@ final class AppState: ObservableObject {
 
     // MARK: - 自动签名并安装（导入/下载完成后一条龙）
 
+    /// 自动一条龙流水线状态（导入→签名→发起安装）：nil = 空闲。
+    /// 旧版签名阶段给 signApp 传空进度回调，大包签名 20-60 秒界面完全空白，
+    /// 用户以为 App 卡死、频繁切后台把导入/签名进程掐死（投递文件结算不了，
+    /// 下次启动又重新导入——"重复导入/连续签两次"的连锁根源之一）。
+    struct AutoPipelineStatus: Equatable {
+        let appName: String
+        /// 阶段名：正在签名 / 发起安装 / 安装已发起
+        let phase: String
+        /// 阶段内明细（zsign 阶段文字、系统提示指引等）
+        let detail: String
+        /// 0~1，签名阶段有效；安装阶段为 nil（无可靠进度）
+        let progress: Double?
+    }
+
+    @Published var autoPipelineStatus: AutoPipelineStatus?
+
+    private func setPipelineStatus(_ appName: String, _ phase: String, _ detail: String = "", progress: Double? = nil) {
+        DispatchQueue.main.async {
+            self.autoPipelineStatus = AutoPipelineStatus(
+                appName: appName, phase: phase, detail: detail, progress: progress
+            )
+        }
+    }
+
+    func clearPipelineStatus() {
+        DispatchQueue.main.async {
+            self.autoPipelineStatus = nil
+        }
+    }
+
+    /// 同一 bundleID 的自动签名冷却期：签名完成后的短窗口内不再对同应用重复
+    /// 发起自动签名。旧版去重只覆盖"排队中/签名中"的重叠窗口，投递文件被重复
+    /// 导入（导入完成时间错开）时会先后签两次；冷却期兜住一切时间错开的双触发。
+    private var recentAutoSignBundleIDs: [String: Date] = [:]
+    private static let autoSignCooldown: TimeInterval = 300
+
     /// 导入/下载/外部打开导入成功后调用：若设置开启且存在有效默认证书/描述文件，
     /// 自动签名并自动安装（一条龙），满足"下载完/导入完直接签名安装"的需求。
     /// 串行队列逐条处理（zsign 并发不安全）；失败时 toast 具体中文原因，不静默。
@@ -746,6 +783,13 @@ final class AppState: ObservableObject {
         guard store.autoSignAndInstallEnabled() else { return false }
         // 拒绝对已签名应用重复自动签名（用户重签走手动流程）
         guard !app.isSigned else { return false }
+        // 冷却期：同一应用刚自动签过（时间错开的重复投递/重复导入）不再签第二次
+        if !app.bundleID.isEmpty,
+           let last = recentAutoSignBundleIDs[app.bundleID],
+           Date().timeIntervalSince(last) < Self.autoSignCooldown {
+            Logger.info("自动签名跳过：\(app.name) 刚在冷却期内签过（防重复投递连签两次）")
+            return false
+        }
         // 默认证书/描述文件必须有效且在列表中（用户可能已删掉该证书）
         guard let cert = selectedCertificate, cert.status == .valid,
               certificates.contains(where: { $0.id == cert.id }) else {
@@ -799,17 +843,26 @@ final class AppState: ObservableObject {
         }
         isAutoSigning = true
         currentAutoSignBundleID = app.bundleID
+        setPipelineStatus(app.name, "正在签名…", "请保持 App 在前台，签名完成后自动发起安装")
         Logger.info("自动签名开始: \(app.name)")
-        signApp(app, certificate: cert, profile: profile, progress: { _, _ in }) { [weak self] result in
+        signApp(app, certificate: cert, profile: profile, progress: { [weak self] p, phase in
+            // 真实进度上屏：签名是大 IO（解压+签名+重打包，大包 20-60 秒），
+            // 没有可见反馈时用户以为卡死（切后台会掐断整个流水线）
+            self?.setPipelineStatus(app.name, "正在签名…", phase, progress: p)
+        }) { [weak self] result in
             guard let self = self else { return }
             self.isAutoSigning = false
             self.currentAutoSignBundleID = nil
             self.autoSigningAppIDs.remove(app.id)
             switch result {
             case .success(let signedPath):
+                if !app.bundleID.isEmpty {
+                    self.recentAutoSignBundleIDs[app.bundleID] = Date()
+                }
                 self.autoSignAndInstallSucceeded(app: app, signedPath: signedPath, certificate: cert)
             case .failure(let error):
                 Logger.error("自动签名失败: \(app.name) - \(error.localizedDescription)")
+                self.clearPipelineStatus()
                 self.showToast("自动签名失败：\(error.localizedDescription)")
             }
             self.pumpAutoSignQueue()
@@ -819,6 +872,9 @@ final class AppState: ObservableObject {
     /// 自动签名成功后：发起安装；若设置开启"签名完成自动返回桌面"，在 itms-services
     /// open 成功后延迟回桌面（iOS 随即弹出"是否安装"确认，省去手动点"返回"）。
     private func autoSignAndInstallSucceeded(app: AppInfo, signedPath: String, certificate: CertificateInfo) {
+        // 发起安装阶段（本地服务器启动 + manifest 生成 + 预检，约 2-5 秒）也上屏：
+        // 这段同样无反馈，是"空白后突然弹安装窗"观感的另一半来源
+        setPipelineStatus(app.name, "正在发起安装…", "启动本地安装通道")
         do {
             try installSignedPath(signedPath, certificate: certificate) { [weak self] in
                 // itms-services open 成功后（主线程回调）才调度回桌面。此前固定 1.2s
@@ -826,6 +882,11 @@ final class AppState: ObservableObject {
                 // 生成常超 1.2s——App 先退到后台，open 随后才执行会被系统忽略
                 // （后台态 open 常被忽略），表现为"自动安装静默失败"。
                 guard let self = self else { return }
+                self.setPipelineStatus(app.name, "安装已发起", "请在系统弹窗点「安装」确认")
+                // 提示停留几秒后收卡（用户点确认/回桌面的时间足够看到结果）
+                DispatchQueue.main.asyncAfter(deadline: .now() + 6) { [weak self] in
+                    self?.clearPipelineStatus()
+                }
                 // 批量队列未清空时不回桌面：保持前台逐个弹系统安装确认，最后一个
                 // 安装发起后才回桌面。
                 guard self.store.autoReturnHomeAfterSigningEnabled(), self.autoSignQueue.isEmpty else { return }
@@ -837,6 +898,7 @@ final class AppState: ObservableObject {
             Logger.info("自动签名并安装已发起: \(app.name)")
         } catch {
             Logger.error("自动签名完成但安装失败: \(app.name) - \(error.localizedDescription)")
+            clearPipelineStatus()
             showToast("自动签名完成，安装失败：\(error.localizedDescription)")
         }
     }
@@ -863,6 +925,20 @@ final class AppState: ObservableObject {
     /// 在途分享投递（内存，仅主线程读写）：投递开始处理即登记、结算后移除，
     /// 防 open 事件 × 回前台扫描 × 冷启动 launchOptions 对同一文件并发/重复触发导入。
     private var pendingInboxImports: Set<String> = []
+
+    /// 已导入投递文件的内容身份（持久化，仅主线程读写）：文件名|大小|mtime，
+    /// 与路径无关。路径去重（processedInboxPaths）在"文件移动过位置 / 结算删除
+    /// 失败 / 路径记录被剪枝"时会漏，漏掉的后果是每次进 App 都把同一文件重新
+    /// 导入一遍（用户实测）；内容身份是最后防线，结算时登记、扫描时拦截。
+    private var importedDeliveryIdentities: Set<String> = []
+
+    /// 投递文件内容身份：与路径无关的"同一文件"判据
+    private static func deliveryIdentity(for url: URL) -> String {
+        let attrs = try? FileManager.default.attributesOfItem(atPath: url.path)
+        let size = (attrs?[.size] as? Int64) ?? 0
+        let mtime = (attrs?[.modificationDate] as? Date)?.timeIntervalSince1970 ?? 0
+        return "\(url.lastPathComponent)|\(size)|\(Int(mtime))"
+    }
 
     /// 上次扫描指纹（内存）：容器集合 + 各投递目录计数。扫描是高频触发（一次回前台
     /// 最多 4 次），指纹不变就不落投递日志——旧版每次扫描固定刷 2~4 条"无文件"，
@@ -995,6 +1071,12 @@ final class AppState: ObservableObject {
                 }
                 continue
             }
+            // 内容身份去重：同一文件（即使被移动/换名失效过路径记录）不重复导入
+            let identity = Self.deliveryIdentity(for: file)
+            if importedDeliveryIdentities.contains(identity) {
+                Logger.info("跳过重复投递（同内容文件已导入过）: \(file.lastPathComponent)")
+                continue
+            }
             // 未登记 = open 事件丢失（正常投递的文件在结算时已自删，不会留到这里）。
             // 在途登记与重复投递拦截都在 handleFileOpenedFromOutside 内部完成。
             Logger.info("兜底导入（open 事件丢失）: \(file.lastPathComponent)")
@@ -1113,8 +1195,21 @@ final class AppState: ObservableObject {
                 self.pendingInboxImports.remove(url.path)
                 self.processedInboxPaths.insert(url.path)
                 self.store.saveProcessedInboxPaths(Array(self.processedInboxPaths))
-                try? FileManager.default.removeItem(at: url)
-                ExternalDeliveryJournal.record("投递结算: \(url.lastPathComponent)（\(note)；源文件已删）", level: .ok)
+                // 内容身份在删除前取（删除后属性读不到）：结算即登记，无论源文件
+                // 删除成败，同一文件都不会再被扫描导入
+                let identity = Self.deliveryIdentity(for: url)
+                self.importedDeliveryIdentities.insert(identity)
+                self.store.saveImportedDeliveryIdentities(Array(self.importedDeliveryIdentities))
+                var settleNote = note
+                do {
+                    try FileManager.default.removeItem(at: url)
+                } catch {
+                    // 删除失败必须留痕：文件残留时用户会看到"每次进 App 重复导入"，
+                    // 报告里能看到真实原因而不是只有一句已删
+                    Logger.error("投递源文件删除失败: \(url.lastPathComponent) - \(error.localizedDescription)")
+                    settleNote = "\(note)；源文件删除失败：\(error.localizedDescription)"
+                }
+                ExternalDeliveryJournal.record("投递结算: \(url.lastPathComponent)（\(settleNote)）", level: .ok)
             }
         }
 
