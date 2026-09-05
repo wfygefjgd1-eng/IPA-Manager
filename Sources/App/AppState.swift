@@ -151,6 +151,9 @@ final class AppState: ObservableObject {
         onSettled: ((Bool) -> Void)? = nil
     ) {
         Logger.info("下载完成，自动解析: \(url.lastPathComponent)")
+        // 持久化留痕：下载一条龙的入口信号（此前该阶段只有内存日志，
+        // 重装/崩溃即丢，"下载完没反应"无从定位）
+        ExternalDeliveryJournal.record("下载完成，进入自动解析: \(url.lastPathComponent)")
         let ext = url.pathExtension.lowercased()
         let isArchive = ext == "zip" || ext == "tgz" || ext == "tar"
             || (ext == "gz" && url.lastPathComponent.lowercased().hasSuffix(".tar.gz"))
@@ -604,6 +607,7 @@ final class AppState: ObservableObject {
                     self.saveState()
                     // 导入成功：清除进度
                     self.clearImportProgress()
+                    ExternalDeliveryJournal.record("导入完成: \(app.name)（\(app.bundleID)）", level: .ok)
                     completion(.success(app))
                     // 导入/下载/外部打开统一出口：一条龙自动签名并安装
                     // （开关默认开；默认证书/描述文件无效时自动跳过，不打扰用户；
@@ -892,6 +896,7 @@ final class AppState: ObservableObject {
         // 发起安装阶段（本地服务器启动 + manifest 生成 + 预检，约 2-5 秒）也上屏：
         // 这段同样无反馈，是"空白后突然弹安装窗"观感的另一半来源
         setPipelineStatus(app.name, "正在发起安装…", "启动本地安装通道")
+        ExternalDeliveryJournal.record("自动签名完成，发起安装: \(app.name)（\(signedPath.lastPathComponent)）")
         do {
             try installSignedPath(signedPath, certificate: certificate) { [weak self] in
                 // itms-services open 成功后（主线程回调）才调度回桌面。此前固定 1.2s
@@ -1076,18 +1081,21 @@ final class AppState: ObservableObject {
                 options: [.skipsHiddenFiles])) ?? []
         }
         let documentFiles = collectDocumentDeliverables()
+        // 先认领 Incoming 接收队列的待处理任务（数量纳入扫描指纹：
+        // 扩展落盘的新任务会让扫描行可见，"分享进来了但没反应"一眼可辨）
+        let incomingTasks = IncomingFileScanner.scanAndClaim()
 
         // 投递日志降噪：容器集合或任一目录计数变化才记一条；组集合与持久记忆不同
         // （重签换描述文件/组漂移）再单独记一条。静默扫描零日志。
         scanRunCount += 1
         let containers = AppGroup.usableContainers()
         let containerSet = containers.map { $0.identifier }.sorted().joined(separator: ",")
-        let fingerprint = "\(containerSet)|\(inboxFiles.count)|\(groupInboxFiles.count)|\(documentFiles.count)"
+        let fingerprint = "\(containerSet)|\(inboxFiles.count)|\(groupInboxFiles.count)|\(documentFiles.count)|\(incomingTasks.count)"
         if fingerprint != lastScanFingerprint {
             lastScanFingerprint = fingerprint
             let containerNote = containers.isEmpty ? "无可用" : containerSet
             ExternalDeliveryJournal.record(
-                "扫描：Inbox=\(inboxFiles.count) 共享Inbox=\(groupInboxFiles.count) Documents=\(documentFiles.count) 容器[\(containerNote)]"
+                "扫描：Inbox=\(inboxFiles.count) 共享Inbox=\(groupInboxFiles.count) Documents=\(documentFiles.count) 任务=\(incomingTasks.count) 容器[\(containerNote)]"
             )
             if containerSet != store.loadLastKnownContainerSet() {
                 store.saveLastKnownContainerSet(containerSet)
@@ -1149,9 +1157,9 @@ final class AppState: ObservableObject {
             handleFileOpenedFromOutside(file, force: isInSystemInbox)
             importedCount += 1
         }
-        // Incoming 接收队列扫描：认领扩展落盘的待处理任务（含上次进程死亡滞留的
-        // processing），逐个交给统一导入入口；任务终态由结算钩子回写
-        for (task, fileURL) in IncomingFileScanner.scanAndClaim() {
+        // Incoming 接收队列：处理前面已认领的任务（pending + 滞留 processing），
+        // 逐个交给统一导入入口；任务终态由结算钩子回写
+        for (task, fileURL) in incomingTasks {
             ExternalDeliveryJournal.record("接收任务开始处理: \(task.originalFileName)（id \(task.id.uuidString.prefix(8))）")
             Logger.info("接收任务进入流水线: \(task.originalFileName) type=\(task.type)")
             handleFileOpenedFromOutside(fileURL, force: true, taskID: task.id)

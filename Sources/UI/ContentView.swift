@@ -36,10 +36,11 @@ struct ContentView: View {
                 }
                 .tag(4)
         }
-        // 统一浮层：导入进度卡/自动流水线卡/全局 toast 同挂一个容器、垂直排布。
+        // 统一浮层：导入进度卡/自动流水线卡/全局 toast 同挂一个容器、垂直排布，
+        // 置于屏幕中央（用户要求：处理状态一眼可见，不再沉在底部被拇指遮挡）。
         // 旧实现分挂 ContentView / HomeView 两个容器还互设 zIndex——zIndex 只在
         // 同级兄弟间排序，跨容器必然叠压（批量导入时黑色胶囊直接叠在一起）。
-        .overlay(alignment: .bottom) {
+        .overlay(alignment: .center) {
             VStack(spacing: 8) {
                 if let progress = appState.importProgress {
                     importProgressCard(progress)
@@ -54,11 +55,9 @@ struct ContentView: View {
                         .padding(.vertical, 10)
                         .background(Capsule().fill(Color.black.opacity(0.8)))
                         .foregroundColor(.white)
-                        .padding(.bottom, 12)
                         .transition(.opacity.combined(with: .move(edge: .bottom)))
                 }
             }
-            .padding(.bottom, 12)
         }
         .animation(.easeInOut(duration: 0.25), value: appState.toastMessage)
         .animation(.easeInOut(duration: 0.25), value: appState.importProgress)
