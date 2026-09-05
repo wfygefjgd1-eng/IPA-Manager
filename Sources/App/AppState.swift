@@ -995,12 +995,12 @@ final class AppState: ObservableObject {
     /// 而 urls(for:.documentDirectory) 返回 /var/mobile/...）。直接 hasPrefix
     /// 永远失配——Documents 内的文件"投递识别=否"、永不结算、每次回前台重复
     /// 导入+重复签名（用户实测"跳转后一直发呆"的根因）。比较前统一剥前缀。
-    private static func normalizedDeliveryPath(_ path: String) -> String {
+    private func normalizedDeliveryPath(_ path: String) -> String {
         path.hasPrefix("/private/") ? String(path.dropFirst("/private".count)) : path
     }
 
     /// url 是否位于 directory 之下（/private 前缀归一化后比较）
-    private static func isPath(_ url: URL, under directory: URL) -> Bool {
+    private func isPath(_ url: URL, under directory: URL) -> Bool {
         normalizedDeliveryPath(url.path).hasPrefix(normalizedDeliveryPath(directory.path) + "/")
     }
 
