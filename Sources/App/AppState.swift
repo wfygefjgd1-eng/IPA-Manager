@@ -802,8 +802,11 @@ final class AppState: ObservableObject {
     /// 串行队列逐条处理（zsign 并发不安全）；失败时 toast 具体中文原因，不静默。
     /// 可被多次调用（多文件导入/下载完成），自动去重排队。
     /// 返回 true 表示本次自动签名已接管（调用方可据此跳过"打开签名详情页"等手动引导）。
+    /// - Parameter persist: 是否登记"待续跑"。常规入队 true；断点续跑的再入队
+    ///   传 false——续跑路径若再登记，签名途中一旦有任何致命错误就会形成
+    ///   "启动→续跑→崩溃→再启动"的死循环（实测教训）。
     @discardableResult
-    func enqueueAutoSignAndInstall(_ app: AppInfo) -> Bool {
+    func enqueueAutoSignAndInstall(_ app: AppInfo, persist: Bool = true) -> Bool {
         // 开关默认开启
         guard store.autoSignAndInstallEnabled() else { return false }
         // 拒绝对已签名应用重复自动签名（用户重签走手动流程）
@@ -847,8 +850,10 @@ final class AppState: ObservableObject {
         autoSigningAppIDs.insert(app.id)
         // 登记"待续跑"：自动签名/安装中途 App 被替换（重装新版）进程死亡时，
         // 重启后自动续跑（见 loadPersistedState 尾部的 resume）
-        pendingAutoSignPaths.insert(app.path)
-        store.savePendingAutoSignPaths(Array(pendingAutoSignPaths))
+        if persist {
+            pendingAutoSignPaths.insert(app.path)
+            store.savePendingAutoSignPaths(Array(pendingAutoSignPaths))
+        }
         pumpAutoSignQueue()
         return true
     }
@@ -1622,7 +1627,8 @@ final class AppState: ObservableObject {
                   !app.isSigned else { continue }
             Logger.info("续跑上次中断的自动签名: \(app.name)")
             ExternalDeliveryJournal.record("续跑上次中断的自动签名: \(app.name)")
-            enqueueAutoSignAndInstall(app)
+            // persist=false：续跑路径不再登记，杜绝任何未来的崩溃死循环
+            enqueueAutoSignAndInstall(app, persist: false)
         }
     }
 
