@@ -259,19 +259,16 @@ final class DownloadManager: NSObject {
             }
             guard let candidate = matched else { continue }
             if task.totalBytes > 0 {
-                // 认领守卫追加"中断前已收满"：同 URL 重复下载的两个任务产物同名
-                // 且同大小，仅凭大小一致无法区分归属。仅当崩溃/被杀前最后一次
-                // 持久化的 receivedBytes 已达到 totalBytes（下载确实走完）才认领；
-                // 未收满的任务回落 rebuildTask 续传（进度已周期性持久化，偏移够新）。
-                guard task.receivedBytes == task.totalBytes else {
-                    Logger.info("任务下载进度未达 100%（\(task.receivedBytes)/\(task.totalBytes)），不认领同名产物: \(name)")
-                    continue
-                }
                 let size = (try? candidate.resourceValues(forKeys: [.fileSizeKey]))?.fileSize ?? 0
                 guard Int64(size) == task.totalBytes else {
                     Logger.info("同名文件大小与任务总大小不符，跳过认领: \(name)")
                     continue
                 }
+                // 磁盘文件大小与服务器声明总大小一致 = 产物本身可证完整，直接认领。
+                // 旧守卫还要求持久化 receivedBytes == totalBytes：但完成回调的进度
+                // 补满若被进程死亡打断（如安装自身导致 App 被替换），记录里就是
+                // 98% 的旧快照——按旧守卫会误判"未收满"而重新下载+重复安装
+                // （实测：zip 下载安装成功后重进 App，任务显示还差一点又要重装）。
             }
             return candidate
         }
@@ -365,13 +362,17 @@ final class DownloadManager: NSObject {
             switch self.classifyDownload(at: destination.path) {
             case .zip:
                 updated.status = .completed
-                // 下载已完整：resumeData 作废（已被 URLSession 消费）。残留的旧
+                // 下载已完整：resumeData 作废（已被 URLSession 消耗）。残留的旧
                 // resumeData 会让后续 retry/恢复路径误用失效断点（重建任务必失败）。
                 updated.resumeData = nil
+                // 进度补满 100%：didWriteData 的进度持久化是 5 秒节流快照，完成时
+                // 若不补满，恢复时任务显示”还差一点点”并被产物认领守卫误判未收满
+                // （实测触发重新下载+重复安装）
+                updated.receivedBytes = max(updated.receivedBytes, updated.totalBytes)
             case .html:
                 updated.status = .failed
-                updated.error = "下载到的是网页而非文件（可能链接失效或被拦截），请检查链接后重试"
-                Logger.error("下载校验失败: \(updated.error ?? "")")
+                updated.error = “下载到的是网页而非文件（可能链接失效或被拦截），请检查链接后重试”
+                Logger.error(“下载校验失败: \(updated.error ?? “”)”)
                 try? AppFileManager.shared.deleteItem(at: destination)
                 retryableFailure = true
             case .other:
@@ -381,13 +382,14 @@ final class DownloadManager: NSObject {
                 // failed 并自动重下；截断文件删掉，避免把坏文件留在下载目录。
                 if updated.totalBytes > 0 && updated.receivedBytes < updated.totalBytes {
                     updated.status = .failed
-                    updated.error = "下载不完整，文件可能损坏"
-                    Logger.error("下载校验失败: \(updated.error ?? "")")
+                    updated.error = “下载不完整，文件可能损坏”
+                    Logger.error(“下载校验失败: \(updated.error ?? “”)”)
                     try? AppFileManager.shared.deleteItem(at: destination)
                     retryableFailure = true
                 } else {
                     updated.status = .completed
                     updated.resumeData = nil
+                    updated.receivedBytes = max(updated.receivedBytes, updated.totalBytes)
                 }
             }
 

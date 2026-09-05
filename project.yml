@@ -195,7 +195,9 @@ targets:
     info:
       path: Sources/ShareExtension/Info.plist
       properties:
-        CFBundleDisplayName: IPA Manager
+        # 显示名与主 App 区分开：分享面板里"IPA Manager 分享"= 本扩展面板入口
+        #（点它应弹出接收面板），便于与应用行/文档投递入口区分排查
+        CFBundleDisplayName: IPA Manager 分享
         CFBundleShortVersionString: "$(MARKETING_VERSION)"
         CFBundleVersion: "$(CURRENT_PROJECT_VERSION)"
         NSExtension:
@@ -241,7 +243,9 @@ targets:
     info:
       path: Sources/ShareExtension/ActionInfo.plist
       properties:
-        CFBundleDisplayName: IPA Manager・接收
+        # 显示名带"接收"字样：动作列表里可辨识（旧名"IPA Manager・接收"的
+        # ・字符在部分列表里显示易混，统一为空格分隔）
+        CFBundleDisplayName: IPA Manager 接收
         CFBundleShortVersionString: "$(MARKETING_VERSION)"
         CFBundleVersion: "$(CURRENT_PROJECT_VERSION)"
         NSExtension:
