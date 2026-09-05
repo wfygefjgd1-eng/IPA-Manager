@@ -438,32 +438,15 @@ bool ZBundle::SignNode(jvalue& jvNode)
 			matched = m_pSignAsset;
 		}
 		if (matched != NULL) {
-			std::string strProvData = matched->m_strProvData;
-			// Appex self-consistent profile: rewrite application-identifier inside
-			// the embedded profile to the extension's own bundle id. With exact-id
-			// supplier profiles the stock profile only covers the app id, and iOS
-			// 17+ validates the extension's binary entitlements against the
-			// embedded profile at launch - an id mismatch gets the extension
-			// refused silently even when a profile is present. Team prefix and
-			// every other entitlement (app groups, keychain) stay untouched; only
-			// the trailing bundle-id part gains the extension suffix, matching
-			// what Xcode produces for extension profiles.
-			if (IsAppExtensionPath(strFolder) && !strProvData.empty()
-			    && !matched->m_strApplicationId.empty()
-			    && strBundleId != matched->m_strApplicationId) {
-				const string& strAppId = matched->m_strApplicationId;
-				const size_t dot = strAppId.find('.');
-				if (dot != string::npos) {
-					const string strIdPart = strAppId.substr(dot + 1);
-					if (strIdPart != "*" && strBundleId.rfind(strIdPart, 0) == 0) {
-						const string strSuffix = strBundleId.substr(strIdPart.size());
-						if (!strSuffix.empty()) {
-							ZUtil::StringReplace(strProvData, ">" + strAppId + "<", ">" + strAppId + strSuffix + "<");
-						}
-					}
-				}
-			}
-			if (!ZFile::WriteFileV(strProvData, "%s/%s/embedded.mobileprovision", m_strAppFolder.c_str(), strFolder.c_str())) {
+			// NOTE: do NOT rewrite application-identifier inside the embedded
+			// profile. An earlier experiment rewrote it to the extension's own
+			// id, which invalidates the profile's CMS signature (the payload is
+			// covered by the signature) and the extension still never launched
+			// on-device. Sideloadly/ESign-style tools embed the SAME profile
+			// byte-for-byte and their extensions load - stay on that proven
+			// layout: profile written verbatim, binary entitlements rewritten
+			// per-bundle in archo.cpp.
+			if (!ZFile::WriteFileV(matched->m_strProvData, "%s/%s/embedded.mobileprovision", m_strAppFolder.c_str(), strFolder.c_str())) {
 				ZLog::ErrorV(">>> Can't write embedded.mobileprovision!\n");
 				return false;
 			}
