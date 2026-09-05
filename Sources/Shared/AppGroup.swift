@@ -438,6 +438,22 @@ enum AppGroup {
         }.max()
     }
 
+    /// 当前安装包的扩展是否就绪：每个 PlugIns/*.appex 都嵌入了含 App Group 的
+    /// 描述文件。外部签名工具通常不给扩展写 profile，iOS 17+ 拒绝加载——
+    /// 返回 nil 表示包内没有扩展；false = 有扩展但缺 profile（用本引擎重签即修复）
+    static var extensionProfilesEmbedded: Bool? {
+        let appexURLs = Bundle.main.urls(forResourcesWithExtension: "appex", subdirectory: "PlugIns") ?? []
+        guard !appexURLs.isEmpty else { return nil }
+        for appexURL in appexURLs {
+            guard let data = try? Data(contentsOf: appexURL.appendingPathComponent("embedded.mobileprovision")),
+                  !data.isEmpty,
+                  !groupsInProvisionData(data).isEmpty else {
+                return false
+            }
+        }
+        return true
+    }
+
     // MARK: - 诊断摘要
 
     /// 当前进程的组解析与容器状态摘要（扩展失败 UI 与诊断报告共用，

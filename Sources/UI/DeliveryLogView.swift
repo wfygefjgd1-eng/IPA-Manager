@@ -133,6 +133,19 @@ struct DeliveryLogView: View {
                     : "共享容器可用（\(containers.map { $0.identifier }.joined(separator: "、"))）")
                     .font(.subheadline.weight(.medium))
             }
+            // 扩展就绪检测：当前安装包的扩展若缺描述文件（外部工具签名的包常见），
+            // iOS 17+ 拒绝加载扩展——分享入口点了毫无反应。装上就能看出原因。
+            if let extReady = AppGroup.extensionProfilesEmbedded {
+                HStack(spacing: 8) {
+                    Image(systemName: extReady ? "checkmark.circle.fill" : "exclamationmark.triangle.fill")
+                        .foregroundColor(extReady ? .green : .orange)
+                    Text(extReady
+                        ? "分享扩展就绪（描述文件已嵌入）"
+                        : "分享扩展未就绪：扩展缺描述文件（外部工具签名所致）——用本 App 的签名引擎重签一次即修复")
+                        .font(.subheadline.weight(extReady ? .medium : .regular))
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
             summaryRow(label: "扩展最近活动", value: lastExtension.map { $0.formatted(date: .abbreviated, time: .shortened) } ?? "从未记录到扩展日志")
             summaryRow(label: "最近投递", value: lastDelivery.map {
                 "\($0.event.prefix(24))（\($0.timestamp.formatted(date: .omitted, time: .shortened))）"
