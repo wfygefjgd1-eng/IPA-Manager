@@ -1613,6 +1613,39 @@ final class AppState: ObservableObject {
         // 自动一条龙的同时重装了新版 App，进程被替换杀死），重启后对仍未签名的
         // 应用自动续跑；失败会 toast 具体原因，不静默
         resumePendingAutoSigns()
+
+        // 签名标志对账：zsign 先把签名产物写入 Signed/，随后才在主线程回写
+        // isSigned/signedPath——若进程恰好在两步之间死亡（典型：安装自身导致
+        // App 被替换），记录仍是"未签名"，而已签名产物已在 Signed/ 目录，首页
+        // 出现"已签应用与待签名同时列出同一应用"的矛盾（用户实测）
+        reconcileSignedFlags()
+    }
+
+    /// 签名标志对账：为"签名产物已生成但 isSigned 未回写"的记录补齐状态。
+    /// 产物命名规则由引擎保证：<源 IPA 去扩展名>-signed-<8位hex>.ipa，
+    /// 源 IPA 即记录的 path，因此按前缀匹配即可唯一归因。
+    private func reconcileSignedFlags() {
+        guard !importedApps.isEmpty else { return }
+        let signedFiles = fileManager.contents(of: .signed)
+        guard !signedFiles.isEmpty else { return }
+        var changed = false
+        for index in importedApps.indices where !importedApps[index].isSigned {
+            let recordPath = importedApps[index].path
+            guard !recordPath.isEmpty else { continue }
+            let base = URL(fileURLWithPath: recordPath).deletingPathExtension().lastPathComponent
+            let prefix = "\(base)-signed-"
+            if let match = signedFiles.first(where: {
+                $0.lastPathComponent.hasPrefix(prefix) && $0.pathExtension == "ipa"
+            }) {
+                importedApps[index].isSigned = true
+                importedApps[index].signedPath = match.path
+                changed = true
+                Logger.info("签名标志对账: \(importedApps[index].name) 已有签名产物 \(match.lastPathComponent)，补记 isSigned")
+            }
+        }
+        if changed {
+            store.saveImportedApps(importedApps)
+        }
     }
 
     /// 续跑上次中断的自动签名（App 被替换重装导致的流水线中断）
