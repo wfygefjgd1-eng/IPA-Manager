@@ -204,9 +204,11 @@ targets:
           # UI（表现为"跳到主 App 后毫无反应"）。字典规则声明接受文件类载荷
           #（ipa/zip/证书），QQ/微信传文件给的是 file 附件，能正常命中；
           # 纯文本/网页分享不再显示入口（本就处理不了），误触率为零。
+          # 键名必须是系统标准单数 File：复数 Files 不是有效键，系统按未声明处理，
+          # 文件类载荷无法命中激活规则（分享入口出现却收不到文件载荷）。
           NSExtensionActivationRule:
             NSExtensionActivationDictionaryVersion: 2
-            NSExtensionActivationSupportsFilesWithMaxCount: 20
+            NSExtensionActivationSupportsFileWithMaxCount: 20
             NSExtensionActivationSupportsAttachmentsWithMaxCount: 20
     entitlements:
       path: Sources/ShareExtension/IPAManagerShare.entitlements
@@ -245,7 +247,7 @@ targets:
           # 接受文件类载荷，不支持的类型由扩展内明确提示
           NSExtensionActivationRule:
             NSExtensionActivationDictionaryVersion: 2
-            NSExtensionActivationSupportsFilesWithMaxCount: 20
+            NSExtensionActivationSupportsFileWithMaxCount: 20
             NSExtensionActivationSupportsAttachmentsWithMaxCount: 20
     entitlements:
       path: Sources/ShareExtension/IPAManagerAction.entitlements

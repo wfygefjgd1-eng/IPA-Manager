@@ -136,6 +136,15 @@ final class ShareViewController: UIViewController {
             var failed = failed
             var failures = failures
             if let url {
+                // 安全作用域：文件 Provider 投递的临时 URL 可能需要显式授权，
+                // 沙盒严格时无作用域直接拷贝会 POSIX EPERM；非作用域 URL 调用
+                // 返回 false，成对 stop 无副作用
+                let accessed = url.startAccessingSecurityScopedResource()
+                defer {
+                    if accessed {
+                        url.stopAccessingSecurityScopedResource()
+                    }
+                }
                 let fileName = Self.resolvedIncomingFileName(tempURL: url, provider: provider)
                 do {
                     let dest = try AppGroup.saveIncomingFile(at: url, preferredFileName: fileName)
@@ -215,6 +224,14 @@ final class ShareViewController: UIViewController {
 
     /// 复制进共享收件箱并展示结果（任意线程可调，UI 更新自动回主线程）
     private func saveAndFinish(url: URL, provider: NSItemProvider) {
+        // 安全作用域：文件 Provider 投递的 URL 可能需要显式授权，无作用域拷贝
+        // 会 POSIX EPERM；非作用域 URL 调用返回 false，成对 stop 无副作用
+        let accessed = url.startAccessingSecurityScopedResource()
+        defer {
+            if accessed {
+                url.stopAccessingSecurityScopedResource()
+            }
+        }
         let fileName = Self.resolvedIncomingFileName(tempURL: url, provider: provider)
         do {
             let saved = try AppGroup.saveIncomingFile(at: url, preferredFileName: fileName)

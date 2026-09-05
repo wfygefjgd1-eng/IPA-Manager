@@ -19,7 +19,7 @@ final class AppDelegate: NSObject, UIApplicationDelegate {
         if let url = launchOptions?[.url] as? URL {
             ExternalDeliveryJournal.record("冷启动 launchOptions 携带 URL: \(url.lastPathComponent)")
             Logger.info("冷启动携带外部文件: \(url.lastPathComponent)")
-            AppState.shared.handleFileOpenedFromOutside(url)
+            AppState.shared.handleFileOpenedFromOutside(url, force: true)
         }
         // 【关键修复】冷启动主动扫描 Documents/Inbox 与 App Group 共享收件箱：
         // 系统把文件拷入 Documents/Inbox 后并不总能保证 openURL 回调（尤其 iOS 17+、
@@ -70,7 +70,7 @@ final class AppDelegate: NSObject, UIApplicationDelegate {
         let openInPlace = (options[.openInPlace] as? Bool) ?? false
         ExternalDeliveryJournal.record("application openURL 事件: \(url.lastPathComponent)（openInPlace=\(openInPlace)）")
         Logger.info("App opened with URL: \(url.absoluteString)")
-        AppState.shared.handleFileOpenedFromOutside(url)
+        AppState.shared.handleFileOpenedFromOutside(url, force: true)
         return true
     }
 }

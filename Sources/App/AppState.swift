@@ -930,6 +930,8 @@ final class AppState: ObservableObject {
     /// 与路径无关。路径去重（processedInboxPaths）在"文件移动过位置 / 结算删除
     /// 失败 / 路径记录被剪枝"时会漏，漏掉的后果是每次进 App 都把同一文件重新
     /// 导入一遍（用户实测）；内容身份是最后防线，结算时登记、扫描时拦截。
+    /// 例外：系统投递（Documents/Inbox）与 force 主动打开不受此拦截——同内容
+    /// 再次主动投递是用户明确意图，静默过滤表现为"分享了毫无反应"。
     private var importedDeliveryIdentities: Set<String> = []
 
     /// 投递文件内容身份：与路径无关的"同一文件"判据
@@ -1071,16 +1073,20 @@ final class AppState: ObservableObject {
                 }
                 continue
             }
-            // 内容身份去重：同一文件（即使被移动/换名失效过路径记录）不重复导入
+            // 内容身份去重：同一文件（即使被移动/换名失效过路径记录）不重复导入。
+            // 系统投递（Documents/Inbox）优先视为有效输入、跳过指纹拦截——出现在
+            // Inbox 里本身就是一次新的用户投递，指纹拦截会把"主动重投同一文件"
+            // 静默吞掉；Documents 内长存文件才需要指纹兜底防反复导入
+            let isInSystemInbox = file.path.hasPrefix(inboxURL.path + "/")
             let identity = Self.deliveryIdentity(for: file)
-            if importedDeliveryIdentities.contains(identity) {
+            if !isInSystemInbox && importedDeliveryIdentities.contains(identity) {
                 Logger.info("跳过重复投递（同内容文件已导入过）: \(file.lastPathComponent)")
                 continue
             }
             // 未登记 = open 事件丢失（正常投递的文件在结算时已自删，不会留到这里）。
             // 在途登记与重复投递拦截都在 handleFileOpenedFromOutside 内部完成。
             Logger.info("兜底导入（open 事件丢失）: \(file.lastPathComponent)")
-            handleFileOpenedFromOutside(file)
+            handleFileOpenedFromOutside(file, force: isInSystemInbox)
             importedCount += 1
         }
         // 可见化反馈：只在真的开始导入时提示（旧版"已处理过"分支每次回前台都弹，
@@ -1140,7 +1146,10 @@ final class AppState: ObservableObject {
     private var lastOpenedExternalURL: String = ""
     private var lastOpenedExternalDate: Date = .distantPast
 
-    func handleFileOpenedFromOutside(_ url: URL) {
+    /// - Parameter force: 系统主动投递的 open 事件（launchOptions/openURL/onOpenURL）
+    ///   传 true：用户主动分享是明确意图，绕过已结算拦截重新导入；回前台扫描
+    ///   兜底路径传 false，维持既有去重语义
+    func handleFileOpenedFromOutside(_ url: URL, force: Bool = false) {
         let now = Date()
         if url.absoluteString == lastOpenedExternalURL,
            now.timeIntervalSince(lastOpenedExternalDate) < Timeouts.externalOpenDedupe {
@@ -1177,8 +1186,10 @@ final class AppState: ObservableObject {
         ExternalDeliveryJournal.record("处理外部文件: \(url.lastPathComponent)（ext=\(ext)，投递识别=\(isInboxDelivery ? "是" : "否")）")
         var inboxSettlement: ((String) -> Void)? = nil
         if isInboxDelivery {
-            // 已结算（此前导入成功/失败并落盘标记）：文件残留场景由扫描清扫，不再导入
-            guard !processedInboxPaths.contains(url.path) else {
+            // 已结算（此前导入成功/失败并落盘标记）：默认跳过（残留由扫描清扫）；
+            // force=true 表示用户主动投递的 open 事件，同文件再分享是明确意图，
+            // 绕过已结算拦截重新导入
+            if !force && processedInboxPaths.contains(url.path) {
                 Logger.info("分享投递已结算，跳过: \(url.lastPathComponent)")
                 return
             }
