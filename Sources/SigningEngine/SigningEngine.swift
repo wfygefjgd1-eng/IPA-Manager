@@ -202,12 +202,100 @@ final class SigningEngine: SigningEngineProtocol {
         // 若不主动告知，smoother 的蠕动定时器会继续空转（泄漏 + UI 空转）。
         smoother.complete()
         Logger.info("签名完成: \(outputURL.path)")
-        // 注：此处曾挂"签名产物校验"（扫描产物 IPA 中央目录检查扩展描述文件），
-        // 实测（iOS 27 beta）其字符串操作对部分 zip 条目名触发 Swift 运行时
-        // String.index 致命崩溃，且崩溃点在签名队列上——进程死亡 = 签名完成但
-        // 安装永不发起 + 续跑死循环（App 点开即闪退）。扩展 profile 嵌入已由
-        // 诊断报告"分享扩展状态"章节跨启动验证，此处不再重复检查。
+        // 签名产物校验与诊断：detached 执行，不阻塞安装发起。字符串处理全部走
+        // NSString/components——zip 条目名可能来自非 UTF-8 编码的压缩包，Swift
+        // String 的手写索引/切片在 iOS 27 beta 有致命崩溃前科（EXC_BREAKPOINT
+        // String.index after，上一版校验实现的教训），这里绝不再出现。
+        let verifySource = sourcePath
+        DispatchQueue.global(qos: .utility).async {
+            Self.verifyAppexProvisioning(outputIPA: outputURL, sourceIPAPath: verifySource)
+        }
         return outputURL.path
+    }
+
+    /// 签名产物校验与诊断（以最终 IPA 为准）：
+    /// - 主 App bundle id
+    /// - 每个 PlugIns/*.appex 的 bundle id、embedded.mobileprovision 是否嵌入、
+    ///   描述文件内是否含 App Group
+    /// 结果写入 Logger 与投递日志（跨启动可查）。字符串处理只用
+    /// components(separatedBy:)/NSString，不含任何手写 String 索引。
+    private static func verifyAppexProvisioning(outputIPA: URL, sourceIPAPath: String) {
+        guard let entries = try? ZipManager.shared.listEntryPaths(archiveURL: outputIPA) else {
+            Logger.warning("签名产物校验: 无法读取 IPA 中央目录，跳过扩展检查")
+            return
+        }
+        let entrySet = Set(entries)
+
+        // 主 App bundle id：Payload/<App>.app/Info.plist
+        var mainBundleID = "?"
+        for entry in entries where entry.hasPrefix("Payload/") && entry.hasSuffix(".app/Info.plist") {
+            if let value = Self.plistEntryValue(entryPath: entry, in: outputIPA, key: "CFBundleIdentifier") {
+                mainBundleID = value
+                break
+            }
+        }
+        Logger.info("签名产物校验: 主 App bundle id = \(mainBundleID)")
+
+        // 顶层扩展目录：Payload/<App>.app/PlugIns/<X>.appex/（严格一级，
+        // 与 zsign 的 profile 嵌入范围一致）
+        var appexDirs = Set<String>()
+        for entry in entries {
+            let comps = entry.components(separatedBy: "/")
+            guard let idx = comps.firstIndex(where: { $0.hasSuffix(".appex") }),
+                  idx > 0, comps[idx - 1] == "PlugIns" else { continue }
+            let dir = comps[0...idx].joined(separator: "/") + "/"
+            appexDirs.insert(dir)
+        }
+        guard !appexDirs.isEmpty else {
+            Logger.warning("签名产物校验: 产物内未发现 PlugIns/*.appex（分享/动作入口将不存在）")
+            ExternalDeliveryJournal.record("签名产物校验: 未发现扩展（PlugIns/*.appex 缺失）", level: .error)
+            return
+        }
+
+        // 逐 appex 校验：profile 嵌入 + bundle id + 描述文件内 App Group
+        for dir in appexDirs.sorted() {
+            let name = dir.components(separatedBy: "/").filter { $0.hasSuffix(".appex") }.first ?? dir
+            let profileEntry = dir + "embedded.mobileprovision"
+            let hasProfile = entrySet.contains(profileEntry)
+            var bundleID = "?"
+            var hasGroups = false
+            if hasProfile, entrySet.contains(dir + "Info.plist") {
+                bundleID = Self.plistEntryValue(entryPath: dir + "Info.plist", in: outputIPA, key: "CFBundleIdentifier") ?? "?"
+                if let provData = Self.extractEntryData(entryPath: profileEntry, in: outputIPA) {
+                    hasGroups = !AppGroup.groupsInProvisionData(provData).isEmpty
+                }
+            }
+            let ok = hasProfile && hasGroups
+            Logger.info("签名产物校验: \(name) bundleID=\(bundleID) 描述文件=\(hasProfile ? "已嵌入" : "缺失") AppGroup=\(hasGroups ? "有" : "无")")
+            ExternalDeliveryJournal.record(
+                "扩展签名结果: \(name) bundleID=\(bundleID) 描述文件=\(hasProfile ? "已嵌入" : "缺失") AppGroup=\(hasGroups ? "有" : "无")",
+                level: ok ? .ok : .error
+            )
+        }
+    }
+
+    /// 从 zip 内提取单个条目的原始数据（临时文件中转，用后即删）
+    private static func extractEntryData(entryPath: String, in archiveURL: URL) -> Data? {
+        let tempURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("verify-\(UUID().uuidString)")
+        do {
+            try ZipManager.shared.extractEntry(archiveURL: archiveURL, entryPath: entryPath, to: tempURL)
+            let data = try? Data(contentsOf: tempURL)
+            try? FileManager.default.removeItem(at: tempURL)
+            return data
+        } catch {
+            try? FileManager.default.removeItem(at: tempURL)
+            return nil
+        }
+    }
+
+    /// 读取 zip 内 plist 条目的指定顶层 key（字符串值）
+    private static func plistEntryValue(entryPath: String, in archiveURL: URL, key: String) -> String? {
+        guard let data = extractEntryData(entryPath: entryPath, in: archiveURL),
+              let plist = try? PropertyListSerialization.propertyList(from: data, options: [], format: nil) as? [String: Any] else {
+            return nil
+        }
+        return plist[key] as? String
     }
 
     /// 用系统 Security 框架（SecPKCS12Import）解开 p12 并把私钥导出为 PEM 文件。
