@@ -438,29 +438,15 @@ bool ZBundle::SignNode(jvalue& jvNode)
 			matched = m_pSignAsset;
 		}
 		if (matched != NULL) {
-			std::string strProvData = matched->m_strProvData;
-			// v1.0.161-era behavior (user-observed: the extension panel presented
-			// on this build): rewrite application-identifier inside the embedded
-			// profile to the extension's own bundle id, so bundle id, binary
-			// entitlements (archo.cpp) and embedded profile are self-consistent.
-			// Team prefix and every other entitlement (app groups, keychain) stay
-			// byte-identical; only the trailing bundle-id part gains the suffix.
-			if (IsAppExtensionPath(strFolder) && !strProvData.empty()
-			    && !matched->m_strApplicationId.empty()
-			    && strBundleId != matched->m_strApplicationId) {
-				const string& strAppId = matched->m_strApplicationId;
-				const size_t dot = strAppId.find('.');
-				if (dot != string::npos) {
-					const string strIdPart = strAppId.substr(dot + 1);
-					if (strIdPart != "*" && strBundleId.rfind(strIdPart, 0) == 0) {
-						const string strSuffix = strBundleId.substr(strIdPart.size());
-						if (!strSuffix.empty()) {
-							ZUtil::StringReplace(strProvData, ">" + strAppId + "<", ">" + strAppId + strSuffix + "<");
-						}
-					}
-				}
-			}
-			if (!ZFile::WriteFileV(strProvData, "%s/%s/embedded.mobileprovision", m_strAppFolder.c_str(), strFolder.c_str())) {
+			// Profile written VERBATIM (byte-for-byte). An earlier experiment
+			// rewrote application-identifier inside the embedded profile to the
+			// extension's own id - that invalidates the profile's CMS signature
+			// (the payload is covered by the signature) and on-device testing
+			// showed the share sheet then stopped enumerating the extensions
+			// entirely. Sideloadly/ESign-style tools embed the SAME profile
+			// byte-for-byte - stay on that proven layout. Per-bundle binary
+			// entitlements are still rewritten in archo.cpp.
+			if (!ZFile::WriteFileV(matched->m_strProvData, "%s/%s/embedded.mobileprovision", m_strAppFolder.c_str(), strFolder.c_str())) {
 				ZLog::ErrorV(">>> Can't write embedded.mobileprovision!\n");
 				return false;
 			}
