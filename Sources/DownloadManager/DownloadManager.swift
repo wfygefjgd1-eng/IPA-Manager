@@ -134,7 +134,7 @@ final class DownloadManager: NSObject {
     }
 
     func resumeDownload(id: UUID) {
-        // 无活跃 sessionTask（如“暂停后重启”恢复的任务只恢复了模型、未建 sessionTask）：
+        // 无活跃 sessionTask（如"暂停后重启"恢复的任务只恢复了模型、未建 sessionTask）：
         // 先按 rebuildTask 重建（有 resumeData 断点续传，否则整包重下），再恢复下载。
         if tasks[id] == nil {
             guard var model = taskModels[id] else { return }
@@ -175,7 +175,7 @@ final class DownloadManager: NSObject {
     /// - completed：校验 `destinationPath` 文件是否仍存在；不存在 → 标记 failed「文件已丢失」。
     /// - downloading：重建 sessionTask 续传（有 resumeData 断点续传，否则整包重下）。
     /// - paused：暂停是用户显式意图——只恢复模型展示（status 保持 .paused、不建
-    ///   sessionTask），绝不悄悄恢复下载；用户点“继续”时由 resumeDownload 按需重建。
+    ///   sessionTask），绝不悄悄恢复下载；用户点"继续"时由 resumeDownload 按需重建。
     /// - failed / 其它：原样恢复到 taskModels 展示。
     func restoreSavedTasks() {
         let saved = store.loadDownloadTasks()
@@ -217,7 +217,7 @@ final class DownloadManager: NSObject {
                 }
             case .paused:
                 // 保持暂停：只恢复模型（tasks[id] 保持 nil），
-                // 用户点“继续”时 resumeDownload 会重建 sessionTask 再 resume。
+                // 用户点"继续"时 resumeDownload 会重建 sessionTask 再 resume。
                 taskModels[task.id] = task
             default:
                 // failed / waiting：原样恢复展示
@@ -316,7 +316,7 @@ final class DownloadManager: NSObject {
     // MARK: - 收尾 / 校验 / 重试
 
     /// 下载完成的收尾：移动到持久位置 → 校验内容真实性 → 更新模型并持久化。
-    /// 校验失败且属于“网络类”问题（HTML 错误页 / 截断损坏）时自动重试一次。
+    /// 校验失败且属于"网络类"问题（HTML 错误页 / 截断损坏）时自动重试一次。
     ///
     /// 关键时序约束：URLSession 的 didFinishDownloadingTo 给出的临时文件
     /// （CFNetworkDownload_xxx.tmp）只在回调执行期间有效，**回调返回后系统立即删除**。
@@ -366,24 +366,24 @@ final class DownloadManager: NSObject {
                 // resumeData 会让后续 retry/恢复路径误用失效断点（重建任务必失败）。
                 updated.resumeData = nil
                 // 进度补满 100%：didWriteData 的进度持久化是 5 秒节流快照，完成时
-                // 若不补满，恢复时任务显示”还差一点点”并被产物认领守卫误判未收满
+                // 若不补满，恢复时任务显示"还差一点点"并被产物认领守卫误判未收满
                 // （实测触发重新下载+重复安装）
                 updated.receivedBytes = max(updated.receivedBytes, updated.totalBytes)
             case .html:
                 updated.status = .failed
-                updated.error = “下载到的是网页而非文件（可能链接失效或被拦截），请检查链接后重试”
-                Logger.error(“下载校验失败: \(updated.error ?? “”)”)
+                updated.error = "下载到的是网页而非文件（可能链接失效或被拦截），请检查链接后重试"
+                Logger.error("下载校验失败: \(updated.error ?? "")")
                 try? AppFileManager.shared.deleteItem(at: destination)
                 retryableFailure = true
             case .other:
                 // 非 zip 且非 HTML 的完整下载（.tar/.apk/.tar.gz 等）按 completed 收尾：
                 // 任务显示完成，是否可导入交给自动导入环节给出中文原因——这里不应把
-                // 完整下载误判为“损坏”。只有确证截断（已知总大小且实际收到更少）才判
+                // 完整下载误判为"损坏"。只有确证截断（已知总大小且实际收到更少）才判
                 // failed 并自动重下；截断文件删掉，避免把坏文件留在下载目录。
                 if updated.totalBytes > 0 && updated.receivedBytes < updated.totalBytes {
                     updated.status = .failed
-                    updated.error = “下载不完整，文件可能损坏”
-                    Logger.error(“下载校验失败: \(updated.error ?? “”)”)
+                    updated.error = "下载不完整，文件可能损坏"
+                    Logger.error("下载校验失败: \(updated.error ?? "")")
                     try? AppFileManager.shared.deleteItem(at: destination)
                     retryableFailure = true
                 } else {
@@ -395,7 +395,7 @@ final class DownloadManager: NSObject {
 
             DispatchQueue.main.async {
                 // 竞态守卫：用户在后台校验期间取消/删除了任务（taskModels[id] 已移除），
-                // 不得把任务“复活”回列表，更不能触发自动导入/自动重试。
+                // 不得把任务"复活"回列表，更不能触发自动导入/自动重试。
                 guard self.taskModels[id] != nil else {
                     // 文件已同步移入 Downloads（同卷 rename 已完成），但任务已删除：
                     // 目标文件不再被任何记录引用，清理掉避免堆积。
@@ -462,7 +462,7 @@ final class DownloadManager: NSObject {
 
     /// 读取文件头少量字节判断下载内容真实性（小 IO，主队列可接受）。
     /// zip 分支额外校验文件尾 EOCD 记录：PK 头完好但缺中央目录/结束记录的
-    /// 截断文件（最常见的“下载不完整”形态）会被判为可重试的失败而非 completed。
+    /// 截断文件（最常见的"下载不完整"形态）会被判为可重试的失败而非 completed。
     private func classifyDownload(at path: String) -> DownloadContentKind {
         guard let handle = FileHandle(forReadingAtPath: path) else { return .other }
         defer { try? handle.close() }
@@ -620,7 +620,7 @@ extension DownloadManager: URLSessionDownloadDelegate {
 
         // 守卫：任务已被主动取消/删除时（cancelDownload 已移除模型），
         // 忽略该回调——否则会以「新 UUID 的占位模型」写回旧 id 键，
-        // 产生列表里永久删不掉的“未知文件/失败”幽灵任务（重启前无法消除）。
+        // 产生列表里永久删不掉的"未知文件/失败"幽灵任务（重启前无法消除）。
         // NSURLErrorCancelled 是 cancel() 的必然回调，模型不存在时直接丢弃。
         guard taskModels[id] != nil else { return }
 
