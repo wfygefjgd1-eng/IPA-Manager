@@ -141,19 +141,24 @@ jobs:
           APPEX_INFOS="$(find /tmp/ipa-plist -name 'Info.plist' | sort)"
           [ "$(echo "$APPEX_INFOS" | grep -c .)" -eq "$APPEX_COUNT" ] \
             || { echo "IPA 校验失败：扩展 Info.plist 数量（$(echo "$APPEX_INFOS" | grep -c .)）与 appex 数量（$APPEX_COUNT）不符"; exit 1; }
-          for PLIST in $APPEX_INFOS; do
+          # 注意：App 名带空格（IPA Manager.app），绝不能用 for-in 分词遍历，
+          # 必须以 NUL 分隔逐条读取；FAIL 标记 + 主 shell 循环（进程替换）保证
+          # 校验失败能真正终止流水线
+          FAIL=0
+          while IFS= read -r -d '' PLIST; do
             APPEX_NAME="$(basename "$(dirname "$PLIST")")"
             # 构建产物中的 Info.plist 可能已被 Xcode 转为二进制格式，先转 XML 再 grep
-            plutil -convert xml1 -o /tmp/ext-info.plist "$PLIST" || { echo "IPA 校验失败：$APPEX_NAME Info.plist 无法解析"; exit 1; }
+            plutil -convert xml1 -o /tmp/ext-info.plist "$PLIST" || { echo "IPA 校验失败：$APPEX_NAME Info.plist 无法解析"; FAIL=1; break; }
             if grep -q 'NSExtensionActivationSupportsFilesWithMaxCount' /tmp/ext-info.plist; then
-              echo "IPA 校验失败：$APPEX_NAME 激活规则使用了无效的复数 Files key"; exit 1
+              echo "IPA 校验失败：$APPEX_NAME 激活规则使用了无效的复数 Files key"; FAIL=1; break
             fi
             grep -q 'NSExtensionActivationSupportsFileWithMaxCount' /tmp/ext-info.plist \
-              || { echo "IPA 校验失败：$APPEX_NAME 激活规则缺少单数 File key"; exit 1; }
+              || { echo "IPA 校验失败：$APPEX_NAME 激活规则缺少单数 File key"; FAIL=1; break; }
             grep -q 'com\.ipamanager\.app' /tmp/ext-info.plist \
-              || { echo "IPA 校验失败：$APPEX_NAME bundle id 不是主 App 子级"; exit 1; }
+              || { echo "IPA 校验失败：$APPEX_NAME bundle id 不是主 App 子级"; FAIL=1; break; }
             echo "扩展 plist 校验通过：$APPEX_NAME（激活规则单数 File key + bundle id）"
-          done
+          done < <(find /tmp/ipa-plist -name 'Info.plist' -print0)
+          [ "$FAIL" -eq 0 ] || exit 1
           echo "IPA 校验通过：版本 1.0.${{ github.run_number }}（构建号 ${{ github.run_number }}），扩展 $APPEX_COUNT 个"
           # 产物完整性基准：人工发布流程（下载 artifact -> gh release create 上传）
           # 之间无可对照哈希时，无法发现 artifact 下载截断/损坏
