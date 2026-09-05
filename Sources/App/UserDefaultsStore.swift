@@ -21,9 +21,12 @@ final class UserDefaultsStore {
         /// 分享面板「拷贝到 App」已处理的 Inbox 投递路径（去重缓存，非业务数据：
         /// 丢失的代价只是对残留文件多导入一次，importFile 按 bundleID 去重，无副作用）
         static let processedInboxPaths = "processed_inbox_paths"
-        /// 已消费的扩展日志字符偏移（扩展是独立进程，主 App 每次扫描只吞入新增行，
-        /// 避免重复刷屏；丢失的代价只是重复显示几行日志，无副作用）
-        static let extensionLogOffset = "extension_log_offset"
+        /// 扩展日志消费偏移：主 App 扇入读取"全部可用容器"，按容器目录名分别记账
+        ///（v1.0.142 起共享容器可能是多个，单一全局偏移会在多容器下串账）
+        static let extensionLogOffsetsByGroup = "extension_log_offsets_by_group"
+        /// 上次记录到投递日志的共享容器组集合：组集合变化（重签换描述文件/组漂移）
+        /// 才记日志，避免每次冷启动都重复"共享容器：可用"刷屏
+        static let lastKnownContainerSet = "last_known_container_set"
         /// 所有需要检查 TTL 的持久化键集合
         static let allPersistedKeys: [String] = [
             certificates, profiles, signingTasks, downloadTasks, importedApps
@@ -131,12 +134,24 @@ final class UserDefaultsStore {
 
     // MARK: - 扩展日志消费偏移
 
-    func loadExtensionLogOffset() -> Int {
-        defaults.integer(forKey: Keys.extensionLogOffset)
+    /// 按容器目录名记账的扩展日志消费偏移（扇入读取全部容器，每容器独立增量消费；
+    /// 旧版单全局偏移在多容器下会串账）
+    func loadExtensionLogOffsetsByGroup() -> [String: Int] {
+        load([String: Int].self, key: Keys.extensionLogOffsetsByGroup) ?? [:]
     }
 
-    func saveExtensionLogOffset(_ offset: Int) {
-        defaults.set(offset, forKey: Keys.extensionLogOffset)
+    func saveExtensionLogOffsetsByGroup(_ offsets: [String: Int]) {
+        save(offsets, key: Keys.extensionLogOffsetsByGroup)
+    }
+
+    // MARK: - 共享容器组集合记忆
+
+    func loadLastKnownContainerSet() -> String? {
+        defaults.string(forKey: Keys.lastKnownContainerSet)
+    }
+
+    func saveLastKnownContainerSet(_ value: String) {
+        defaults.set(value, forKey: Keys.lastKnownContainerSet)
     }
 
     // MARK: - 自动流程开关（默认开启）

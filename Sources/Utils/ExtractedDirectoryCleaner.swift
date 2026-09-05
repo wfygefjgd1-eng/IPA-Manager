@@ -62,7 +62,11 @@ final class ExtractedDirectoryCleaner {
                now.timeIntervalSince(modified) < 600 {
                 continue
             }
-            let isReferenced = referencedPaths.contains { $0.hasPrefix(entry.path) }
+            // 前缀匹配必须按路径分量对齐：纯字符串前缀会把 `App.ipa-abc` 误判为被
+            // 兄弟目录 `App.ipa-abc123/...` 的引用路径"引用"而漏删。引用路径等于该
+            // 目录自身、或位于其下（`entry.path + "/"` 开头）才算被引用；条件只会
+            // 收紧不会放宽，已引用目录不会因此被误删。
+            let isReferenced = referencedPaths.contains { $0 == entry.path || $0.hasPrefix(entry.path + "/") }
             if !isReferenced {
                 try? AppFileManager.shared.deleteItem(at: entry)
                 Logger.info("已清理孤儿解压目录: \(entry.path)")

@@ -13,6 +13,9 @@ enum Logger {
 
     private static let maxEntries = Limits.maxLogEntries
     private static let maxFailureEntries = Limits.maxFailureEntries
+    /// 失败专区的持久化键：跨启动保留（旧版纯内存，用户"遇到失败 → 重开 App 导出
+    /// 报告"的时序下报告永远"（无失败记录）"）
+    private static let failureStorageKey = "logger_failure_entries"
     // os_unfair_lock：相比 NSLock 轻量（不自旋、不绑定 pthread），且不会在等锁线程
     // 持有 Send 权限上出问题；关键修复点：NSLock 是阻塞锁，若 os_log 内部触发 KVO/
     // NotificationCenter → 再调 Logger.log → 同线程可重入 NSLock 直接死锁。
@@ -50,6 +53,24 @@ enum Logger {
             if failureEntries.count > maxFailureEntries {
                 failureEntries.removeFirst(failureEntries.count - maxFailureEntries)
             }
+            persistFailuresLocked()
+        }
+    }
+
+    /// 启动时载入持久化的失败记录（AppDelegate 冷启动调用一次；本会话已有记录时不动）
+    static func loadPersistedFailures() {
+        lock.lock()
+        defer { lock.unlock() }
+        guard failureEntries.isEmpty,
+              let data = UserDefaults.standard.data(forKey: failureStorageKey),
+              let stored = try? JSONDecoder().decode([LogEntry].self, from: data) else { return }
+        failureEntries = stored
+    }
+
+    /// 失败专区落盘（调用方必须已持锁；环形上限与内存一致）
+    private static func persistFailuresLocked() {
+        if let data = try? JSONEncoder().encode(failureEntries) {
+            UserDefaults.standard.set(data, forKey: failureStorageKey)
         }
     }
 
@@ -76,8 +97,9 @@ enum Logger {
         let timestampFormatter = DateFormatter()
         timestampFormatter.dateFormat = "yyyy-MM-dd HH:mm:ss"
         timestampFormatter.locale = Locale(identifier: "en_US_POSIX")
+        // 时间戳带日期：失败常发生在上一次会话，只有 HH:mm:ss 会让跨天记录无法排序
         let timeFormatter = DateFormatter()
-        timeFormatter.dateFormat = "HH:mm:ss"
+        timeFormatter.dateFormat = "MM-dd HH:mm:ss"
         timeFormatter.locale = Locale(identifier: "en_US_POSIX")
 
         let device = UIDevice.current
@@ -125,6 +147,15 @@ enum Logger {
         lines.append(ExternalDeliveryJournal.reportText())
 
         lines.append("")
+        lines.append("===== 共享容器与投递通道自检 =====")
+        // 组候选来源、逐组可写探针、各容器收件箱状态一站汇总（主 App 与扩展共用
+        // 同一份摘要逻辑；容器"可用"结论必须经写入探针实测，仅 containerURL 非 nil
+        // 不能证明可写）
+        for line in AppGroup.diagnosticsSummary() {
+            lines.append(line)
+        }
+
+        lines.append("")
         lines.append("===== 分享扩展状态（逐个拆解）=====")
         let appexURLs = Bundle.main.urls(forResourcesWithExtension: "appex", subdirectory: "PlugIns") ?? []
         if appexURLs.isEmpty {
@@ -133,13 +164,8 @@ enum Logger {
             lines.append("分享扩展：已安装 \(appexURLs.count) 个")
         }
         let mainGroup = AppGroup.resolvedIdentifier()
-        if AppGroup.containerURL != nil {
-            lines.append("App Group 共享容器：可用（运行时组：\(mainGroup ?? "?")）")
-        } else {
-            lines.append("App Group 共享容器：不可用")
-        }
         // 主 App 自身描述文件里的组（与扩展的逐个比对，揪出“组错位”）
-        let mainProfileGroups = Self.scanGroupsInMobileProvision(
+        let mainProfileGroups = Self.groupsInMobileProvisionFile(
             Bundle.main.url(forResource: "embedded", withExtension: "mobileprovision"))
         lines.append("主 App 描述文件组：\(mainProfileGroups.isEmpty ? "读不到" : mainProfileGroups.joined(separator: "、"))")
         for appexURL in appexURLs {
@@ -170,7 +196,7 @@ enum Logger {
                 atPath: appexURL.appendingPathComponent("_CodeSignature").path)
             lines.append("  签名：\(hasSig ? "有 _CodeSignature" : "无 _CodeSignature（未签名，iOS 会拒绝加载！）")")
             // 3) 扩展自身描述文件里的组：与主 App 的组交叉比对
-            let extGroups = Self.scanGroupsInMobileProvision(
+            let extGroups = Self.groupsInMobileProvisionFile(
                 appexURL.appendingPathComponent("embedded.mobileprovision"))
             lines.append("  描述文件组：\(extGroups.isEmpty ? "无/读不到" : extGroups.joined(separator: "、"))")
             if let mainGroup, !extGroups.isEmpty, !extGroups.contains(mainGroup) {
@@ -180,10 +206,14 @@ enum Logger {
 
         lines.append("")
         lines.append("===== 分享扩展日志（共享容器 ExtensionLog.txt）=====")
-        if let extLog = AppGroup.readExtensionLog() {
+        if let extLog = AppGroup.readAllExtensionLogs() {
             lines.append(extLog)
         } else {
-            lines.append("（无扩展日志——扩展进程从未成功写入共享容器：可能从未被唤起、启动即崩，或与主 App 解析到了不同的组）")
+            lines.append("（无扩展日志——扩展从未成功写入共享容器。按可能性排查：")
+            lines.append("1) 分享时点的是「拷贝到 IPA Manager」入口：该入口走文档投递、不经过扩展，无扩展日志属正常——请改点分享面板里的「IPA Manager」扩展面板入口（或动作区「IPA Manager・接收」）再试；")
+            lines.append("2) 扩展被系统拒绝加载：见上方逐个 appex 的「签名」「描述文件组」检查，任一「无 _CodeSignature」「描述文件组：无/读不到」或「组错位」都会让入口不可用——请用保留扩展的签名方式重签（例如用本 App 的签名引擎签本 App）；")
+            lines.append("3) 共享容器整体不可用：见上方「共享容器与投递通道自检」的逐组探针结果。")
+            lines.append("）")
         }
 
         lines.append("")
@@ -192,24 +222,11 @@ enum Logger {
         return lines.joined(separator: "\n")
     }
 
-    /// 从 mobileprovision 原始数据里提取 group.* 组名（CMS 包裹，组名以明文存在，
-    /// 正则提取即可；读不到/无组返回空数组）。仅用于诊断展示，不参与运行时决策。
-    private static func scanGroupsInMobileProvision(_ url: URL?) -> [String] {
-        guard let url,
-              let data = try? Data(contentsOf: url),
-              let regex = try? NSRegularExpression(pattern: #"group\.[A-Za-z0-9._\-]{2,64}"#) else { return [] }
-        // CMS 二进制包裹：非法字节按替换字符解码即可，组名本身是 ASCII 明文
-        let text = String(decoding: data, as: UTF8.self)
-        let range = NSRange(text.startIndex..., in: text)
-        var seen = Set<String>()
-        var result: [String] = []
-        for match in regex.matches(in: text, range: range) {
-            guard let matchRange = Range(match.range, in: text) else { continue }
-            let name = String(text[matchRange])
-            if seen.insert(name).inserted { result.append(name) }
-            if result.count >= 10 { break }
-        }
-        return result
+    /// 从 mobileprovision 文件提取 group.* 组名（解析逻辑在 AppGroup.groupsInProvisionData，
+    /// 与运行时候选组发现同源；仅诊断展示用）
+    private static func groupsInMobileProvisionFile(_ url: URL?) -> [String] {
+        guard let url, let data = try? Data(contentsOf: url) else { return [] }
+        return AppGroup.groupsInProvisionData(data)
     }
 
     /// 激活规则摘要：字符串谓词原样打印；字典只列键（全量打印太长）。

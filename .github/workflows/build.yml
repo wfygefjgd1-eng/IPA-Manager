@@ -54,7 +54,7 @@ jobs:
           # 产物缺失时就地重建，否则报错点会漂移到 xcodebuild 链接期的
           # "library not found"，只能手动删 Actions 缓存才能恢复。
           if [ ! -s Vendor/openssl/lib/libcrypto-device.a ] || [ ! -f Vendor/openssl/include/openssl/crypto.h ]; then
-            echo "OpenSSL 缓存不完整，就地重建"
+            echo "::warning::OpenSSL 缓存不完整，已就地重建。注意：坏缓存键不会自愈（save 因 cache-hit=true 被跳过），若后续 run 反复出现，请到 Actions → Caches 删除 openssl-ios-* 缓存或 bump key 的 -v2 后缀"
             rm -rf Vendor/openssl
             bash scripts/build-openssl.sh
           fi
@@ -125,7 +125,11 @@ jobs:
             || { echo "IPA 结构或版本校验失败，终止发布"; exit 1; }
           grep -qE '"CFBundleVersion" => "${{ github.run_number }}"' /tmp/ipa-info.txt \
             || { echo "IPA 结构或版本校验失败，终止发布"; exit 1; }
-          echo "IPA 校验通过：版本 1.0.${{ github.run_number }}（构建号 ${{ github.run_number }}）"
+          # e) 扩展必须随包：签名/打包环节剥离 PlugIns/*.appex 是"分享面板无扩展入口"
+          #    的已知根因（iOS 不为缺失的扩展显示任何入口），产物侧先兜住
+          APPEX_COUNT="$(unzip -Z1 "$IPA" | grep -oE '^Payload/[^/]+\.app/PlugIns/[^/]+\.appex/' | sort -u | wc -l | tr -d ' ')"
+          [ "$APPEX_COUNT" -ge 2 ] || { echo "IPA 结构校验失败：PlugIns 扩展缺失（应含 2 个 appex，实际 $APPEX_COUNT）"; exit 1; }
+          echo "IPA 校验通过：版本 1.0.${{ github.run_number }}（构建号 ${{ github.run_number }}），扩展 $APPEX_COUNT 个"
           # 产物完整性基准：人工发布流程（下载 artifact -> gh release create 上传）
           # 之间无可对照哈希时，无法发现 artifact 下载截断/损坏
           shasum -a 256 "$IPA" | tee build/artifacts/SHA256SUMS

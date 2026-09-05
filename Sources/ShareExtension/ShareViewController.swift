@@ -119,9 +119,14 @@ final class ShareViewController: UIViewController {
     /// 逐个取文件表示并保存（串行：扩展内存/IO 配额有限，大包并发复制易被系统杀掉；
     /// 每一步都是新的异步回调，不占用调用栈，文件再多也不会栈溢出）。
     /// 用 loadFileRepresentation 取文件：回调块结束时临时 url 即失效，必须当场复制。
-    private func receiveFiles(_ jobs: [(NSItemProvider, String)], index: Int = 0, saved: [String] = [], failed: Int = 0) {
+    /// 失败原因逐条收集（failures），最终汇总进结束页 UI——共享容器不可用时扩展
+    /// 日志同样写不出去，UI 是当时唯一可靠的诊断出口，必须把细节直接给用户。
+    private func receiveFiles(
+        _ jobs: [(NSItemProvider, String)], index: Int = 0,
+        saved: [String] = [], failed: Int = 0, failures: [String] = []
+    ) {
         guard index < jobs.count else {
-            finishReceiving(saved: saved, failed: failed, total: jobs.count)
+            finishReceiving(saved: saved, failed: failed, total: jobs.count, failures: failures)
             return
         }
         let (provider, typeIdentifier) = jobs[index]
@@ -129,6 +134,7 @@ final class ShareViewController: UIViewController {
             guard let self else { return }
             var saved = saved
             var failed = failed
+            var failures = failures
             if let url {
                 let fileName = Self.resolvedIncomingFileName(tempURL: url, provider: provider)
                 do {
@@ -138,27 +144,35 @@ final class ShareViewController: UIViewController {
                 } catch {
                     AppGroup.appendExtensionLog("失败：保存失败（\(error.localizedDescription)）")
                     failed += 1
+                    failures.append("\(fileName)：\(error.localizedDescription)")
                 }
             } else {
-                AppGroup.appendExtensionLog("失败：读取文件失败（\(error?.localizedDescription ?? "未知错误")）")
+                let reason = error?.localizedDescription ?? "未知错误"
+                AppGroup.appendExtensionLog("失败：读取文件失败（\(reason)）")
                 failed += 1
+                failures.append(reason)
             }
-            self.receiveFiles(jobs, index: index + 1, saved: saved, failed: failed)
+            self.receiveFiles(jobs, index: index + 1, saved: saved, failed: failed, failures: failures)
         }
     }
 
     /// 全部收完后统一展示汇总并拉起主 App（只拉起一次，避免多文件连跳）。
-    private func finishReceiving(saved: [String], failed: Int, total: Int) {
+    private func finishReceiving(saved: [String], failed: Int, total: Int, failures: [String] = []) {
         DispatchQueue.main.async {
             guard !saved.isEmpty else {
-                self.updateStatus("接收失败，共 \(total) 个文件均未保存", success: false)
-                self.scheduleComplete(after: 4.0)
+                var text = "接收失败，共 \(total) 个文件均未保存"
+                if let first = failures.first {
+                    text += "\n\n\(first)"
+                    if failures.count > 1 { text += "\n（共 \(failures.count) 条失败）" }
+                }
+                self.updateStatus(text, success: false)
+                self.scheduleComplete(after: 8.0)
                 return
             }
             let shown = saved.prefix(3).joined(separator: "、")
             let more = saved.count > 3 ? " 等 \(saved.count) 个" : ""
             var text = "已接收「\(shown)\(more)」\n\n正在拉起 IPA Manager…"
-            if failed > 0 { text += "\n（\(failed) 个失败）" }
+            if failed > 0 { text += "\n（\(failed) 个失败：\(failures.prefix(2).joined(separator: "；"))）" }
             self.updateStatus(text, success: true)
             self.scheduleComplete(after: 5.0)
             // 尝试拉起主 App：历史系统版本对分享扩展不支持 open（失败无副作用）；
@@ -221,14 +235,13 @@ final class ShareViewController: UIViewController {
         } catch let error as NSError {
             AppGroup.appendExtensionLog("失败：保存失败（\(error.localizedDescription)）")
             DispatchQueue.main.async {
-                // App Group 不可用时给出明确中文提示
-                if error.domain == "AppGroup" && error.code == 1 {
-                    self.updateStatus(
-                        "⚠️ 共享容器不可用\n\n当前签名描述文件未包含 App Group 权限，\n分享扩展无法交接文件给主 App。\n\n请使用包含 App Group 的描述文件重新签名本 App，\n或在「设置」→「证书」中导入描述文件。",
-                        success: false
-                    )
-                    // 错误提示保持 6 秒，让用户有时间看清
-                    self.scheduleComplete(after: 6.0)
+                // App Group 域错误（容器不可用/全部写入失败）的 localizedDescription
+                // 已内嵌完整诊断（声明组/描述文件授予组/逐组探针结果/解决办法），
+                // 直接展示——共享容器不可用时扩展日志也写不出去，UI 是唯一诊断出口
+                if error.domain == "AppGroup" {
+                    self.updateStatus(error.localizedDescription, success: false)
+                    // 诊断文字长，多留几秒让用户看清/截图
+                    self.scheduleComplete(after: 12.0)
                 } else {
                     self.updateStatus("保存失败：\(error.localizedDescription)", success: false)
                     self.scheduleComplete(after: 4.0)

@@ -8,18 +8,18 @@ final class AppDelegate: NSObject, UIApplicationDelegate {
     ) -> Bool {
         // 启动清理：本地服务器 TLS 身份遗留的钥匙串孤儿条目。
         CertificateManager.cleanupServerIdentityKeychainItems()
-        // 载入持久化投递追踪
+        // 载入持久化投递追踪与失败专区（跨启动保留，"失败与异常"不再每次启动清零）
         ExternalDeliveryJournal.load()
+        Logger.loadPersistedFailures()
         // 冷启动分享投递兜底：分享面板「拷贝到 IPA Manager」冷启动 App 时，个别系统
         // 版本/时序下 application(_:open:) 与 onOpenURL 均不回调，open 事件丢失表现为
         // "分享后毫无反应"。launchOptions[.url] 是系统冷启动保证携带的投递通道；若
         // open/onOpenURL 随后重复投递同一 URL，由 AppState 的去重兜住，不会双重导入。
+        // 普通启动（无 URL）不落投递日志——每次冷启动固定刷一条"无 URL"纯属噪音。
         if let url = launchOptions?[.url] as? URL {
             ExternalDeliveryJournal.record("冷启动 launchOptions 携带 URL: \(url.lastPathComponent)")
             Logger.info("冷启动携带外部文件: \(url.lastPathComponent)")
             AppState.shared.handleFileOpenedFromOutside(url)
-        } else {
-            ExternalDeliveryJournal.record("冷启动：launchOptions 无 URL（普通启动）")
         }
         // 【关键修复】冷启动主动扫描 Documents/Inbox 与 App Group 共享收件箱：
         // 系统把文件拷入 Documents/Inbox 后并不总能保证 openURL 回调（尤其 iOS 17+、

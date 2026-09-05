@@ -71,7 +71,9 @@ targets:
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.ipamanager.app
-        INFOPLIST_FILE: Sources/Info.plist
+        # Info.plist 路径由下方 info: 节统一声明（xcodegen 会设置 INFOPLIST_FILE），
+        # settings 里不再重复声明：双处声明一旦只改其一，properties 生成路径与工程
+        # 实际引用路径会静默断连且无告警
         HEADER_SEARCH_PATHS:
           - $(SRCROOT)/Vendor/zsign/src
           - $(SRCROOT)/Vendor/zsign/src/common
@@ -177,11 +179,16 @@ targets:
     platform: iOS
     sources:
       - path: Sources/ShareExtension
+        # 两个扩展共用本目录：排除对方 target 的 entitlements / Info.plist 生成物，
+        # 避免被当资源拷进本扩展的 appex（Info.plist 类文件 xcodegen 不进编译阶段，
+        # 但改名后的 ActionInfo.plist 与 *.entitlements 无此保证）
+        excludes:
+          - ActionInfo.plist
+          - "*.entitlements"
       - path: Sources/Shared
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.ipamanager.app.Share
-        INFOPLIST_FILE: Sources/ShareExtension/Info.plist
         TARGETED_DEVICE_FAMILY: "1"
     info:
       path: Sources/ShareExtension/Info.plist
@@ -208,15 +215,17 @@ targets:
     platform: iOS
     sources:
       - path: Sources/ShareExtension
-        # 与分享扩展共用接收控制器目录；该目录内的 Info.plist 属于 Share target，
-        # 在此会被当资源拷贝并与本 target 的 Info.plist 产出路径冲突，必须排除
+        # 与分享扩展共用接收控制器目录；该目录内的 Info.plist / ActionInfo.plist
+        # 属于 Share target，*.entitlements 是两个扩展的签名配置，均须排除，
+        # 避免被当资源拷进本 target 的 appex
         excludes:
           - Info.plist
+          - ActionInfo.plist
+          - "*.entitlements"
       - path: Sources/Shared
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.ipamanager.app.Action
-        INFOPLIST_FILE: Sources/ShareExtension/ActionInfo.plist
         TARGETED_DEVICE_FAMILY: "1"
     info:
       path: Sources/ShareExtension/ActionInfo.plist

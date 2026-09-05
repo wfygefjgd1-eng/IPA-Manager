@@ -147,8 +147,18 @@ final class IPAParser {
         return message
     }
 
+    /// 与 parseAppInfoWithRoot 相同，但解压根目录（Extracted/<base>-<uuid>，可达
+    /// 数百 MB~数 GB）在本函数内用后即清：调用方（安装元数据、bundleID 比对等）
+    /// 只读 info、不持有目录，留着只能等下次冷启动且 mtime 超 10 分钟的孤儿清扫，
+    /// 会话内每次调用泄漏一个目录、磁盘线性堆积。清理不能下沉到 parse /
+    /// parseAppInfoWithRoot——convertToIPAIfNeeded 仍要移动其中的 .app，
+    /// parseAppInfoWithRoot 须把 rootURL 交给调用方决定清理时机（图标持久化后才删）。
     func parseAppInfo(fileURL: URL, progress: ((Double) -> Void)? = nil) throws -> AppInfo {
-        try parseAppInfoWithRoot(fileURL: fileURL, progress: progress).info
+        let (info, rootURL) = try parseAppInfoWithRoot(fileURL: fileURL, progress: progress)
+        // info（含图标，已持久化到 Extracted/Icons/）到手即清，与 parseAppInfoWithRoot
+        // 调用方（AppState 导入路径）的既有清理行为一致。
+        try? fileManager.removeItem(at: rootURL)
+        return info
     }
 
     /// 与 parseAppInfo 相同，但额外返回本次解析的解压根目录（Extracted/<base>-<uuid>）。
@@ -175,8 +185,10 @@ final class IPAParser {
         guard let entry = archive.first(where: { entry in
             guard entry.type == .file, entry.path.hasSuffix("/Info.plist") else { return false }
             let components = entry.path.components(separatedBy: "/")
-            return (components.count == 3 && components[0] == "Payload" && components[1].hasSuffix(".app"))
-                || (components.count == 2 && components[0].hasSuffix(".app"))
+            // .app 扩展名按小写比较：部分打包工具产出 Payload/X.APP，大小写敏感匹配
+            // 命不中轻量路径，会白白回退整包解压（与 findAppBundle 的既有处理一致）。
+            return (components.count == 3 && components[0] == "Payload" && components[1].lowercased().hasSuffix(".app"))
+                || (components.count == 2 && components[0].lowercased().hasSuffix(".app"))
         }) else { return nil }
 
         var plistData = Data()

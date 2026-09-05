@@ -127,8 +127,9 @@ struct AppDetailView: View {
         }
         /// 签名完成弹窗：内容“签名完成，已发起安装”，旁边“确定”和“返回”两个按钮。
         // “返回”：关闭当前详情界面、切回首页 Tab，并挂起 App 直接回到 iOS 桌面（主屏幕）。
-        // 若设置“签名完成自动返回桌面”开启（默认开），弹窗出现约 1.5 秒后自动执行
-        // “返回”动作；用户在此期间手动点了“确定”或“返回”则取消自动返回。
+        // 若设置“签名完成自动返回桌面”开启（默认开），自动执行“返回”：已发起安装时
+        // 锚定 itms-services open 成功后约 1.5 秒（见 startSigning 里的 onInstallOpened），
+        // 未发起安装时从弹窗出现起约 1.5 秒；用户在此期间手动点了“确定”或“返回”则取消自动返回。
         .alert("签名完成", isPresented: $showSignedAlert) {
             Button("确定", role: .cancel) {
                 cancelAutoReturnIfNeeded()
@@ -388,12 +389,20 @@ struct AppDetailView: View {
                 etaSeconds = 0
                 if installAfter {
                     do {
-                        try appState.installSignedPath(signedPath, certificate: certificate)
-                        // 弹窗内容：签名完成，已发起安装（旁边有“确定”与“返回”）
+                        // “自动回桌面”锚定在 itms-services open 成功之后（onInstallOpened
+                        // 主线程回调）：Installer 在后台要先完成服务器 ready 等待（≤5s）+
+                        // 0.8s 探测 + manifest 预检才真正 open，若沿用“发起安装即起 1.5s”
+                        // 的固定计时，App 会被先到的回桌面动作挂起，后台态 open 被系统忽略，
+                        // 表现为“签名完成自动安装”静默失败（与自动一条龙路径
+                        // autoSignAndInstallSucceeded 的修法一致）。
+                        try appState.installSignedPath(signedPath, certificate: certificate) { [self] in
+                            // “未开启自动返回开关不回桌面”“用户手动点确定/返回取消”
+                            // 的判断都在 scheduleAutoReturnIfNeeded 内保留
+                            scheduleAutoReturnIfNeeded()
+                        }
+                        // 弹窗仍立即弹出：installSignedPath 只同步做前置校验，open 及其
+                        // 回调发生在后台（可能数秒后），不阻塞弹窗出现
                         showSignedAlert = true
-                        // 设置开启时自动返回桌面（默认开）：约 1.5s 后自动执行“返回”
-                        //（用户手动点“确定/返回”会取消该自动动作）
-                        scheduleAutoReturnIfNeeded()
                     } catch {
                         alertMessage = "签名完成，安装失败: \(error.localizedDescription)"
                         showAlert = true
@@ -448,7 +457,9 @@ struct AppDetailView: View {
 
     // MARK: - 签名完成自动返回桌面（设置开关，默认开）
 
-    /// 签名完成弹窗出现后自动执行“返回”的延迟任务；用户手动点了“确定/返回”即取消。
+    /// 自动执行“返回”的延迟任务：已发起安装时在 itms-services open 成功回调里调度
+    /// （App 此刻仍在前台，open 已被系统受理，延迟的只是回桌面动作），未发起安装时
+    /// 在弹窗出现后调度；用户手动点了“确定/返回”即取消。
     /// 防止自动返回与用户手动操作重复触发（返回动作里会重新触发 dismiss，重复执行无害
     /// 但会闪跳，因此用标志位保证只执行一次）。
     @State private var autoReturnWorkItem: DispatchWorkItem?
@@ -507,18 +518,34 @@ struct InstallCertificatePicker: View {
             List {
                 Section("选择用于安装的证书") {
                     ForEach(appState.certificates) { cert in
+                        // 过期证书置灰禁用但不从列表隐藏：用户需要看到“为什么不能选”，
+                        // 隐藏会让人误以为证书丢了；选中过期证书发起安装必然被 iOS 拒绝。
                         Button {
                             onConfirm(cert)
                             dismiss()
                         } label: {
                             VStack(alignment: .leading) {
-                                Text(cert.name)
-                                    .foregroundColor(.primary)
-                                Text("到期: \(cert.expireDateDescription)")
+                                HStack(spacing: 6) {
+                                    Text(cert.name)
+                                        .foregroundColor(cert.status == .expired ? .secondary : .primary)
+                                    if cert.status == .expired {
+                                        Text("已过期")
+                                            .font(.caption2.weight(.semibold))
+                                            .foregroundColor(.red)
+                                            .padding(.horizontal, 6)
+                                            .padding(.vertical, 2)
+                                            .background(Capsule().fill(Color.red.opacity(0.12)))
+                                    }
+                                }
+                                // 副标题补充禁用原因（status 由 expireDate 与当前时间比较得出）
+                                Text(cert.status == .expired
+                                     ? "到期: \(cert.expireDateDescription) · 已过期，无法用于安装"
+                                     : "到期: \(cert.expireDateDescription)")
                                     .font(.caption)
                                     .foregroundColor(.secondary)
                             }
                         }
+                        .disabled(cert.status == .expired)
                     }
                 }
             }

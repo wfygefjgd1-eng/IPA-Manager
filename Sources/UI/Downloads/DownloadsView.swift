@@ -534,7 +534,9 @@ struct DownloadsView: View {
             // 兜底：handleDownloadedFile 对“证书包 zip”不会回调 completion（证书导入无 completion），
             // 该分支几秒内无结果时再查一次 importedApps，仍未命中才弹通用提示，避免用户无任何反馈。
             do {
-                _ = try IPAParser().parse(fileURL: URL(fileURLWithPath: path))
+                // parseAppInfo（而非 parse）：解析后自动清理解压目录——本调用只做
+                // "zip 能否解析出应用"的探测，返回值整体丢弃，用后即清不留 GB 级副本
+                _ = try IPAParser().parseAppInfo(fileURL: URL(fileURLWithPath: path))
                 DispatchQueue.main.async {
                     if let app = self.matchedApp(for: task) {
                         Logger.info("zip 已自动导入成功，零延迟打开签名页: \(app.name)")

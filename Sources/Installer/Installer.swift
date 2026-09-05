@@ -31,8 +31,14 @@ final class Installer: Installing {
     }
 
     /// 后台执行完整安装流程（服务器启动/探测 + IPA 元数据解析 + manifest 生成），
-    /// 出错时停掉本地服务器并记录错误日志；成功后再切回主线程打开 itms-services 链接。
+    /// 出错时记录错误日志（若本次安装已成功启动服务器则一并停掉）；成功后再切回
+    /// 主线程打开 itms-services 链接。
     private func performInstall(ipaPath: String, certificate: CertificateInfo, onInstallOpened: (() -> Void)?) {
+        // 只有 start() 成功返回，本次安装才"拥有"了本地服务器。start 抛错（等待
+        // 上一个安装空闲超时、监听器就绪失败）时，服务器要么仍属于上一个可能正在
+        // 向 SpringBoard 传输 IPA 的会话，要么已被 startOnce 的失败路径自行清理——
+        // 此时兜底 stop() 会连上一个安装一起杀掉（批量签名时表现为上一个安装静默失败）。
+        var serverStarted = false
         do {
             let ipaURL = URL(fileURLWithPath: ipaPath)
             // 本地服务器只负责流式提供 IPA；manifest 走公网 HTTPS
@@ -40,6 +46,7 @@ final class Installer: Installing {
             // 系统安装进程拒绝本地 HTTP manifest、以及蜂窝 CGNAT IP 本机
             // 不可自访问两个问题。
             let baseURL = try LocalInstallServer.shared.start(ipaLocalURL: ipaURL)
+            serverStarted = true
 
             // 解析安装元数据（bundle-identifier / 名称 / 版本）。
             // 优先轻量读取 zip 中央目录里的 Payload/<App>.app/Info.plist 单个条目
@@ -138,9 +145,12 @@ final class Installer: Installing {
             }
         } catch {
             // 后台失败无法在此时同步抛给调用方（调用方在异步完成前已显示"安装请求已发出"），
-            // 停掉本地服务器并记录详细错误，避免 NWListener/音频保活残留；
-            // 同时用全局 toast 补一条用户可见反馈，避免"点了安装毫无反应"。
-            LocalInstallServer.shared.stop()
+            // 记录详细错误并用全局 toast 补一条用户可见反馈，避免"点了安装毫无反应"。
+            // 仅当本次安装曾成功启动服务器才兜底 stop（避免 NWListener/音频保活残留）：
+            // start 抛错说明服务器从未归本会话所有，停它只会掐死上一个仍在进行的安装。
+            if serverStarted {
+                LocalInstallServer.shared.stop()
+            }
             Logger.error("本地安装失败: \(error.localizedDescription)")
             AppState.shared.showToast("安装失败：\(error.localizedDescription)")
         }

@@ -18,6 +18,10 @@ final class LocalInstallServer {
     private var lastBaseURL: URL?
     /// 服务器是否处于运行状态（start 就绪到 stop 之间）：stop 的幂等判定与日志降噪
     private var isRunning = false
+    /// 启动进行中（startOnce 进入到 ready 等待结束之间）：此窗口内 isRunning 尚为
+    /// false，"等空闲"判定若只看 isRunning，并发安装会误判空闲并抢先 startOnce，
+    /// 其入口 stop() 会取消本会话刚就绪的监听器（互杀）。
+    private var isStarting = false
     /// 本次服务器启动时刻：安装确认弹窗可能停留任意久（期间无任何连接活动），
     /// 回前台/保活超时除活动时间外还看会话时长，避免弹窗停留较久的用户
     /// 回 App 后服务器被误停
@@ -27,7 +31,7 @@ final class LocalInstallServer {
     private var lastActivityDate: Date?
     /// 上一个会话的 IPA 是否已完整发出（EOF）及发完时刻：连续安装的"等空闲"
     /// 判定依据——整个 IPA 发完后 SpringBoard 不再需要旧服务器，可安全重启。
-    /// 仅在服务器串行队列读写（sendFileChunks 运行在该队列）。
+    /// 仅在服务器串行队列读写（sendFileChunks 及其 send 完成回调运行在该队列）。
     private var transferCompletedDate: Date?
 
     /// 持有并发探测结果的盒子，避免在并发 Task 中直接捕获可变变量（Sendable 警告）。
@@ -141,9 +145,10 @@ final class LocalInstallServer {
     }
 
     /// 等待上一个安装会话空闲（连续/批量安装防互踩）。满足其一即空闲：
-    /// 1) 服务器未在运行（从未启动 / 已 stop）；
-    /// 2) 上一个会话的 IPA 已完整发出（EOF）且距今超过 5 秒——SpringBoard
-    ///    下载完成后不再需要旧服务器，可安全重启；
+    /// 1) 服务器既未运行也未在启动中（从未启动 / 已 stop）——启动中的会话
+    ///    （ready 等待，最长 5 秒）isRunning 仍为 false，不能据此判空闲；
+    /// 2) 上一个会话的 IPA 已完整发出（EOF / 传输中止）且距今超过 5 秒——
+    ///    SpringBoard 下载完成后（或已断开）不再需要旧服务器，可安全重启；
     /// 3) 等待超过 15 分钟硬上限：用户把系统安装确认弹窗无限期挂着时放弃等待，
     ///    由调用方给出明确错误（而不是掐死上一个安装）。
     /// 期间并发 stop() 会把 isRunning 置 false，循环随即退出。
@@ -153,7 +158,7 @@ final class LocalInstallServer {
         while true {
             var idle = false
             ServerQueue.shared.queue.sync {
-                idle = !isRunning
+                idle = (!isRunning && !isStarting)
                     || (transferCompletedDate.map { Date().timeIntervalSince($0) >= 5 } ?? false)
             }
             if idle { return }
@@ -185,6 +190,12 @@ final class LocalInstallServer {
     /// 单次启动尝试（stop 旧会话 → 随机端口监听 → 等 ready → 探测 → 保活）。
     /// 抛出的 AppError 描述为具体原因（无"启动失败"前缀），由 start 统一包装。
     private func startOnce(ipaLocalURL: URL) throws -> URL {
+        // 先于入口 stop() 登记启动状态：从现在到 isRunning 置 true 之间是"启动中"
+        // 窗口，必须让并发安装的"等空闲"判定看到忙（详见 isStarting 注释）。
+        // defer 复位覆盖全部退出路径（就绪成功 / ready 超时抛错 / 异常），且在
+        // isRunning 置 true 之后才执行，两标志之间不存在同时为 false 的空窗。
+        ServerQueue.shared.queue.sync { isStarting = true }
+        defer { ServerQueue.shared.queue.sync { isStarting = false } }
         stop()
 
         let port = UInt16.random(in: 49152...65535)
@@ -472,6 +483,12 @@ final class LocalInstallServer {
                 // 绝不进入分块发送循环
                 try? handle.close()
                 connection.cancel()
+                // 与 sendFileChunks 失败分支同理：对端断开即本会话已死亡，
+                // 须记录传输结束时刻，否则批量安装的下一个"等空闲"会空转到
+                // 15 分钟硬上限。完成回调运行在服务器串行队列，直接写安全。
+                if error != nil {
+                    self?.transferCompletedDate = Date()
+                }
                 return
             }
             self.sendFileChunks(from: handle, connection: connection)
@@ -508,6 +525,14 @@ final class LocalInstallServer {
                 // stateUpdateHandler 的 .cancelled 分支在服务器队列上移除）。
                 try? handle.close()
                 connection.cancel()
+                // 对端断开即本次安装会话已死亡：与 EOF 分支同样记录传输结束时刻，
+                // 否则连续安装的下一个"等空闲"永远等不到标记，空转到 15 分钟硬上限。
+                // 仅在真发送失败时写（weak self 失效但未出错时无事可做）；完成回调
+                // 运行在服务器串行队列，与 EOF 分支一致直接写。连接被本方 stop()
+                // 取消时多写一次无害：stop 已置 isRunning=false，判定照样视为空闲。
+                if error != nil {
+                    self?.transferCompletedDate = Date()
+                }
                 return
             }
             self.sendFileChunks(from: handle, connection: connection)

@@ -71,6 +71,13 @@ final class AppState: ObservableObject {
     /// 日志面板展开状态（默认折叠）
     @Published var showDeliveryLog: Bool = false
 
+    /// 投递日志变更后同步 UI 快照（清空/手动扫描等入口调用）
+    func refreshDeliveryLogEntries() {
+        DispatchQueue.main.async {
+            self.deliveryLogEntries = ExternalDeliveryJournal.getEntries()
+        }
+    }
+
     /// 在任意线程设置全局轻提示（内部切回主线程并安排自动清除；重复设置会重置计时）。
     func showToast(_ message: String) {
         DispatchQueue.main.async {
@@ -857,74 +864,113 @@ final class AppState: ObservableObject {
     /// 防 open 事件 × 回前台扫描 × 冷启动 launchOptions 对同一文件并发/重复触发导入。
     private var pendingInboxImports: Set<String> = []
 
-    /// 共享容器可用性已记录（每次进程只记一次，避免追踪日志被重复条目淹没）
-    private var didJournalGroupAvailability = false
+    /// 上次扫描指纹（内存）：容器集合 + 各投递目录计数。扫描是高频触发（一次回前台
+    /// 最多 4 次），指纹不变就不落投递日志——旧版每次扫描固定刷 2~4 条"无文件"，
+    /// 120 条环形缓冲约 20 次前后台切换就刷光，真实信号全被淹没（用户实测日志
+    /// "每次都一模一样"的直接原因）。
+    private var lastScanFingerprint: String?
+    private var scanRunCount = 0
 
-    /// 可自动导入的散落投递扩展名（Documents 根目录扫描用；Inbox 内不做扩展名过滤
-    /// ——系统投递什么处理什么）。Documents 根下只认应用/证书文件，避免把用户经
-    /// 文件 App 放进来的其它文件误当投递。
+    /// 可自动导入的投递扩展名（Documents 内扫描用；Inbox 内不做扩展名过滤
+    /// ——系统投递什么处理什么）。Documents 内只认应用/证书文件，避免把用户
+    /// 经文件 App 放进来的其它文件误当投递。
     private static let deliveryExtensions: Set<String> = ["ipa", "zip", "p12", "pfx", "mobileprovision"]
 
-    /// 分享投递路径识别：Documents/Inbox 内（系统拷贝投递）、Documents 根目录下的
-    /// 可导入应用/证书文件（document-browser 式"保存到 App"投递 / 用户经文件 App 放入）、
-    /// 或 App Group 共享收件箱内（分享扩展接收的文件）。
+    /// Documents 下由本 App 管理的目录：投递扫描（含子目录）必须跳过——这些目录
+    /// 里的 ipa/zip 是导入产物/工作副本/证书副本，绝不能被当成新投递再次导入。
+    private static let managedDocumentsDirs: Set<String> = [
+        "Inbox", "IPA", "Signed", "Extracted", "Certificates", "Profiles", "Downloads", "Icons"
+    ]
+
+    /// 分享投递路径识别：Documents/Inbox 内（系统拷贝投递）、任一共享容器收件箱内
+    /// （分享扩展接收的文件，扇入枚举全部容器）、或 Documents 内任意层级的可导入
+    /// 文件（用户经文件 App 放入/保存，v1.0.142 起扫描扩展到子目录，识别口径与
+    /// 扫描一致；本 App 管理目录内的产物不算投递）。
     private func isDeliveryPath(_ url: URL) -> Bool {
         if url.path.hasPrefix(inboxURL.path + "/") { return true }
-        if let groupInbox = AppGroup.inboxURLIfPresent,
-           url.path.hasPrefix(groupInbox.path + "/") {
+        for groupInbox in AppGroup.allInboxURLsIfPresent
+        where url.path.hasPrefix(groupInbox.path + "/") {
             return true
         }
         guard Self.deliveryExtensions.contains(url.pathExtension.lowercased()) else { return false }
-        return url.deletingLastPathComponent().path == fileManager.documentsURL.path
+        let documentsPath = fileManager.documentsURL.path
+        guard url.path.hasPrefix(documentsPath + "/") else { return false }
+        let relative = String(url.path.dropFirst(documentsPath.count + 1))
+        guard let topDir = relative.split(separator: "/").first else { return false }
+        return !Self.managedDocumentsDirs.contains(String(topDir))
     }
 
-    /// 回前台扫描待处理投递（触发点：SwiftUI scenePhase == .active 与
-    /// applicationDidBecomeActive 双挂——iOS 27 实测不再回调 application 级
-    /// didBecomeActive，SwiftUI scenePhase 是可靠触发点；两者并存，扫描内部去重）：
-    /// 扫描 Documents/Inbox（系统拷贝投递）、App Group 共享收件箱（分享扩展接收）、
-    /// Documents 根目录（document-browser 式"保存到 App"投递 / 用户经文件 App 放入）：
-    /// - 已结算且文件不存在：清掉失效登记（防集合无限增长）；
-    /// - 已结算但文件仍存在（删除失败等残留）：超过 24h 直接删除并清登记；
-    /// - 未登记：视为 open 事件丢失的投递，补走完整导入链路（handleFileOpenedFromOutside
-    ///   内部登记在途 + 结算自删 + 既有自动签名一条龙）。
-    /// 仅主线程调用；目录不存在/为空时开销仅一次目录探测。
-    func processInboxFilesIfNeeded() {
-        if !didJournalGroupAvailability {
-            didJournalGroupAvailability = true
-            ExternalDeliveryJournal.record(AppGroup.resolvedIdentifier().map { identifier in
-                "共享容器：可用（组 \(identifier)）"
-            } ?? "共享容器：不可用（描述文件未授予 App Group，分享扩展无法交接文件）")
+    /// 收集 Documents 内的投递文件（根目录 + 有界深度子目录，跳过本 App 管理目录与
+    /// 隐藏目录）。文件 App（UIFileSharingEnabled 让 Documents 对文件 App 可见）是
+    /// iOS 27 上最可靠的投递通道——分享面板路由失效时"把文件存/移动到 IPA Manager
+    /// 文件夹"仍然可用；子目录扫描让用户可以先按文件夹整理再统一投递。
+    private func collectDocumentDeliverables() -> [URL] {
+        var result: [URL] = []
+        var queue: [(url: URL, depth: Int)] = [(fileManager.documentsURL, 0)]
+        while !queue.isEmpty {
+            let (dir, depth) = queue.removeFirst()
+            let entries = (try? FileManager.default.contentsOfDirectory(
+                at: dir, includingPropertiesForKeys: [.isDirectoryKey, .contentModificationDateKey],
+                options: [.skipsHiddenFiles])) ?? []
+            for entry in entries {
+                let isDirectory = (try? entry.resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory ?? false
+                if isDirectory {
+                    if depth < 2, !Self.managedDocumentsDirs.contains(entry.lastPathComponent) {
+                        queue.append((entry, depth + 1))
+                    }
+                } else if Self.deliveryExtensions.contains(entry.pathExtension.lowercased()) {
+                    result.append(entry)
+                }
+            }
         }
-        // 详细诊断：记录每个扫描目录的存在状态和文件数量
-        let inboxExists = FileManager.default.fileExists(atPath: inboxURL.path)
-        let groupInboxExists = AppGroup.inboxURLIfPresent.map { FileManager.default.fileExists(atPath: $0.path) } ?? false
-        let groupContainerExists = AppGroup.containerURL != nil
+        return result
+    }
+
+    /// 扫描待处理投递（触发点：SwiftUI scenePhase == .active 与
+    /// applicationDidBecomeActive 双挂——iOS 27 实测不再回调 application 级
+    /// didBecomeActive，SwiftUI scenePhase 是可靠触发点；两者并存，扫描内部去重；
+    /// 另有冷启动、ipamanager:// 唤起、日志页"立即扫描"）：
+    /// - Documents/Inbox：系统「拷贝到 App」拷贝投递；
+    /// - 全部可用共享容器的收件箱：分享扩展接收（扇入枚举所有容器，扩展与主 App
+    ///   即使解析到不同组也不丢文件——旧版只扫单个解析组，组错位即全盲）；
+    /// - Documents 根目录与子目录：文件 App 放入/保存的投递。
+    /// 处理规则：已结算且文件不在 → 清失效登记；已结算但文件仍在 → 超 24h 清扫；
+    /// 未登记 → 视为 open 事件丢失的投递，补走完整导入链路（handleFileOpenedFromOutside
+    /// 内部登记在途 + 结算自删 + 自动一条龙签名安装）。
+    /// 仅主线程调用；目录不存在/为空时开销仅几次目录探测。
+    func processInboxFilesIfNeeded() {
         let inboxFiles = (try? FileManager.default.contentsOfDirectory(
             at: inboxURL, includingPropertiesForKeys: [.contentModificationDateKey],
             options: [.skipsHiddenFiles])) ?? []
-        let groupInboxFiles = AppGroup.inboxURLIfPresent.map { inbox -> [URL] in
+        let groupInboxFiles = AppGroup.allInboxURLsIfPresent.flatMap { inbox -> [URL] in
             (try? FileManager.default.contentsOfDirectory(
                 at: inbox, includingPropertiesForKeys: [.contentModificationDateKey],
                 options: [.skipsHiddenFiles])) ?? []
-        } ?? []
-        ExternalDeliveryJournal.record("扫描诊断：Documents/Inbox=\(inboxExists)(\(inboxFiles.count)项) AppGroup容器=\(groupContainerExists) 共享Inbox=\(groupInboxExists)(\(groupInboxFiles.count)项)")
-        
-        ExternalDeliveryJournal.record(inboxFiles.isEmpty
-            ? "回前台扫描：Inbox 无文件"
-            : "回前台扫描：Inbox \(inboxFiles.count) 项 [\(inboxFiles.map { $0.lastPathComponent }.joined(separator: "、"))]")
+        }
+        let documentFiles = collectDocumentDeliverables()
 
-        if !groupInboxFiles.isEmpty {
-            ExternalDeliveryJournal.record("回前台扫描：共享 Inbox \(groupInboxFiles.count) 项 [\(groupInboxFiles.map { $0.lastPathComponent }.joined(separator: "、"))]")
+        // 投递日志降噪：容器集合或任一目录计数变化才记一条；组集合与持久记忆不同
+        // （重签换描述文件/组漂移）再单独记一条。静默扫描零日志。
+        scanRunCount += 1
+        let containers = AppGroup.usableContainers()
+        let containerSet = containers.map { $0.identifier }.sorted().joined(separator: ",")
+        let fingerprint = "\(containerSet)|\(inboxFiles.count)|\(groupInboxFiles.count)|\(documentFiles.count)"
+        if fingerprint != lastScanFingerprint {
+            lastScanFingerprint = fingerprint
+            let containerNote = containers.isEmpty ? "无可用" : containerSet
+            ExternalDeliveryJournal.record(
+                "扫描：Inbox=\(inboxFiles.count) 共享Inbox=\(groupInboxFiles.count) Documents=\(documentFiles.count) 容器[\(containerNote)]"
+            )
+            if containerSet != store.loadLastKnownContainerSet() {
+                store.saveLastKnownContainerSet(containerSet)
+                if !containers.isEmpty {
+                    ExternalDeliveryJournal.record("共享容器：可用（组 \(containerSet)）", level: .ok)
+                }
+            }
         }
 
-        let documentsRootFiles = ((try? FileManager.default.contentsOfDirectory(
-            at: fileManager.documentsURL, includingPropertiesForKeys: [.contentModificationDateKey],
-            options: [.skipsHiddenFiles])) ?? [])
-            .filter { !$0.hasDirectoryPath }
-            .filter { Self.deliveryExtensions.contains($0.pathExtension.lowercased()) }
-
         // 剪枝：源文件已不存在的已结算登记（正常结算即删文件）顺带清掉
-        let alive = Set((inboxFiles + groupInboxFiles + documentsRootFiles).map { $0.path })
+        let alive = Set((inboxFiles + groupInboxFiles + documentFiles).map { $0.path })
         let settledAndGone = processedInboxPaths.subtracting(alive)
         if !settledAndGone.isEmpty {
             processedInboxPaths.subtract(settledAndGone)
@@ -933,11 +979,9 @@ final class AppState: ObservableObject {
 
         let now = Date()
         var importedCount = 0
-        var skippedCount = 0
-        var errorCount = 0
         for file in inboxFiles.filter({ !$0.hasDirectoryPath })
             + groupInboxFiles.filter({ !$0.hasDirectoryPath })
-            + documentsRootFiles {
+            + documentFiles {
             let path = file.path
             if processedInboxPaths.contains(path) {
                 // 已结算但源文件仍在（删除失败等残留）：超期清扫
@@ -949,7 +993,6 @@ final class AppState: ObservableObject {
                     store.saveProcessedInboxPaths(Array(processedInboxPaths))
                     Logger.info("清理超期分享投递残留: \(file.lastPathComponent)")
                 }
-                skippedCount += 1
                 continue
             }
             // 未登记 = open 事件丢失（正常投递的文件在结算时已自删，不会留到这里）。
@@ -958,44 +1001,55 @@ final class AppState: ObservableObject {
             handleFileOpenedFromOutside(file)
             importedCount += 1
         }
-        // 可见化反馈：扫描结果让用户知道发生了什么
+        // 可见化反馈：只在真的开始导入时提示（旧版"已处理过"分支每次回前台都弹，
+        // 属于打扰）
         if importedCount > 0 {
             showToast("收到 \(importedCount) 个分享文件，正在导入…")
-        } else if (inboxFiles.count + groupInboxFiles.count + documentsRootFiles.count) > 0 {
-            showToast("分享投递已处理过（或非待导入文件）")
-        } else if !didJournalGroupAvailability {
-            // 首次扫描且无文件：不提示，避免干扰
         }
-        // 跨进程可见性：吞入扩展进程写入共享容器的新增日志行（扩展与主 App 是两个进程，
-        // 主 App 的投递日志天然看不到扩展；这里按字符偏移增量消费，避免重复刷屏）。
-        ingestExtensionLogIfNeeded()
+        // 跨进程可见性：吞入扩展进程写入共享容器的新增日志行（扩展与主 App 是两个
+        // 进程，主 App 的投递日志天然看不到扩展）。
+        ingestExtensionLogsIfNeeded()
         // 实时同步投递日志到 UI
         DispatchQueue.main.async {
             self.deliveryLogEntries = ExternalDeliveryJournal.getEntries()
         }
     }
 
-    /// 吞入共享容器中的扩展日志新增行：扩展每次被分享面板唤起都会先写“扩展启动”，
-    /// 主 App 读到即证明扩展进程活着（入口可见且能启动）；读不到则入口缺失或启动即崩。
-    private func ingestExtensionLogIfNeeded() {
-        guard let logURL = AppGroup.extensionLogURLIfPresent,
-              let data = try? Data(contentsOf: logURL),
-              !data.isEmpty else { return }
-        var offset = store.loadExtensionLogOffset()
-        // 日志被截断/轮转后文件变短：偏移复位，避免永远读不到新行
-        if offset > data.count { offset = 0 }
-        guard offset < data.count else {
-            store.saveExtensionLogOffset(data.count)
-            return
+    /// 吞入共享容器中的扩展日志新增行：扩展每次被分享面板唤起都会先写"扩展启动"，
+    /// 主 App 读到即证明扩展进程活着（入口可见且能启动）。
+    /// 扇入读取**全部**可用容器（扩展与主 App 可能解析到不同组，旧版只读单个解析组
+    /// 在组错位时全盲）；按容器目录名（UUID，跨启动稳定）分别记账字符偏移。
+    /// 含"失败"字样的行升级为错误级并写 Logger 失败专区——扩展进程不编译 Logger，
+    /// 这是扩展侧错误进入"失败与异常"专区的唯一通道。
+    private func ingestExtensionLogsIfNeeded() {
+        var offsets = store.loadExtensionLogOffsetsByGroup()
+        var changed = false
+        for inbox in AppGroup.allInboxURLsIfPresent {
+            let containerDir = inbox.deletingLastPathComponent()
+            let logURL = containerDir.appendingPathComponent(AppGroup.extensionLogFileName)
+            guard let data = try? Data(contentsOf: logURL), !data.isEmpty else { continue }
+            let containerKey = containerDir.lastPathComponent
+            var offset = offsets[containerKey] ?? 0
+            // 日志被截断/轮转后文件变短：偏移复位，避免永远读不到新行
+            if offset > data.count { offset = 0 }
+            guard offset < data.count else { continue }
+            let slice = Data(data[offset...])
+            offsets[containerKey] = data.count
+            changed = true
+            guard let text = String(data: slice, encoding: .utf8),
+                  !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { continue }
+            for line in text.components(separatedBy: "\n") {
+                let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
+                guard !trimmed.isEmpty else { continue }
+                let isFailure = trimmed.contains("失败")
+                ExternalDeliveryJournal.record("扩展：\(trimmed)", level: isFailure ? .error : .info)
+                if isFailure {
+                    Logger.error("扩展侧失败（跨进程日志）：\(trimmed)")
+                }
+            }
         }
-        let slice = Data(data[offset...])
-        store.saveExtensionLogOffset(data.count)
-        guard let text = String(data: slice, encoding: .utf8),
-              !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
-        for line in text.components(separatedBy: "\n") {
-            let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
-            guard !trimmed.isEmpty else { continue }
-            ExternalDeliveryJournal.record("扩展：\(trimmed)")
+        if changed {
+            store.saveExtensionLogOffsetsByGroup(offsets)
         }
     }
 
@@ -1060,7 +1114,7 @@ final class AppState: ObservableObject {
                 self.processedInboxPaths.insert(url.path)
                 self.store.saveProcessedInboxPaths(Array(self.processedInboxPaths))
                 try? FileManager.default.removeItem(at: url)
-                ExternalDeliveryJournal.record("投递结算: \(url.lastPathComponent)（\(note)；源文件已删）")
+                ExternalDeliveryJournal.record("投递结算: \(url.lastPathComponent)（\(note)；源文件已删）", level: .ok)
             }
         }
 
@@ -1554,9 +1608,20 @@ final class AppState: ObservableObject {
     }
 
     func addProfile(_ profile: ProvisioningInfo) {
-        profiles.append(profile)
-        if selectedProfile == nil {
-            selectedProfile = profiles.first { $0.status == .valid } ?? profile
+        // 同 uuid 描述文件（同一证书包被分享两次/多个入口重复导入）原地更新而非追加：
+        // 磁盘文件是同一个（persistProfile 按 uuid 命名），重复记录会让列表重复展示、
+        // 删除一条后另一条仍指向有效文件，行为不一致。去重下沉到本方法，三条导入
+        // 路径（单文件/证书包/证书页）共用同一口径。
+        if let index = profiles.firstIndex(where: { $0.uuid == profile.uuid }) {
+            profiles[index] = profile
+            if selectedProfile?.uuid == profile.uuid {
+                selectedProfile = profile
+            }
+        } else {
+            profiles.append(profile)
+            if selectedProfile == nil {
+                selectedProfile = profiles.first { $0.status == .valid } ?? profile
+            }
         }
         saveState()
     }

@@ -6,6 +6,17 @@ DerivedData/
 xcuserdata/
 *.xcuserstate
 
+# XcodeGen 生成文件：project.yml 的 info.properties / entitlements.properties
+# 每次 xcodegen generate 都会重新生成并覆盖这些文件（设计上以 project.yml 为
+# 唯一事实源）。不入库防止：① 误提交后改 properties 被 generate 静默覆盖，
+# 出现"改了不生效"；② generate 前误读磁盘上的过期副本
+IPAManager.entitlements
+Sources/Info.plist
+Sources/ShareExtension/Info.plist
+Sources/ShareExtension/ActionInfo.plist
+Sources/ShareExtension/IPAManagerShare.entitlements
+Sources/ShareExtension/IPAManagerAction.entitlements
+
 # Swift Package Manager
 .build/
 .swiftpm/
