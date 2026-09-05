@@ -896,7 +896,7 @@ final class AppState: ObservableObject {
         // 发起安装阶段（本地服务器启动 + manifest 生成 + 预检，约 2-5 秒）也上屏：
         // 这段同样无反馈，是"空白后突然弹安装窗"观感的另一半来源
         setPipelineStatus(app.name, "正在发起安装…", "启动本地安装通道")
-        ExternalDeliveryJournal.record("自动签名完成，发起安装: \(app.name)（\(signedPath.lastPathComponent)）")
+        ExternalDeliveryJournal.record("自动签名完成，发起安装: \(app.name)（\((signedPath as NSString).lastPathComponent)）")
         do {
             try installSignedPath(signedPath, certificate: certificate) { [weak self] in
                 // itms-services open 成功后（主线程回调）才调度回桌面。此前固定 1.2s
