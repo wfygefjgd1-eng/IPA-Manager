@@ -411,7 +411,26 @@ bool ZBundle::SignNode(jvalue& jvNode)
 		};
 		for (auto it = m_pSignAssets->rbegin(); it != m_pSignAssets->rend(); ++it) {
 			m_pSignAsset = &(*it);
-			if (endsWith(m_pSignAsset->m_strApplicationId, strBundleId)) {
+			bool bProvisionMatch = endsWith(m_pSignAsset->m_strApplicationId, strBundleId);
+			// Top-level app extensions (PlugIns/*.appex) get nothing under the
+			// original endsWith rule: their bundle id EXTENDS the app id
+			// (com.x.y -> com.x.y.Share) while application-identifier only
+			// covers com.x.y, so the profile was never written into the appex
+			// and modern iOS refuses to load a profile-less extension (share
+			// entry taps silently do nothing). Fallback for top-level appexes:
+			// match when the profile's bundle-id part (after the team prefix)
+			// is a prefix of the extension id, or is the "*" wildcard — same
+			// layout legit resign tools produce (profile embedded in every
+			// top-level extension).
+			if (!bProvisionMatch && IsAppExtensionPath(strFolder)) {
+				const string& strAppId = m_pSignAsset->m_strApplicationId;
+				size_t dot = strAppId.find('.');
+				if (dot != string::npos) {
+					const string strIdPart = strAppId.substr(dot + 1);
+					bProvisionMatch = (strIdPart == "*") || (strBundleId.rfind(strIdPart, 0) == 0);
+				}
+			}
+			if (bProvisionMatch) {
 				if (!ZFile::WriteFileV(m_pSignAsset->m_strProvData, "%s/%s/embedded.mobileprovision", m_strAppFolder.c_str(), strFolder.c_str())) {
 					ZLog::ErrorV(">>> Can't write embedded.mobileprovision!\n");
 					return false;

@@ -128,6 +128,11 @@ struct DeliveryLogView: View {
             Text("共 \(appState.deliveryLogEntries.count) 条记录")
                 .font(.caption)
                 .foregroundColor(.secondary)
+            // 备用投递通道指引：文档投递与扩展入口都依赖系统路由，iOS 27 上
+            // 可能整体失效；文件 App 文件夹是唯一不依赖分享面板的可靠通道
+            Text("分享后没反应？把 ipa/zip 存到「文件」App → 我的 iPhone → IPA Manager 文件夹（含子文件夹，自动导入签名安装）。")
+                .font(.caption2)
+                .foregroundColor(.secondary)
         }
         .padding(12)
         .frame(maxWidth: .infinity, alignment: .leading)

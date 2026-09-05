@@ -78,10 +78,30 @@ enum AppGroup {
     /// 从本 target 自带的 embedded.mobileprovision 提取描述文件实际授予的 App Groups。
     /// App 与扩展的 bundle 内各有一份自己的描述文件（签名工具注入），这是不需要
     /// 跨进程传递、也不需要沙盒外路径权限的组名真相来源。
+    /// 扩展拿不到自己的描述文件时（部分签名工具只把描述文件写进主 App），回退读
+    /// **宿主主 App** 的描述文件——appex 就在主 App bundle 内，沿目录上溯即可，
+    /// 不需要任何沙盒外权限；没有这一步，扩展进程的组候选只剩默认名与沙盒外扫描，
+    /// 在真机上双双失败、共享容器整体不可用（实测根因之一）。
     static func profileGrantedIdentifiers() -> [String] {
-        guard let url = Bundle.main.url(forResource: "embedded", withExtension: "mobileprovision"),
-              let data = try? Data(contentsOf: url) else { return [] }
-        return groupsInProvisionData(data)
+        if let data = profileDataInBundle(Bundle.main.bundleURL),
+           !groupsInProvisionData(data).isEmpty {
+            return groupsInProvisionData(data)
+        }
+        var url = Bundle.main.bundleURL
+        for _ in 0..<3 {
+            url = url.deletingLastPathComponent()
+            if let data = profileDataInBundle(url) {
+                let groups = groupsInProvisionData(data)
+                if !groups.isEmpty { return groups }
+            }
+        }
+        return []
+    }
+
+    private static func profileDataInBundle(_ directoryURL: URL) -> Data? {
+        let url = directoryURL.appendingPathComponent("embedded.mobileprovision")
+        guard let data = try? Data(contentsOf: url), !data.isEmpty else { return nil }
+        return data
     }
 
     /// 从 mobileprovision 原始数据提取 group.* 组名。CMS 二进制包裹里组名是
@@ -385,9 +405,13 @@ enum AppGroup {
         var lines: [String] = []
         let containers = usableContainers()
         let granted = profileGrantedIdentifiers()
+        let hasOwnProfile = profileDataInBundle(Bundle.main.bundleURL) != nil
+        let sourceNote = hasOwnProfile || granted.isEmpty
+            ? ""
+            : "（读自宿主主 App 描述文件——扩展自身无 embedded.mobileprovision）"
         lines.append("进程：\(Bundle.main.bundleIdentifier ?? "?")")
         lines.append("声明的默认组：\(defaultIdentifier)")
-        lines.append("描述文件实际授予：\(granted.isEmpty ? "读不到（无 embedded.mobileprovision 或未授予组）" : granted.joined(separator: "、"))")
+        lines.append("描述文件实际授予：\(granted.isEmpty ? "读不到（无 embedded.mobileprovision 或未授予组）" : granted.joined(separator: "、"))\(sourceNote)")
         if containers.isEmpty {
             lines.append("可用容器：无（全部候选组探针失败）")
             lines.append(diagnosticUnavailableMessage())

@@ -199,6 +199,9 @@ enum Logger {
             let extGroups = Self.groupsInMobileProvisionFile(
                 appexURL.appendingPathComponent("embedded.mobileprovision"))
             lines.append("  描述文件组：\(extGroups.isEmpty ? "无/读不到" : extGroups.joined(separator: "、"))")
+            if extGroups.isEmpty {
+                lines.append("  ⚠️ 扩展内没有 embedded.mobileprovision：iOS 17+ 会拒绝加载无描述文件的扩展（分享入口点了毫无反应的直接原因）。zsign 旧版只给主 App 写描述文件，用修复后的本引擎重签即可把描述文件补进每个扩展。")
+            }
             if let mainGroup, !extGroups.isEmpty, !extGroups.contains(mainGroup) {
                 lines.append("  ⚠️组错位：该扩展的描述文件里没有主 App 正在用的组，主 App 永远读不到它存的文件！")
             }

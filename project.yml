@@ -199,10 +199,15 @@ targets:
         NSExtension:
           NSExtensionPointIdentifier: com.apple.share-services
           NSExtensionPrincipalClass: "$(PRODUCT_MODULE_NAME).ShareViewController"
-          # 激活规则：TRUEPREDICATE（侧载工具专用取舍）——QQ/微信等宿主经常不以 file-url
-          # 形态给文件（data/链接/复合载荷），file-only 谓词会让入口直接不显示。
-          # 常显后，不支持的类型由扩展内明确提示，不会静默失败。
-          NSExtensionActivationRule: TRUEPREDICATE
+          # 激活规则必须用字典谓词：TRUEPREDICATE 是编译期占位布尔，iOS 17+ 对它
+          # 的运行时行为未定义——实测（iOS 27）分享面板显示入口但点按不呈现扩展
+          # UI（表现为"跳到主 App 后毫无反应"）。字典规则声明接受文件类载荷
+          #（ipa/zip/证书），QQ/微信传文件给的是 file 附件，能正常命中；
+          # 纯文本/网页分享不再显示入口（本就处理不了），误触率为零。
+          NSExtensionActivationRule:
+            NSExtensionActivationDictionaryVersion: 2
+            NSExtensionActivationSupportsFilesWithMaxCount: 20
+            NSExtensionActivationSupportsAttachmentsWithMaxCount: 20
     entitlements:
       path: Sources/ShareExtension/IPAManagerShare.entitlements
       properties:
@@ -236,9 +241,12 @@ targets:
         NSExtension:
           NSExtensionPointIdentifier: com.apple.ui-services
           NSExtensionPrincipalClass: "$(PRODUCT_MODULE_NAME).ShareViewController"
-          # 与分享扩展同理：常显谓词，保证 QQ/微信等宿主的动作区里能找到入口；
-          # 不支持的类型由扩展内明确提示。
-          NSExtensionActivationRule: TRUEPREDICATE
+          # 与分享扩展同理：字典谓词（TRUEPREDICATE 在 iOS 17+ 行为未定义），
+          # 接受文件类载荷，不支持的类型由扩展内明确提示
+          NSExtensionActivationRule:
+            NSExtensionActivationDictionaryVersion: 2
+            NSExtensionActivationSupportsFilesWithMaxCount: 20
+            NSExtensionActivationSupportsAttachmentsWithMaxCount: 20
     entitlements:
       path: Sources/ShareExtension/IPAManagerAction.entitlements
       properties:
