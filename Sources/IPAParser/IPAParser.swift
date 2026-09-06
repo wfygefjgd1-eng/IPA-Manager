@@ -42,33 +42,42 @@ final class IPAParser {
             throw AppError.operationFailed("解压失败：\(error.localizedDescription)")
         }
 
-        // 优先级不变：zip 里同时存在 .app 时仍按标准应用包解析
-        if let appURL = findAppBundle(in: extractDir) {
-            return try makePackage(appURL: appURL, extractDir: extractDir)
-        }
-
-        // zip 内嵌 .ipa（GitHub release 常见格式：zip 包着 ipa + 校验 txt）：
-        // 没有 .app 时在解压目录里找独立的 .ipa，把其中的 .app 提取到当前解压目录再解析。
-        // 多个内嵌 .ipa：绝不静默取第一个（与下载/分享链路 classifyArchivedContent 的
-        // 多 IPA 保护口径一致——旧实现文件选择器导入多 IPA zip 时会随机装错应用），
-        // 抛错列出全部候选，交上层明确告知用户。
-        if ext == "zip" {
-            let embeddedIPAs = findEmbeddedIPAs(in: extractDir)
-            if embeddedIPAs.count > 1 {
-                let names = embeddedIPAs.map { $0.lastPathComponent }.joined(separator: "、")
-                throw AppError.operationFailed(
-                    "该 ZIP 内发现 \(embeddedIPAs.count) 个 IPA 文件：\(names)。为避免装错应用，不会随机选择——请解压后在文件 App 中分享要安装的那个 IPA。"
-                )
-            }
-            if let ipaURL = embeddedIPAs.first,
-               let appURL = try extractAppFromEmbeddedIPA(ipaURL, into: extractDir) {
+        // 解析段自清：解压根目录（数百 MB~数 GB）只对成功路径有意义，抛错路径
+        // 若留在原地只能等冷启动孤儿清扫——会话内反复导入坏 zip（坏包/多 IPA/
+        // 非 .app 结构）时磁盘占用线性堆积。成功路径绝不能清（调用方还要读取
+        // rootURL 里的 .app 与图标）。
+        do {
+            // 优先级不变：zip 里同时存在 .app 时仍按标准应用包解析
+            if let appURL = findAppBundle(in: extractDir) {
                 return try makePackage(appURL: appURL, extractDir: extractDir)
             }
-        }
 
-        // 解压成功但既找不到 .app 也找不到 .ipa：列出压缩包顶层实际内容，
-        // 让用户/我们一眼看出这是源码包、证书包、空包还是结构异常的 ZIP。
-        throw AppError.operationFailed(noAppBundleMessage(for: extractDir))
+            // zip 内嵌 .ipa（GitHub release 常见格式：zip 包着 ipa + 校验 txt）：
+            // 没有 .app 时在解压目录里找独立的 .ipa，把其中的 .app 提取到当前解压目录再解析。
+            // 多个内嵌 .ipa：绝不静默取第一个（与下载/分享链路 classifyArchivedContent 的
+            // 多 IPA 保护口径一致——旧实现文件选择器导入多 IPA zip 时会随机装错应用），
+            // 抛错列出全部候选，交上层明确告知用户。
+            if ext == "zip" {
+                let embeddedIPAs = findEmbeddedIPAs(in: extractDir)
+                if embeddedIPAs.count > 1 {
+                    let names = embeddedIPAs.map { $0.lastPathComponent }.joined(separator: "、")
+                    throw AppError.operationFailed(
+                        "该 ZIP 内发现 \(embeddedIPAs.count) 个 IPA 文件：\(names)。为避免装错应用，不会随机选择——请解压后在文件 App 中分享要安装的那个 IPA。"
+                    )
+                }
+                if let ipaURL = embeddedIPAs.first,
+                   let appURL = try extractAppFromEmbeddedIPA(ipaURL, into: extractDir) {
+                    return try makePackage(appURL: appURL, extractDir: extractDir)
+                }
+            }
+
+            // 解压成功但既找不到 .app 也找不到 .ipa：列出压缩包顶层实际内容，
+            // 让用户/我们一眼看出这是源码包、证书包、空包还是结构异常的 ZIP。
+            throw AppError.operationFailed(noAppBundleMessage(for: extractDir))
+        } catch {
+            try? fileManager.removeItem(at: extractDir)
+            throw error
+        }
     }
 
     /// 从 zip 内嵌的 .ipa 中提取 .app，移入当前解压目录：

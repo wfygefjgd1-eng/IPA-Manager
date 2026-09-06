@@ -49,22 +49,46 @@ enum ImportTaskStore {
     /// - status == .processing 且文件仍在：上次认领后进程死亡（导入未结算），
     ///   重新认领——以文件存在为准，任务状态只是凭据。
     /// 文件缺失的任务视为已完成残留（正常结算会删除源文件），顺带清理 JSON。
+    /// 同时做 Incoming 残留清扫：终态任务（completed/failed）的源文件超过保留
+    /// 窗口后删除（含 JSON）——失败任务的文件按设计保留"供手动处理"，但共享
+    /// 容器对用户不可见、无任何其它出口，不清扫就是永久滞留（GB 级 IPA 的失败
+    /// 导入 = 永久 GB 级泄漏）。孤儿文件（扩展写文件成功但任务 JSON 写失败的
+    /// 残迹）按文件 mtime 超窗删除。
     static func scanClaimableTasks() -> [(task: ImportTask, fileURL: URL)] {
         var byID: [UUID: (task: ImportTask, fileURL: URL)] = [:]
-        var staleJSONs: [URL] = []
+        let now = Date()
         for container in AppGroup.usableContainers() {
             let dir = tasksDirectoryURL(in: container)
             guard let files = try? FileManager.default.contentsOfDirectory(
-                at: dir, includingPropertiesForKeys: nil, options: [.skipsHiddenFiles]) else { continue }
+                at: dir, includingPropertiesForKeys: [.contentModificationDateKey],
+                options: [.skipsHiddenFiles]) else { continue }
+            let incomingDir = dir.deletingLastPathComponent()
+            var staleJSONs: [URL] = []
+            /// 本容器内被任务 JSON 引用的存储名（孤儿判定必须按容器分别记账：
+            /// 冗余扇出的副本在主容器有 JSON 引用、在副本容器可能没有）
+            var referencedNames = Set<String>()
+            /// 本容器内终态任务（completed/failed）：文件保留供手动处理，
+            /// 超过保留窗口后连文件带 JSON 一起回收
+            var terminalTasks: [(json: URL, file: URL, createdAt: Date)] = []
+            /// 容器内有 10 分钟内的任务活动（扩展刚落盘 JSON）：孤儿清扫本容器跳过。
+            /// copyItem 完成时会把源文件的旧 mtime 应用到副本上，"文件已拷完、JSON
+            /// 还差几毫秒落盘"的在途文件会呈现为旧 mtime 孤儿——近期活动护栏避免
+            /// 扫描恰落在该窗口内把在途文件当垃圾删掉。
+            var recentTaskActivity = false
             for jsonURL in files where jsonURL.pathExtension == "json" {
+                if let modified = (try? jsonURL.resourceValues(forKeys: [.contentModificationDateKey]))?
+                    .contentModificationDate,
+                   now.timeIntervalSince(modified) < 600 {
+                    recentTaskActivity = true
+                }
                 guard let data = try? Data(contentsOf: jsonURL),
                       let task = try? JSONDecoder().decode(ImportTask.self, from: data) else {
                     // 损坏的任务 JSON：删除防反复解析失败
                     staleJSONs.append(jsonURL)
                     continue
                 }
-                let fileURL = dir.deletingLastPathComponent()
-                    .appendingPathComponent(task.storedFileName)
+                let fileURL = incomingDir.appendingPathComponent(task.storedFileName)
+                referencedNames.insert(task.storedFileName)
                 guard FileManager.default.fileExists(atPath: fileURL.path) else {
                     // 源文件已结算删除：任务生命周期已结束，清理 JSON
                     staleJSONs.append(jsonURL)
@@ -75,13 +99,38 @@ enum ImportTaskStore {
                     if byID[task.id] == nil {
                         byID[task.id] = (task, fileURL)
                     }
+                case .completed, .failed:
+                    terminalTasks.append((jsonURL, fileURL, task.createdAt))
                 default:
+                    // 中间态（copying/extracting 等）：视为在途，保留
                     break
                 }
             }
-        }
-        for url in staleJSONs {
-            try? FileManager.default.removeItem(at: url)
+            for url in staleJSONs {
+                try? FileManager.default.removeItem(at: url)
+            }
+            // 终态任务残留清扫。年龄用任务 createdAt（任务创建≈投递时刻）而非文件
+            // mtime——copyItem 保留源文件旧 mtime，压缩包解出物更是携带压缩包内
+            // 记录的旧日期，按 mtime 判会把刚失败的文件立刻回收。
+            for entry in terminalTasks
+            where now.timeIntervalSince(entry.createdAt) > Timeouts.incomingResidueMaxAge {
+                try? FileManager.default.removeItem(at: entry.file)
+                try? FileManager.default.removeItem(at: entry.json)
+            }
+            // 孤儿文件清扫：无任何本容器任务 JSON 引用且文件 mtime 超窗；
+            // 容器近期有任务活动时跳过（见 recentTaskActivity 竞态护栏）
+            guard !recentTaskActivity,
+                  let incomingFiles = try? FileManager.default.contentsOfDirectory(
+                at: incomingDir, includingPropertiesForKeys: [.contentModificationDateKey],
+                options: [.skipsHiddenFiles]) else { continue }
+            for file in incomingFiles where !file.hasDirectoryPath {
+                if referencedNames.contains(file.lastPathComponent) { continue }
+                let modified = (try? file.resourceValues(forKeys: [.contentModificationDateKey]))?
+                    .contentModificationDate ?? .distantPast
+                if now.timeIntervalSince(modified) > Timeouts.incomingResidueMaxAge {
+                    try? FileManager.default.removeItem(at: file)
+                }
+            }
         }
         return Array(byID.values)
     }

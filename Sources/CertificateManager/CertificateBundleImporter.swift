@@ -56,6 +56,14 @@ final class CertificateBundleImporter {
             let dest = fileManager.directoryURL(.certificates)
                 .appendingPathComponent("cert-\(UUID().uuidString).p12")
             try fileManager.copyItem(from: url, to: dest)
+            // 刷新 mtime 为导入时刻：copyItem 保留源文件 mtime，而源是 zip 解出物
+            // （ZIPFoundation 解压会还原压缩包内记录的旧日期）——启动清扫按 mtime
+            // 判定"失败保留副本是否还在 24h 手动导入窗口内"，旧 mtime 会让刚保留
+            // 的副本立刻被回收。以导入时刻为时钟起点才可靠。
+            try? FileManager.default.setAttributes(
+                [.modificationDate: Date()],
+                ofItemAtPath: dest.path
+            )
             resultP12 = dest
         }
         if let url = profileURL {
@@ -82,24 +90,32 @@ final class CertificateBundleImporter {
         }
     }
 
-    /// 启动清扫证书导入残留：删除 Certificates/ 下所有 cert-*.p12 托管副本与
-    /// bundle-extract-* 解压目录。正常路径这些副本在导入完成（无论成败）后即被
-    /// 精确清理；导入中途进程被杀/崩溃时无人清理，明文私钥材料会永久残留
-    /// Documents。启动时无任何证书导入进行中，残留副本必然无用（私钥已入
-    /// Keychain，或导入根本未发生）。
+    /// 启动清扫证书导入残留：删除 Certificates/ 下所有 bundle-extract-* 解压目录，
+    /// 以及超过保留窗口（24h）的 cert-*.p12 托管副本。
+    /// 正常路径这些副本在导入完成后即被精确清理；导入中途进程被杀/崩溃时无人清理。
+    /// 注意：证书导入失败（密码不匹配等）的副本是**有意保留**的——源 zip 已被投递
+    /// 结算删除，副本是用户用正确密码手动导入的唯一剩余材料，24h 内不得回收；
+    /// 超窗副本（含崩溃残留）由本清扫回收，明文私钥材料的滞留上限仍是 24h。
     func sweepOrphanManagedArtifacts() {
         let certDir = fileManager.directoryURL(.certificates)
         guard let items = try? FileManager.default.contentsOfDirectory(
             at: certDir,
-            includingPropertiesForKeys: [.isRegularFileKey],
+            includingPropertiesForKeys: [.isRegularFileKey, .contentModificationDateKey],
             options: [.skipsHiddenFiles]
         ) else { return }
         var swept = 0
+        let now = Date()
         for item in items {
             let name = item.lastPathComponent
             let isManagedP12 = name.hasPrefix("cert-") && name.hasSuffix(".p12")
             let isBundleExtract = name.hasPrefix("bundle-extract-")
             guard isManagedP12 || isBundleExtract else { continue }
+            if isManagedP12,
+               let modified = (try? item.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate,
+               now.timeIntervalSince(modified) < Timeouts.managedP12Retention {
+                // 失败导入有意保留的副本仍在手动导入窗口内，跳过
+                continue
+            }
             try? fileManager.deleteItem(at: item)
             swept += 1
         }

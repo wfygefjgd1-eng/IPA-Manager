@@ -17,7 +17,13 @@ struct DocumentPicker: UIViewControllerRepresentable {
 
     func makeUIViewController(context: Context) -> UIDocumentPickerViewController {
         let types = contentTypes ?? [.item]
-        let picker = UIDocumentPickerViewController(forOpeningContentTypes: types, asCopy: true)
+        // asCopy=false：返回安全作用域 URL，消费方直接读原位置。旧实现 asCopy=true
+        // 会让系统先把文件整份拷进 tmp、导入流程再从 tmp 二次拷贝——GB 级 IPA 的
+        // 文件选择器导入凭空多一倍 IO 与磁盘峰值。全部消费方
+        // （AppState.importFile / CertificateBundleImporter.extract /
+        // ProvisioningManager.importProfile / CertificateManager.importCertificate）
+        // 均已自带 startAccessingSecurityScopedResource 成对管理，直接读作用域 URL。
+        let picker = UIDocumentPickerViewController(forOpeningContentTypes: types, asCopy: false)
         picker.allowsMultipleSelection = allowsMultiple
         picker.delegate = context.coordinator
         return picker

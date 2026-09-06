@@ -1470,13 +1470,19 @@ final class AppState: ObservableObject {
 
     /// zip 证书包导入收尾：删除托管 P12 明文副本（Certificates/cert-*.p12）与解压目录
     /// （bundle-extract-*），避免私钥材料明文常驻 Documents（文件 App/备份可导出）。
-    /// 证书导入成功后私钥已进 Keychain，明文 P12 不再需要；失败同样清理。
+    /// 证书导入成功后私钥已进 Keychain，明文 P12 立即清理；导入失败时保留副本
+    /// 供手动导入（keepP12），由启动清扫按 24h 时限回收。
+    /// - Parameter keepP12: true 时保留托管 P12 副本、只清理解压目录——用于证书导入
+    ///   失败（密码不匹配等）场景：源 zip 已被投递结算删除，副本是用户仅剩的证书
+    ///   材料，删掉它"请到证书页手动导入"的指引就落空了。保留副本由启动清扫按
+    ///   24h 时限兜底回收（明文滞留窗口有界）。
     private func cleanupManagedCertBundle(
         importer: CertificateBundleImporter,
         moved: (p12URL: URL?, profileURL: URL?)?,
-        extractDir: URL?
+        extractDir: URL?,
+        keepP12: Bool = false
     ) {
-        if let moved = moved {
+        if let moved = moved, !keepP12 {
             importer.deleteManagedP12(moved.p12URL)
         }
         if let extractDir = extractDir {
@@ -1532,14 +1538,18 @@ final class AppState: ObservableObject {
                                     case .success(let cert):
                                         self.addCertificate(cert)
                                         Logger.info("zip 证书包证书导入成功: \(cert.name)")
+                                        // 导入成功：私钥已进 Keychain，明文副本立即清理
+                                        self.cleanupManagedCertBundle(importer: importer, moved: moved, extractDir: extractDir)
                                     case .failure(let error):
+                                        // 密码不匹配等失败：保留托管 P12 副本供手动导入。
+                                        // 旧实现"无论成败都删"让"请到证书页手动导入"的指引
+                                        // 落空——源 zip 已被投递结算删除、副本又被删掉，用户
+                                        // 拿着提示却无文件可导（实测数据丢失）。副本由启动
+                                        // 清扫按 24h 时限回收，明文滞留窗口有界。
                                         Logger.warning("zip 证书包证书需手动导入: \(error.localizedDescription)")
-                                        // 常见密码 "1" 不匹配也必须给用户可见反馈（否则
-                                        // 导入像没发生一样）；提示改走证书页手动输密码
-                                        self.showToast("证书导入失败（密码可能不是常见密码）：\(error.localizedDescription)，请到证书页手动导入")
+                                        self.cleanupManagedCertBundle(importer: importer, moved: moved, extractDir: extractDir, keepP12: true)
+                                        self.showToast("证书导入失败（密码可能不是常见密码）：\(error.localizedDescription)。证书副本已保留在 文件 App → IPA Manager → Certificates，可到证书页用正确密码重新导入")
                                     }
-                                    // 证书导入处理完毕（无论成败）后清理托管 P12 与解压目录
-                                    self.cleanupManagedCertBundle(importer: importer, moved: moved, extractDir: extractDir)
                                 }
                             }
                         } else {
