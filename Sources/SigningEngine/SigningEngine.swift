@@ -447,8 +447,12 @@ final class SigningEngine: SigningEngineProtocol {
                         + tlv(0xA0, oid(curveOID)))
         // AlgorithmIdentifier: SEQUENCE { OID id-ecPublicKey(1.2.840.10045.2.1), OID curve }
         let algorithm = tlv(0x30, oid([0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x02, 0x01]) + oid(curveOID))
-        // PrivateKeyInfo: SEQUENCE { INTEGER 0, AlgorithmIdentifier, OCTET STRING sec1 }
-        return tlv(0x30, tlv(0x02, Data([0x01])) + algorithm + tlv(0x04, sec1))
+        // PrivateKeyInfo: SEQUENCE { INTEGER 0(version), AlgorithmIdentifier, OCTET STRING sec1 }
+        // 版本字节必须是 0（PKCS#8 RFC 5958 v1）；此处曾误写 0x01（与 SEC1 内层的
+        // version=1 混淆），OpenSSL 的 PEM_read_bio_PrivateKey 解析时直接报
+        // "Invalid key"——ECC 证书签名 100% 失败于初始化。实测（OpenSSL 3.x）：
+        // version=0 同样的 DER 解析成功且私钥值一致。
+        return tlv(0x30, tlv(0x02, Data([0x00])) + algorithm + tlv(0x04, sec1))
     }
 
     /// DER → base64 分行（64 字符/行）→ 包 PEM 头尾写盘（0600 权限）。

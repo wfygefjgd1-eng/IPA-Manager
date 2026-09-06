@@ -186,12 +186,14 @@ final class CertificateManager {
         return status
     }
 
-    /// 按 class + label 前缀查询后逐个清理（SecItemCopyMatching 拿全量属性，
-    /// 再按 label 过滤出前缀匹配的条目逐个 SecItemDelete）。
+    /// 按 class + label 前缀查询后逐个清理（先取回该 class 全部条目属性，
+    /// 再按 label 前缀过滤出目标逐个 SecItemDelete）。
+    /// 注意：查询里不能带 kSecAttrLabel——Keychain 查询对字符串属性是【精确
+    /// 匹配】，带上它只能命中与前缀完全相等的条目，"前缀+UUID 后缀"的孤儿
+    /// 永远查不到（旧实现整个清理实际是 no-op）。
     private static func deleteKeychainItems(class itemClass: CFString, labelPrefix: String) {
         let query: [String: Any] = [
             kSecClass as String: itemClass,
-            kSecAttrLabel as String: labelPrefix,
             kSecMatchLimit as String: kSecMatchLimitAll,
             kSecReturnAttributes as String: true
         ]

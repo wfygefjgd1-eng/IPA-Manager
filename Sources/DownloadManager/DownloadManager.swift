@@ -39,6 +39,12 @@ final class DownloadManager: NSObject {
     /// didCompleteWithError 收到 NSURLErrorCancelled 时据此按"暂停完成"收尾
     /// （存 resumeData、状态保持 .paused），而不是记成 failed。
     private var pausingTaskIDs: Set<UUID> = []
+    /// 暂停收尾窗口内用户点了"继续"的任务 id：cancel(byProducingResumeData:) 已
+    /// 发出、didCompleteWithError 尚未到达（同在主队列，仅隔一轮回转）时，tasks[id]
+    /// 仍是即将作废的旧任务，此刻 resume() 是 no-op，随后暂停回调把状态定回
+    /// .paused——用户的"继续"被静默吞掉（暂停后立刻手滑点继续的常见操作）。
+    /// 登记意图后由暂停回调改走重建路径（有断点续传、无断点整包重下）。
+    private var resumeRequestedTaskIDs: Set<UUID> = []
     /// 经 resumeData 续传重建的任务 id：didWriteData 首次回调时校验"续传偏移 +
     /// 本次期望字节数"与恢复前持久化的总大小一致，防止服务器端内容变化
     /// （release 重新上传、CDN 换源）把前半旧内容与后半新内容拼成损坏产物。
@@ -134,6 +140,13 @@ final class DownloadManager: NSObject {
     }
 
     func resumeDownload(id: UUID) {
+        // 暂停收尾窗口（见 resumeRequestedTaskIDs）：旧任务正在被 cancel 收尾，
+        // resume() 是 no-op——登记"继续"意图，由 didCompleteWithError 的暂停分支
+        // 重建任务并续传/重下，保证这次"继续"不丢。
+        if tasks[id] != nil, pausingTaskIDs.contains(id) {
+            resumeRequestedTaskIDs.insert(id)
+            return
+        }
         // 无活跃 sessionTask（如"暂停后重启"恢复的任务只恢复了模型、未建 sessionTask）：
         // 先按 rebuildTask 重建（有 resumeData 断点续传，否则整包重下），再恢复下载。
         if tasks[id] == nil {
@@ -150,6 +163,7 @@ final class DownloadManager: NSObject {
     func cancelDownload(id: UUID) {
         tasks[id]?.cancel()
         tasks.removeValue(forKey: id)
+        clearTransientState(for: id)
         if let model = taskModels[id] {
             // 顺带删除已完成任务在磁盘上的目标文件，避免反复下载/删除堆积垃圾文件
             if model.status == .completed, !model.destinationPath.isEmpty {
@@ -158,6 +172,14 @@ final class DownloadManager: NSObject {
         }
         taskModels.removeValue(forKey: id)
         persistTasks()
+    }
+
+    /// 任务终态（完成/失败/删除）时清理随任务累积的辅助字典条目：
+    /// lastProgressPersistDate / sizePersistedTasks 只在重建整包重下时移除，
+    /// 正常完成的任务从不清——长会话多次下载后随任务数无限增长（小泄漏）。
+    private func clearTransientState(for id: UUID) {
+        lastProgressPersistDate.removeValue(forKey: id)
+        sizePersistedTasks.remove(id)
     }
 
     func snapshotTasks() -> [DownloadTask] {
@@ -279,6 +301,11 @@ final class DownloadManager: NSObject {
     /// 有 resumeData 则断点续传，否则从 0 重新下载（登录/Session 过期后旧 resumeData
     /// 可能失效，从 0 重下是兜底）。重建失败（URL 无效等）则降级为 failed。
     private func rebuildTask(_ task: inout DownloadTask) {
+        // 重建出来的是全新任务：清掉可能残留的暂停/继续标记——对已被 cancel 的
+        // 旧任务再点"暂停"是 no-op 取消（不会产生新回调），过期标记会让新任务
+        // 随后的一次失败被误判成"暂停完成"（状态落 .paused 而非 .failed）
+        pausingTaskIDs.remove(task.id)
+        resumeRequestedTaskIDs.remove(task.id)
         var candidate = task
         guard let url = URL(string: candidate.url),
               let scheme = url.scheme?.lowercased(),
@@ -405,6 +432,7 @@ final class DownloadManager: NSObject {
                     return
                 }
                 self.tasks.removeValue(forKey: id)
+                self.clearTransientState(for: id)
                 self.taskModels[id] = updated
                 self.persistTasks()
 
@@ -422,6 +450,10 @@ final class DownloadManager: NSObject {
     /// 用同一个 URL 重新下载：复用同一个任务 id、保留模型（更新状态为下载中），
     /// 移除旧 task、创建新的 sessionTask 并重新关联到同一 id。
     private func retryDownload(id: UUID, model: DownloadTask) {
+        // 全新任务：清掉可能残留的暂停/继续标记（过期标记会把新任务的一次失败
+        // 误判成"暂停完成"，见 rebuildTask 同源说明）
+        pausingTaskIDs.remove(id)
+        resumeRequestedTaskIDs.remove(id)
         guard let url = URL(string: model.url) else {
             var failed = model
             failed.status = .failed
@@ -556,6 +588,8 @@ extension DownloadManager: URLSessionDownloadDelegate {
             Logger.warning("续传内容与原文件不一致（偏移 \(model.receivedBytes) + 期望 \(totalBytesExpectedToWrite) ≠ 原总大小 \(model.totalBytes)），放弃断点整包重下: \(model.fileName)")
             tasks[id]?.cancel()
             tasks.removeValue(forKey: id)
+            pausingTaskIDs.remove(id)
+            resumeRequestedTaskIDs.remove(id)
             var retrying = model
             retrying.retryCount = effectiveRetryCount(for: model) + 1
             retrying.lastRetryDate = Date()
@@ -571,6 +605,14 @@ extension DownloadManager: URLSessionDownloadDelegate {
                 taskModels[id] = retrying
                 tasks[id] = sessionTask
                 sessionTask.resume()
+                persistTasks()
+            } else {
+                // 防御：URL 失效（URLSession 存续期间基本不可达）时按失败收尾，
+                // 绝不留下"无 sessionTask 却显示下载中"的僵尸任务（永远卡在 0%）
+                retrying.status = .failed
+                retrying.error = "无效 URL"
+                tasks.removeValue(forKey: id)
+                taskModels[id] = retrying
                 persistTasks()
             }
             return
@@ -646,6 +688,14 @@ extension DownloadManager: URLSessionDownloadDelegate {
                 // 没产出断点（如刚起步就暂停）：清掉，恢复时按整包重下
                 updated.resumeData = nil
             }
+            // 暂停收尾窗口内用户已点"继续"（resumeDownload 登记）：不落 .paused，
+            // 直接按断点重建任务续传（无断点则整包重下），保住用户的"继续"操作
+            if resumeRequestedTaskIDs.remove(id) != nil {
+                tasks.removeValue(forKey: id)
+                rebuildTask(&updated)
+                persistTasks()
+                return
+            }
             updated.status = .paused
             updated.error = nil
             taskModels[id] = updated
@@ -688,8 +738,9 @@ extension DownloadManager: URLSessionDownloadDelegate {
         updated.status = .failed
         updated.error = error.localizedDescription
         Logger.error("下载失败: \(error.localizedDescription)")
-        taskModels[id] = updated
         tasks.removeValue(forKey: id)
+        clearTransientState(for: id)
+        taskModels[id] = updated
         persistTasks()
     }
 }
