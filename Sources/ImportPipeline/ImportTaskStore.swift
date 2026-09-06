@@ -106,7 +106,11 @@ enum ImportTaskStore {
                   var task = try? JSONDecoder().decode(ImportTask.self, from: data) else { continue }
             task.status = succeeded ? .completed : .failed
             task.error = succeeded ? nil : note
-            try? data.write(to: url, options: .atomic)
+            // 必须重新编码修改后的 task 再落盘：写回解码前的原始 data 会让终态
+            // 永不生效（磁盘上仍是 .processing），scanClaimableTasks 每次扫描都会
+            // 重新认领该失败任务、无限重试导入（坏文件每次进 App 反复解析的根因）。
+            guard let updated = try? JSONEncoder().encode(task) else { continue }
+            try? updated.write(to: url, options: .atomic)
         }
     }
 

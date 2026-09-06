@@ -49,9 +49,21 @@ final class IPAParser {
 
         // zip 内嵌 .ipa（GitHub release 常见格式：zip 包着 ipa + 校验 txt）：
         // 没有 .app 时在解压目录里找独立的 .ipa，把其中的 .app 提取到当前解压目录再解析。
-        if ext == "zip", let ipaURL = findEmbeddedIPA(in: extractDir),
-           let appURL = try extractAppFromEmbeddedIPA(ipaURL, into: extractDir) {
-            return try makePackage(appURL: appURL, extractDir: extractDir)
+        // 多个内嵌 .ipa：绝不静默取第一个（与下载/分享链路 classifyArchivedContent 的
+        // 多 IPA 保护口径一致——旧实现文件选择器导入多 IPA zip 时会随机装错应用），
+        // 抛错列出全部候选，交上层明确告知用户。
+        if ext == "zip" {
+            let embeddedIPAs = findEmbeddedIPAs(in: extractDir)
+            if embeddedIPAs.count > 1 {
+                let names = embeddedIPAs.map { $0.lastPathComponent }.joined(separator: "、")
+                throw AppError.operationFailed(
+                    "该 ZIP 内发现 \(embeddedIPAs.count) 个 IPA 文件：\(names)。为避免装错应用，不会随机选择——请解压后在文件 App 中分享要安装的那个 IPA。"
+                )
+            }
+            if let ipaURL = embeddedIPAs.first,
+               let appURL = try extractAppFromEmbeddedIPA(ipaURL, into: extractDir) {
+                return try makePackage(appURL: appURL, extractDir: extractDir)
+            }
         }
 
         // 解压成功但既找不到 .app 也找不到 .ipa：列出压缩包顶层实际内容，
@@ -92,24 +104,26 @@ final class IPAParser {
         return movedAppURL
     }
 
-    /// 在解压目录中查找独立的 .ipa 文件（顶层或任意子目录，排除 .app 内部的），
-    /// 用于 zip 内嵌 .ipa 的解析。zip 中不可能有多个有效的内嵌 ipa，取第一个即可。
-    private func findEmbeddedIPA(in rootURL: URL) -> URL? {
+    /// 在解压目录中查找全部独立的 .ipa 文件（顶层或任意子目录，排除 .app 内部的），
+    /// 用于 zip 内嵌 .ipa 的解析。单个时调用方直接解析；多个时调用方必须拒绝
+    /// 随机选择并明确告知用户（与 AppState.classifyArchivedContent 口径一致）。
+    private func findEmbeddedIPAs(in rootURL: URL) -> [URL] {
         guard let enumerator = fileManager.enumerator(at: rootURL, includingPropertiesForKeys: nil) else {
-            return nil
+            return []
         }
+        var result: [URL] = []
         while let element = enumerator.nextObject() as? URL {
             guard element.pathExtension.lowercased() == "ipa",
                   !isInsideAppBundle(element) else { continue }
             let isDirectory = (try? element.resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory ?? false
             guard !isDirectory else { continue }
-            return element
+            result.append(element)
         }
-        return nil
+        return result
     }
 
     private func isInsideAppBundle(_ url: URL) -> Bool {
-        // 小写比较：与 findEmbeddedIPA / AppState.classifyArchivedContent 一致，
+        // 小写比较：与 findEmbeddedIPAs / AppState.classifyArchivedContent 一致，
         // 兼容 Payload/MyApp.APP 大写扩展名
         url.pathComponents.contains { $0.lowercased().hasSuffix(".app") }
     }

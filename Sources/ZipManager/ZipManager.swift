@@ -346,9 +346,11 @@ final class ZipManager {
             ?? String(data: data, encoding: .isoLatin1))?.lowercased()
         guard let lowercased = text else { return false }
 
-        // HTML 检测：仅匹配完整标签起首（含括号/换行/空白），避免把"not found"、
+        // HTML 检测：仅匹配标签起首（含括号/换行/空白），避免把"not found"、
         // "404" 等常见正常文本误判为 HTML 错误页（如 file_not_found.txt、v2.0.4 等）。
-        let markers = ["<!doctype html", "<html", "<head>", "<body", "<!doctype"]
+        // 标记集合与 DownloadManager.classifyDownload 完全一致（"<head" 而非
+        // "<head>"：部分错误页写作 <header> 或标签带属性）。
+        let markers = ["<!doctype", "<html", "<head", "<body"]
         return markers.contains { lowercased.contains($0) }
     }
 }

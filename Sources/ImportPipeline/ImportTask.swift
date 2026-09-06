@@ -46,3 +46,24 @@ struct ImportTask: Codable, Equatable {
         self.error = nil
     }
 }
+
+extension ImportTask {
+    private enum CodingKeys: String, CodingKey {
+        case id, originalFileName, storedFileName, type, createdAt, status, error
+    }
+
+    /// 自定义解码：全部键用 decodeIfPresent + 默认值（与 DownloadTask 同模式）。
+    /// Swift 合成 Decodable 不使用属性默认值——历史任务 JSON 缺少后加的字段时，
+    /// 合成解码会整体抛 keyNotFound，scanClaimableTasks 把它当损坏文件删除，
+    /// 扩展与主 App 之间的交接凭据直接蒸发。
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        id = try container.decodeIfPresent(UUID.self, forKey: .id) ?? UUID()
+        originalFileName = try container.decodeIfPresent(String.self, forKey: .originalFileName) ?? ""
+        storedFileName = try container.decodeIfPresent(String.self, forKey: .storedFileName) ?? ""
+        type = try container.decodeIfPresent(String.self, forKey: .type) ?? "other"
+        createdAt = try container.decodeIfPresent(Date.self, forKey: .createdAt) ?? Date()
+        status = try container.decodeIfPresent(Status.self, forKey: .status) ?? .pending
+        error = try container.decodeIfPresent(String.self, forKey: .error)
+    }
+}

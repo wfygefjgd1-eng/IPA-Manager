@@ -1177,8 +1177,23 @@ final class AppState: ObservableObject {
             importedCount += 1
         }
         // Incoming 接收队列：处理前面已认领的任务（pending + 滞留 processing），
-        // 逐个交给统一导入入口；任务终态由结算钩子回写
+        // 逐个交给统一导入入口；任务终态由结算钩子回写。
+        // - 在途任务跳过：一次回前台最多触发 4 次扫描，scanClaimableTasks 会重复
+        //   返回 processing 中的任务，不去重的话"接收任务开始处理"日志与
+        //   "收到 N 个分享文件"toast 会连刷 4 遍（导入本身由 pendingInboxImports 去重）。
+        // - 失败限流与文件循环同口径（连续失败达上限 / 节流窗口内不重试）：
+        //   任务终态正常回写时 .failed 不会再被认领，这里兜的是终态写盘失败
+        //   （共享容器瞬时不可写）时 JSON 仍停留在 processing 的退化路径。
         for (task, fileURL) in incomingTasks {
+            guard !pendingInboxImports.contains(fileURL.path) else { continue }
+            let identity = Self.deliveryIdentity(for: fileURL)
+            if let record = failedDeliveryRecords[identity] {
+                if record.count >= Self.maxDeliveryRetries { continue }
+                if Date().timeIntervalSince(record.lastAttempt) < Timeouts.deliveryRetryThrottle {
+                    Logger.info("接收任务重试节流中（上次失败距今过近）: \(task.originalFileName)")
+                    continue
+                }
+            }
             ExternalDeliveryJournal.record("接收任务开始处理: \(task.originalFileName)（id \(task.id.uuidString.prefix(8))）")
             Logger.info("接收任务进入流水线: \(task.originalFileName) type=\(task.type)")
             handleFileOpenedFromOutside(fileURL, force: true, taskID: task.id)
@@ -1496,12 +1511,14 @@ final class AppState: ObservableObject {
                     DispatchQueue.main.async {
                         // 描述文件：解析失败给明确反馈并清理托管副本（旧实现 try? 吞错，
                         // 文案宣称"已导入描述文件"与实际不符，且明文副本残留 Documents）
+                        var profileImportFailed = false
                         if let profileURL = moved.profileURL {
                             do {
                                 let profile = try ProvisioningManager.shared.importProfile(from: profileURL)
                                 self.addProfile(profile)
                             } catch {
                                 try? FileManager.default.removeItem(at: profileURL)
+                                profileImportFailed = true
                                 Logger.error("zip 证书包描述文件导入失败: \(error)")
                                 self.showToast("描述文件导入失败：\(error.localizedDescription)")
                             }
@@ -1527,9 +1544,13 @@ final class AppState: ObservableObject {
                             }
                         } else {
                             // 无证书：描述文件已归档到 Profiles，直接清理；
-                            // 给用户可见反馈（只导入到一半的包也该说清楚）
+                            // 给用户可见反馈（只导入到一半的包也该说清楚）。
+                            // profileImportFailed 时上方已 toast 具体失败原因，
+                            // 不再叠加"已导入描述文件"的误导文案
                             self.cleanupManagedCertBundle(importer: importer, moved: moved, extractDir: extractDir)
-                            self.showToast("已导入描述文件；压缩包内未找到证书 (.p12)")
+                            if !profileImportFailed {
+                                self.showToast("已导入描述文件；压缩包内未找到证书 (.p12)")
+                            }
                         }
                         Logger.info("zip 证书包导入完成")
                         // 分享投递（Inbox）结算：解压/归档已完成，内容已转入托管位置，
@@ -1760,12 +1781,25 @@ final class AppState: ObservableObject {
     /// 对每个签名 IPA 完整解析，拿到 bundleID / version / iconPath（修复“未知 Bundle ID”、
     /// 图标不显示）；解析失败时回退为旧逻辑（文件名 + isSigned）。
     /// 解析在串行后台队列执行（解压较慢，不可上主线程），最终 @Published 赋值回到主线程。
+    /// 已签应用解析缓存的持久化条目（internal：UserDefaultsStore 编解码用）。
+    struct InstalledAppCacheEntry: Codable {
+        let mtime: Date
+        let size: Int64
+        let info: AppInfo
+    }
+
     /// 已签应用解析缓存（仅在 installedAppsRefreshQueue 串行队列访问）：
-    /// key 为 IPA 绝对路径，值为 (修改时间, 大小, AppInfo)。签名产物文件名唯一且
+    /// key 为 IPA 绝对路径，值为 (修改时间, 大小, 解析结果)。签名产物文件名唯一且
     /// 内容不变，(mtime,size) 未变即可复用——refreshInstalledApps 在每次签名完成/
     /// 删除应用/启动后都会全量扫描，没有缓存时每个已签 IPA 都要重新整包解压一遍
-    /// （N 个大包 × 每次刷新 = 重复的 GB 级 IO）。
-    private var installedAppParseCache: [String: (mtime: Date, size: Int64, info: AppInfo)] = [:]
+    /// （N 个大包 × 每次刷新 = 重复的 GB 级 IO）。缓存跨启动持久化（UserDefaults）：
+    /// 冷启动后首次刷新即命中，免去对全部签名产物的重复整包解压；路径因重装失效
+    /// 的条目按 (mtime,size) 自然未命中重建，过期条目由刷新收尾剪枝。
+    private var installedAppParseCache: [String: InstalledAppCacheEntry] = [:]
+    /// 持久化缓存是否已播种进内存（仅 refresh 队列读写；进程内只播种一次）
+    private var installedAppCacheLoaded = false
+    /// 缓存在本次刷新中有新增/更新：由 refreshInstalledApps 收尾统一落盘一次
+    private var installedAppCacheDirty = false
 
     func refreshInstalledApps(completion: (() -> Void)? = nil) {
         isRefreshingInstalledApps = true
@@ -1780,6 +1814,17 @@ final class AppState: ObservableObject {
             let apps = datedURLs
                 .sorted { $0.1 > $1.1 }
                 .map { self.makeInstalledAppInfo(from: $0.0, modifiedAt: $0.1) }
+            // 剪枝：已删除签名产物的缓存条目不再保留（防长期无限增长），有变化才落盘
+            let alivePaths = Set(datedURLs.map { $0.0.path })
+            var cacheChanged = false
+            for key in self.installedAppParseCache.keys where !alivePaths.contains(key) {
+                self.installedAppParseCache.removeValue(forKey: key)
+                cacheChanged = true
+            }
+            if cacheChanged || self.installedAppCacheDirty {
+                self.store.saveInstalledAppParseCache(self.installedAppParseCache)
+                self.installedAppCacheDirty = false
+            }
             DispatchQueue.main.async {
                 self.installedApps = apps
                 self.isRefreshingInstalledApps = false
@@ -1792,8 +1837,16 @@ final class AppState: ObservableObject {
     private func makeInstalledAppInfo(from url: URL, modifiedAt: Date) -> AppInfo {
         let path = url.path
         let size = fileManager.fileSize(at: url)
+        loadInstalledAppCacheFromStoreIfNeeded()
         if let cached = installedAppParseCache[path], cached.mtime == modifiedAt, cached.size == size {
-            return cached.info
+            // 图标可能因容器迁移失效（relocateImportedAppIconPaths 只重定位
+            // importedApps 记录，不覆盖缓存条目）：命中时校验图标存在性，
+            // 失效即视为未命中，走整包解析重建（每次刷新仅一次 stat，开销可忽略）
+            if let icon = cached.info.iconPath, !FileManager.default.fileExists(atPath: icon) {
+                installedAppParseCache.removeValue(forKey: path)
+            } else {
+                return cached.info
+            }
         }
 
         var result: AppInfo
@@ -1837,8 +1890,17 @@ final class AppState: ObservableObject {
             try? FileManager.default.removeItem(at: extractedRoot)
         }
         // 失败回退结果同样缓存：损坏产物每次刷新都重新解压一遍毫无意义
-        installedAppParseCache[path] = (modifiedAt, size, result)
+        installedAppParseCache[path] = InstalledAppCacheEntry(mtime: modifiedAt, size: size, info: result)
+        installedAppCacheDirty = true
         return result
+    }
+
+    /// 冷启动后进程内缓存为空：首次访问时从 UserDefaults 播种，让解析缓存跨启动
+    /// 生效（(mtime,size) 未变即命中，免整包解压）。仅 refresh 队列调用。
+    private func loadInstalledAppCacheFromStoreIfNeeded() {
+        guard !installedAppCacheLoaded else { return }
+        installedAppCacheLoaded = true
+        installedAppParseCache = store.loadInstalledAppParseCache()
     }
 
     /// 把签名 IPA 解压出的图标复制到稳定位置 Extracted/Icons/<baseName>/<标识>-icon.<ext>，
@@ -1955,29 +2017,48 @@ final class AppState: ObservableObject {
                 || relatedSourcePaths.contains(task.sourceFile)
                 || relatedSignedPaths.contains(task.sourceFile)
         }
-        // 2) 并行 IO：签名产物 + 关联源 IPA 两类文件都删（按 baseName 分桶并行删除）。
-        // 历史 N 个应用串行 N 次 removeItem 在 SSD 上仍需数秒，并发后 UI 完全无感。
+        // 2) 并行 IO。三类清理目标职责区分：
+        //    a) IPA 文件：签名产物 + 关联源 IPA 全部删除（去重避免并发重删）；
+        //    b) Extracted/ 解析目录：一律以【源 IPA】的 baseName 命名（<base>-<uuid>），
+        //       只按源 baseName 清理——签名产物名（Foo-signed-xxxx）永远匹配不到
+        //       任何解析目录，对它跑目录清理是全程空转；
+        //    c) Icons/ 图标目录：导入图标在 Icons/<源baseName>/、已签应用图标在
+        //       Icons/<签名产物baseName>/（makeInstalledAppInfo 以签名产物名落盘），
+        //       两类都要清。
         let extractedRoot = fileManager.directoryURL(.extracted)
-        func entry(for path: String) -> (ipa: URL, baseName: String, iconsDir: URL) {
-            let url = URL(fileURLWithPath: path)
-            let baseName = url.deletingPathExtension().lastPathComponent
-            let iconsDir = extractedRoot
-                .appendingPathComponent("Icons", isDirectory: true)
-                .appendingPathComponent(baseName, isDirectory: true)
-            return (url, baseName, iconsDir)
-        }
-        var entries = relatedSignedPaths.map { entry(for: $0) }
-        entries += relatedSourcePaths.map { entry(for: $0) }
-        // 同一源可能对应多个签名产物（重签）：按 ipa 路径去重避免并发重删
+        var ipaPaths = relatedSignedPaths + relatedSourcePaths
         var seen = Set<String>()
-        entries = entries.filter { seen.insert($0.ipa.path).inserted }
-        DispatchQueue.global(qos: .userInitiated).async { [extractedRoot, entries] in
-            DispatchQueue.concurrentPerform(iterations: entries.count) { idx in
-                let item = entries[idx]
-                try? AppFileManager.shared.deleteItem(at: item.ipa)
+        ipaPaths = ipaPaths.filter { seen.insert($0).inserted }
+        func baseName(of path: String) -> String {
+            URL(fileURLWithPath: path).deletingPathExtension().lastPathComponent
+        }
+        var sourceBases: [String] = []
+        var signedBases: [String] = []
+        var seenBase = Set<String>()
+        for path in relatedImports.map({ $0.path }) where !path.isEmpty {
+            let base = baseName(of: path)
+            if seenBase.insert(base).inserted { sourceBases.append(base) }
+        }
+        for path in relatedSignedPaths where !path.isEmpty {
+            let base = baseName(of: path)
+            if seenBase.insert(base).inserted { signedBases.append(base) }
+        }
+        DispatchQueue.global(qos: .userInitiated).async { [extractedRoot, ipaPaths, sourceBases, signedBases] in
+            // IPA 文件删除（签名产物 + 源 IPA，已去重）：N 个应用串行删在 SSD 上
+            // 仍需数秒，并发后 UI 完全无感
+            DispatchQueue.concurrentPerform(iterations: ipaPaths.count) { idx in
+                try? AppFileManager.shared.deleteItem(at: URL(fileURLWithPath: ipaPaths[idx]))
+            }
+            // 目录清理按 baseName 串行即可（数量远小于 IPA 文件数，且各自都要
+            // 枚举 Extracted/ 根目录，并发枚举同一父目录收益为负）
+            let iconsRoot = extractedRoot.appendingPathComponent("Icons", isDirectory: true)
+            for base in sourceBases {
                 // 按前缀清理解析目录（兼容旧版 <baseName> 与新版 <baseName>-<UUID>）
-                Self.cleanupExtractDirs(matching: item.baseName, in: extractedRoot)
-                try? AppFileManager.shared.deleteItem(at: item.iconsDir)
+                Self.cleanupExtractDirs(matching: base, in: extractedRoot)
+                try? AppFileManager.shared.deleteItem(at: iconsRoot.appendingPathComponent(base, isDirectory: true))
+            }
+            for base in signedBases {
+                try? AppFileManager.shared.deleteItem(at: iconsRoot.appendingPathComponent(base, isDirectory: true))
             }
             DispatchQueue.main.async {
                 self.saveState()

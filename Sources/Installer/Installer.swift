@@ -73,9 +73,9 @@ final class Installer: Installing {
 
             // 公网 manifest（api.palera.in /genPlist）可用性预检：URL 构造本身恒成功，
             // 真正的失败发生在 SpringBoard 拉 manifest 时（无外网 / DNS 污染 / 服务
-            // 故障），那时已无法纠正。这里先做一次 2 秒超时的同步预检（后台线程），
-            // 失败直接走本地 manifest（cacheManifest + 127.0.0.1 URL），保证无外网/
-            // 被墙环境仍可安装。
+            // 故障），那时已无法纠正。这里先做一次同步预检（后台线程，请求超时 2 秒、
+            // 信号量等待上限 3 秒），失败直接走本地 manifest（cacheManifest +
+            // 127.0.0.1 URL），保证无外网/被墙环境仍可安装。
             var manifestURL: URL?
             var isLocalFallback = false
             if Self.isExternalManifestServiceReachable() {

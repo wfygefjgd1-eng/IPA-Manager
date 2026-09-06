@@ -572,10 +572,11 @@ final class SigningEngine: SigningEngineProtocol {
             return true
         }
         // Archive 由 deinit 自动关闭（与 ZipManager 一致，不调用 close()）
-        // 必须完整遍历中央目录再下结论：旧实现"遇到第一个非 Payload 条目即判非
-        // 标准"依赖条目顺序——重签名流水线 / macOS 打包常把 __MACOSX/、META-INF/
-        // 等排在 Payload 之前，标准 IPA 被误判为缺 Payload → 走整套"解压 + 找
-        // .app + 重打包"规范化，大 IPA 白白多花数十秒与一倍临时磁盘。
+        // 不能按"首个非 Payload 条目"下结论：重签名流水线 / macOS 打包常把
+        // __MACOSX/、META-INF/ 等排在 Payload 之前，标准 IPA 会被误判为缺 Payload
+        // → 走整套"解压 + 找 .app + 重打包"规范化，大 IPA 白白多花数十秒与一倍
+        // 临时磁盘。找到 Payload 即可提前退出；只有遍历完中央目录仍未见 Payload
+        // 才判非标准。
         var hasPayload = false
         for entry in archive {
             let path = entry.path

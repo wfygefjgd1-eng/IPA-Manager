@@ -475,9 +475,10 @@ final class DownloadManager: NSObject {
             return hasValidEndOfCentralDirectory(at: path) ? .zip : .other
         }
         let text = String(data: data, encoding: .utf8)?.lowercased() ?? ""
-        // 与 ZipManager.hasHTMLPageContent 的 markers 对齐：只保留真正的 HTML 标签起首，
-        // 避免 "v2.0.4" / "file_not_found.txt" 等常见正常文本被误判为网页错误页
-        let htmlSignals = ["<!doctype html", "<html", "<head", "<body", "<!doctype"]
+        // 与 ZipManager.hasHTMLPageContent 的 markers 完全一致：只保留真正的
+        // HTML 标签起首，避免 "v2.0.4" / "file_not_found.txt" 等常见正常文本
+        // 被误判为网页错误页
+        let htmlSignals = ["<!doctype", "<html", "<head", "<body"]
         if htmlSignals.contains(where: { text.contains($0) }) { return .html }
         return .other
     }

@@ -37,6 +37,9 @@ final class UserDefaultsStore {
         /// 待续跑的自动签名源路径：App 在自动签名/安装中途被替换（重装新版）时
         /// 进程死亡，重启后据此自动续跑，下载一条龙不会因更新 App 而不了了之
         static let pendingAutoSignPaths = "pending_auto_sign_paths"
+        /// 已签应用解析缓存（路径 → mtime/size/解析结果）：跨启动命中免整包解压
+        /// （(mtime,size) 未变即复用；图标失效的条目在命中时剔除重建）
+        static let installedAppParseCache = "installed_app_parse_cache"
         /// 所有需要检查 TTL 的持久化键集合
         static let allPersistedKeys: [String] = [
             certificates, profiles, signingTasks, downloadTasks, importedApps
@@ -195,6 +198,18 @@ final class UserDefaultsStore {
     func savePendingAutoSignPaths(_ paths: [String]) {
         // 上限截断：16 条远超正常用量；超限丢最旧（代价是该应用不再自动续跑）
         save(Array(paths.suffix(16)), key: Keys.pendingAutoSignPaths)
+    }
+
+    // MARK: - 已签应用解析缓存（跨启动免整包解压）
+
+    func loadInstalledAppParseCache() -> [String: AppState.InstalledAppCacheEntry] {
+        load([String: AppState.InstalledAppCacheEntry].self, key: Keys.installedAppParseCache) ?? [:]
+    }
+
+    func saveInstalledAppParseCache(_ cache: [String: AppState.InstalledAppCacheEntry]) {
+        // 体量天然有限：条目数 = 已签应用数，单条仅含 AppInfo 元数据（数百字节）；
+        // 过期条目由 AppState.refreshInstalledApps 按现存产物剪枝
+        save(cache, key: Keys.installedAppParseCache)
     }
 
     // MARK: - 自动流程开关（默认开启）

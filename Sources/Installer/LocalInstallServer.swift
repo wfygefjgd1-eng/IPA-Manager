@@ -184,8 +184,12 @@ final class LocalInstallServer {
         for attempt in 1...3 {
             do {
                 return try startOnce(ipaLocalURL: ipaLocalURL)
-            } catch let error as AppError {
-                lastDetail = error.localizedDescription
+            } catch {
+                // 非 AppError（NWListener 初始化抛出的原始 NWError 等）同样计入重试
+                // 并统一包装，否则会穿透 3 次重试逻辑、把英文 POSIX 错误直接抛给上层
+                let message = (error as? AppError)?.localizedDescription
+                    ?? "本地监听器创建失败（\(error.localizedDescription)）"
+                lastDetail = message
                 Logger.warning("本地安装服务器启动失败（第 \(attempt) 次尝试）: \(lastDetail)")
             }
         }
@@ -512,9 +516,20 @@ final class LocalInstallServer {
         let chunkSize = 256 * 1024
         // read(upToCount:) 是 throwing API（iOS 13.4+）：I/O 错误（非 EOF）时抛错，
         // 旧实现 readData(ofLength:) 对 I/O 错误直接抛 ObjC 异常且未捕获 → 进程崩溃
-        // （EOF 返回 nil）。这里把"错误"与"EOF"统一折叠为空 Data → 走下方
-        // 收尾分支（关句柄 + 断开），一次失败的安装好过整个 App 闪退。
-        let data = (try? handle.read(upToCount: chunkSize)) ?? Data()
+        // （EOF 返回 nil）。读错误单独收尾（关句柄 + 断开 + 失败留痕）——绝不与 EOF
+        // 一样记成"IPA 传输完成"，否则诊断时无法区分真完成与源文件读取失败。
+        let data: Data
+        do {
+            data = try handle.read(upToCount: chunkSize) ?? Data()
+        } catch {
+            transferCompletedDate = Date()
+            try? handle.close()
+            self.connections.removeAll { $0 === connection }
+            connection.cancel()
+            Logger.error("本地服务器读取 IPA 失败: \(error.localizedDescription)")
+            ExternalDeliveryJournal.record("IPA 传输中断（读取源文件失败: \(error.localizedDescription)）", level: .error)
+            return
+        }
         if data.isEmpty {
             // 整个 IPA 已完整发出：记录 EOF 时刻。连续安装的下一个 start()
             // 据此判定"上一个会话已空闲"（见 waitForPreviousInstallIdle）。
