@@ -64,11 +64,10 @@ enum Timeouts {
     /// 窗口内不重复重试，坏文件不会在单次进 App 时被连续导入 4 遍
     static let deliveryRetryThrottle: TimeInterval = 60
     /// 分享投递（Documents/Inbox）残留清扫时限：已登记处理但未结算删除的文件，
-    /// 保留 24h 后由回前台扫描删除（正常导入链路结算后会自删源文件）
+    /// 保留 24h 后由回前台扫描删除（正常导入链路结算后会自删源文件）。
+    /// 注：共享容器 Incoming 队列的残留清扫时限在 ImportTaskStore 内本地定义——
+    /// 该文件编入扩展 target，不能引用本文件（仅主 App 编译）。
     static let inboxResidueMaxAge: TimeInterval = 24 * 60 * 60
-    /// 共享容器 Incoming 接收队列的残留清扫时限：终态任务（completed/failed）的
-    /// 源文件与孤儿文件超 24h 后由扫描清扫（失败文件在窗口内保留供手动处理）
-    static let incomingResidueMaxAge: TimeInterval = 24 * 60 * 60
     /// 证书导入失败时保留的托管 P12 副本的手动导入窗口：超 24h 由启动清扫回收
     /// （明文私钥材料的滞留上限）
     static let managedP12Retention: TimeInterval = 24 * 60 * 60

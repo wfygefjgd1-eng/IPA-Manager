@@ -9,6 +9,10 @@ import Foundation
 enum ImportTaskStore {
     /// 任务 JSON 的相对目录（相对各可用共享容器根）：Incoming/Tasks/
     private static let tasksDir = "Incoming/Tasks"
+    /// Incoming 残留清扫时限：终态任务与孤儿文件超此时限后回收（24h）。
+    /// 注意：本文件同时编入主 App 与两个扩展 target，而 Constants.swift 仅主
+    /// App 编译——清扫常量必须本地定义，引用 Timeouts 会在扩展 target 编译失败。
+    private static let residueMaxAge: TimeInterval = 24 * 60 * 60
 
     private static func tasksDirectoryURL(in container: AppGroup.Container) -> URL {
         container.url.appendingPathComponent(tasksDir, isDirectory: true)
@@ -113,7 +117,7 @@ enum ImportTaskStore {
             // mtime——copyItem 保留源文件旧 mtime，压缩包解出物更是携带压缩包内
             // 记录的旧日期，按 mtime 判会把刚失败的文件立刻回收。
             for entry in terminalTasks
-            where now.timeIntervalSince(entry.createdAt) > Timeouts.incomingResidueMaxAge {
+            where now.timeIntervalSince(entry.createdAt) > residueMaxAge {
                 try? FileManager.default.removeItem(at: entry.file)
                 try? FileManager.default.removeItem(at: entry.json)
             }
@@ -127,7 +131,7 @@ enum ImportTaskStore {
                 if referencedNames.contains(file.lastPathComponent) { continue }
                 let modified = (try? file.resourceValues(forKeys: [.contentModificationDateKey]))?
                     .contentModificationDate ?? .distantPast
-                if now.timeIntervalSince(modified) > Timeouts.incomingResidueMaxAge {
+                if now.timeIntervalSince(modified) > residueMaxAge {
                     try? FileManager.default.removeItem(at: file)
                 }
             }
