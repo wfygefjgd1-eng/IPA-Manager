@@ -45,12 +45,43 @@ final class InfoPlistParser {
             return nil
         }
 
-        // 收集所有可能的图标名候选：多种 Info.plist 结构全部尝试，不只取 first。
+        // 收集所有可能的图标名候选（多种 Info.plist 结构全部尝试，不只取 first）。
         // 关键修复点：iOS 12+ 用资源目录（asset catalog）构建的应用常只声明
         // CFBundleIconName（如 "AppIcon"）而没有 CFBundleIconFiles，此时图标
         // PNG（AppIcon60x60@2x.png 等）仍在 .app 根目录里，旧实现会漏掉 → 显示灰图标。
-        var candidates: [String] = []
+        // 候选收集逻辑抽为 iconCandidates(from:)：与 IPAParser 的轻量（中央目录）
+        // 解析路径共用，两端口径必须一致。
+        let candidates = Self.iconCandidates(from: plist)
 
+        // 先一次性枚举 .app 根目录内容并缓存（items）交给候选匹配，避免每个候选
+        // 都重新 contentsOfDirectory（候选多 + 大目录时反复全目录 IO）。
+        let rootItems: [URL]
+        if let items = try? FileManager.default.contentsOfDirectory(
+            at: appURL,
+            includingPropertiesForKeys: nil
+        ) {
+            rootItems = items
+        } else {
+            rootItems = []
+        }
+
+        for candidate in candidates {
+            if let found = searchIcon(named: candidate, in: appURL, cachedItems: rootItems) {
+                return found
+            }
+        }
+
+        // plist 给出的名字全都匹配不到实际文件（或该应用只有资源目录图标名）：
+        // 回退扫描 .app 内的图标形态位图，保证「有独立图标 PNG 就一定显示」。
+        return fallbackIcon(in: appURL)
+    }
+
+    /// 收集 Info.plist 中全部图标名候选（多种历史结构全尝试：CFBundleIcons 的
+    /// 主图标/文件列表、顶层 CFBundleIconFiles/CFBundleIconName/CFBundleIconFile、
+    /// ~ipad 变体）。供 extractIcon（整包解析）与 IPAParser 的轻量（中央目录）
+    /// 解析路径共用。
+    static func iconCandidates(from plist: [String: Any]) -> [String] {
+        var candidates: [String] = []
         if let iconsDict = plist["CFBundleIcons"] as? [String: Any] {
             if let primaryIcon = iconsDict["CFBundlePrimaryIcon"] as? [String: Any] {
                 if let files = primaryIcon["CFBundleIconFiles"] as? [String] {
@@ -80,28 +111,7 @@ final class InfoPlistParser {
            let files = primaryIcon["CFBundleIconFiles"] as? [String] {
             candidates.append(contentsOf: files)
         }
-
-        // 先一次性枚举 .app 根目录内容并缓存（items）交给候选匹配，避免每个候选
-        // 都重新 contentsOfDirectory（候选多 + 大目录时反复全目录 IO）。
-        let rootItems: [URL]
-        if let items = try? FileManager.default.contentsOfDirectory(
-            at: appURL,
-            includingPropertiesForKeys: nil
-        ) {
-            rootItems = items
-        } else {
-            rootItems = []
-        }
-
-        for candidate in candidates {
-            if let found = searchIcon(named: candidate, in: appURL, cachedItems: rootItems) {
-                return found
-            }
-        }
-
-        // plist 给出的名字全都匹配不到实际文件（或该应用只有资源目录图标名）：
-        // 回退扫描 .app 内的图标形态位图，保证「有独立图标 PNG 就一定显示」。
-        return fallbackIcon(in: appURL)
+        return candidates
     }
 
     private func searchIcon(named name: String, in appDir: URL, cachedItems: [URL]) -> String? {
@@ -124,8 +134,8 @@ final class InfoPlistParser {
             }
             // 高分屏优先：@3x > @2x > 无；同档取文件名更长者
             .sorted { lhs, rhs in
-                let l = scaleRank(lhs.lastPathComponent)
-                let r = scaleRank(rhs.lastPathComponent)
+                let l = Self.scaleRank(lhs.lastPathComponent)
+                let r = Self.scaleRank(rhs.lastPathComponent)
                 if l != r { return l > r }
                 return lhs.lastPathComponent.count > rhs.lastPathComponent.count
             }
@@ -133,8 +143,8 @@ final class InfoPlistParser {
         return matched.first?.path
     }
 
-    /// 文件名高分屏档位：@3x=3 / @2x=2 / 其余=1
-    private func scaleRank(_ fileName: String) -> Int {
+    /// 文件名高分屏档位：@3x=3 / @2x=2 / 其余=1（两条解析路径共用）
+    static func scaleRank(_ fileName: String) -> Int {
         if fileName.contains("@3x") { return 3 }
         if fileName.contains("@2x") { return 2 }
         return 1
@@ -168,7 +178,7 @@ final class InfoPlistParser {
             var score = 0
             if fileName.hasPrefix("appicon") || fileName.hasPrefix("icon") { score += 100 }
             if fileName.contains("icon") { score += 10 }
-            score += scaleRank(element.lastPathComponent) * 10
+            score += Self.scaleRank(element.lastPathComponent) * 10
             // 路径越浅越可能是主图标（.app 根目录 > 子目录）：相对 appDir 的层数
             let depth = element.pathComponents.count - appDir.pathComponents.count
             score += max(0, 10 - depth)

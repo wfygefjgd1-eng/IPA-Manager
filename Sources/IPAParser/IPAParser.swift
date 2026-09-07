@@ -230,6 +230,122 @@ final class IPAParser {
         )
     }
 
+    /// 轻量解析 .ipa：只从 zip 中央目录读取 Info.plist 与图标条目（毫秒级、零
+    /// 整包解压副本），替代导入路径上"整包解压 → 读 Info.plist → 提图标 → 删除
+    /// GB 级副本"的 IO 峰值（直连 .ipa 导入与已签应用刷新的最大单项开销）。
+    /// 与整包解析同口径：Info.plist 条目匹配复用 lightweightAppInfo 的规则，
+    /// 图标候选与高分屏排序复用 InfoPlistParser.iconCandidates/scaleRank。
+    /// 返回 (info, workDir)：workDir 为临时目录（内含解出的 Info.plist 与可选
+    /// 图标文件），info.iconPath 已指向其中的图标文件——调用方完成图标持久化后
+    /// 统一删除 workDir（与整包路径的 rootURL 清理同模式）。任何一步失败返回
+    /// nil，调用方回退整包解析（零风险兜底，最坏情况 = 旧行为）。
+    func lightweightParsedAppInfo(from ipaURL: URL) -> (info: AppInfo, workDir: URL)? {
+        guard let archive = try? Archive(url: ipaURL, accessMode: .read) else { return nil }
+        // 与 lightweightAppInfo 相同的顶层 .app Info.plist 匹配（Payload/X.APP
+        // 大写扩展名按小写比较，与 findAppBundle 口径一致）
+        guard let plistEntry = archive.first(where: { entry in
+            guard entry.type == .file, entry.path.hasSuffix("/Info.plist") else { return false }
+            let components = entry.path.components(separatedBy: "/")
+            return (components.count == 3 && components[0] == "Payload" && components[1].lowercased().hasSuffix(".app"))
+                || (components.count == 2 && components[0].lowercased().hasSuffix(".app"))
+        }) else { return nil }
+        // .app 目录前缀（"Payload/App.app"），供图标条目匹配
+        let appDir = String(plistEntry.path.dropLast("/Info.plist".count))
+
+        let workDir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("lwi-\(UUID().uuidString)", isDirectory: true)
+        do {
+            try FileManager.default.createDirectory(at: workDir, withIntermediateDirectories: true)
+            // Info.plist：单条目解出后复用 InfoPlistParser.parse（顶层非字典等
+            // 异常与整包解析同语义），再解一次 dict 供图标候选收集
+            let plistTempURL = workDir.appendingPathComponent("Info.plist")
+            try ZipManager.shared.extractEntry(archiveURL: ipaURL, entryPath: plistEntry.path, to: plistTempURL)
+            var info = try infoParser.parse(at: plistTempURL)
+            info.path = ipaURL.path
+            info.size = AppFileManager.shared.fileSize(at: ipaURL)
+
+            if let plistData = try? Data(contentsOf: plistTempURL),
+               let dict = (try? PropertyListSerialization.propertyList(from: plistData, options: [], format: nil)) as? [String: Any] {
+                info.iconPath = Self.lightweightIconEntry(in: archive, appDir: appDir, plist: dict)
+                    .flatMap { entry -> URL? in
+                        let ext = (entry.path as NSString).pathExtension.lowercased()
+                        let iconURL = workDir.appendingPathComponent("icon.\(ext)")
+                        try? ZipManager.shared.extractEntry(archiveURL: ipaURL, entryPath: entry.path, to: iconURL)
+                        return FileManager.default.fileExists(atPath: iconURL.path) ? iconURL : nil
+                    }
+            }
+            return (info, workDir)
+        } catch {
+            try? FileManager.default.removeItem(at: workDir)
+            return nil
+        }
+    }
+
+    /// 中央目录图标条目匹配（与 InfoPlistParser.searchIcon / fallbackIcon 同口径）：
+    /// 先按 Info.plist 候选名前缀匹配 .app 根目录的位图（高分屏降序、同档名长者
+    /// 优先，逐候选返回首个命中者），全部落空再按"名称含 icon"启发式扫描。
+    private static func lightweightIconEntry(in archive: Archive, appDir: String, plist: [String: Any]) -> Entry? {
+        let allowed = Set(["png", "jpg", "jpeg"])
+        let prefix = appDir + "/"
+        // .app 根目录内的位图条目（候选匹配只认根目录，与整包路径的
+        // contentsOfDirectory(appURL) 非递归口径一致）
+        let isRootBitmapEntry = { (entry: Entry) -> Bool in
+            guard entry.type == .file, entry.path.hasPrefix(prefix) else { return false }
+            let relative = String(entry.path.dropFirst(prefix.count))
+            guard !relative.contains("/") else { return false }
+            return allowed.contains((relative as NSString).pathExtension.lowercased())
+        }
+
+        for candidate in InfoPlistParser.iconCandidates(from: plist) {
+            let base = candidate
+                .replacingOccurrences(of: ".png", with: "")
+                .replacingOccurrences(of: ".jpg", with: "")
+                .replacingOccurrences(of: ".jpeg", with: "")
+                .lowercased()
+            guard !base.isEmpty else { continue }
+            var best: Entry?
+            var bestRank = 0
+            var bestNameLength = 0
+            for entry in archive where isRootBitmapEntry(entry) {
+                let fileName = (entry.path as NSString).lastPathComponent.lowercased()
+                guard fileName.hasPrefix(base) else { continue }
+                let rank = InfoPlistParser.scaleRank(fileName)
+                if best == nil || rank > bestRank || (rank == bestRank && fileName.count > bestNameLength) {
+                    best = entry
+                    bestRank = rank
+                    bestNameLength = fileName.count
+                }
+            }
+            if let best { return best }
+        }
+
+        // 兜底：appDir 内名称含 icon 的位图（整包路径的 fallbackIcon 递归扫描
+        // .app 全部层级；中央目录等价实现按相对路径深度评分，根目录 = 0 层）
+        var bestScore = -1
+        var bestEntry: Entry?
+        for entry in archive {
+            guard entry.type == .file, entry.path.hasPrefix(prefix) else { continue }
+            let relative = String(entry.path.dropFirst(prefix.count))
+            let fileName = relative.lowercased()
+            guard allowed.contains((relative as NSString).pathExtension.lowercased()),
+                  fileName.contains("icon") else { continue }
+            var score = 0
+            if fileName.hasPrefix("appicon") || fileName.hasPrefix("icon") { score += 100 }
+            if fileName.contains("icon") { score += 10 }
+            score += InfoPlistParser.scaleRank(fileName) * 10
+            // 路径越浅越可能是主图标（.app 根目录 > 子目录）
+            let depth = relative.components(separatedBy: "/").count - 1
+            score += max(0, 10 - depth)
+            let size = Int(min(entry.uncompressedSize, UInt64(Int.max)))
+            score += size > 0 ? min(size / 10_000, 100) : 0
+            if score > bestScore {
+                bestScore = score
+                bestEntry = entry
+            }
+        }
+        return bestEntry
+    }
+
     func convertToIPAIfNeeded(fileURL: URL, progress: ((Double) -> Void)? = nil) throws -> URL {
         let ext = fileURL.pathExtension.lowercased()
         if ext == "ipa" { return fileURL }

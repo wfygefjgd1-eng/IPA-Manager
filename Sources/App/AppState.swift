@@ -542,18 +542,26 @@ final class AppState: ObservableObject {
                     self.updateImportProgress(fileName: fileName, index: index, total: total, phase: "解析中…", progress: ProgressWeight.parseStartZip)
                 }
                 var app: AppInfo
-                let parsedRootURL: URL
-                let parsed = try self.parser.parseAppInfoWithRoot(fileURL: destination, progress: { p in
-                    if isDirectIPA {
-                        // .ipa 直接导入：5% → 98% 线性映射解压字节
-                        self.updateImportProgress(fileName: fileName, index: index, total: total, phase: "解析中…", progress: ProgressWeight.parseStartDirect + p * ProgressWeight.parseRangeDirect)
-                    } else {
-                        // zip 导入：80% → 95%
-                        self.updateImportProgress(fileName: fileName, index: index, total: total, phase: "解析中…", progress: ProgressWeight.parseStartZip + p * ProgressWeight.parseRangeZip)
-                    }
-                })
-                app = parsed.info
-                parsedRootURL = parsed.rootURL
+                let parsedRootURL: URL?
+                if isDirectIPA, let light = self.parser.lightweightParsedAppInfo(from: destination) {
+                    // 轻量解析（中央目录直读 Info.plist + 图标，毫秒级）：直连
+                    // .ipa 导入不再为读元数据整包解压一份 GB 级副本（本次解压目录
+                    // 旧版要等解析完成才删）。失败自动落回整包解析，最坏 = 旧行为。
+                    app = light.info
+                    parsedRootURL = light.workDir
+                } else {
+                    let parsed = try self.parser.parseAppInfoWithRoot(fileURL: destination, progress: { p in
+                        if isDirectIPA {
+                            // .ipa 直接导入：5% → 98% 线性映射解压字节
+                            self.updateImportProgress(fileName: fileName, index: index, total: total, phase: "解析中…", progress: ProgressWeight.parseStartDirect + p * ProgressWeight.parseRangeDirect)
+                        } else {
+                            // zip 导入：80% → 95%
+                            self.updateImportProgress(fileName: fileName, index: index, total: total, phase: "解析中…", progress: ProgressWeight.parseStartZip + p * ProgressWeight.parseRangeZip)
+                        }
+                    })
+                    app = parsed.info
+                    parsedRootURL = parsed.rootURL
+                }
                 // skip-copy 分支唯一后缀保护：转换产物已直接写入 destination，但该路径若
                 // 已被其它 bundleID 的记录引用（如旧记录指向已丢失的文件、或转换输出恰好
                 // 撞上残留同名文件），把产物改名到唯一后缀，杜绝新旧两条记录指向同一文件。
@@ -592,10 +600,12 @@ final class AppState: ObservableObject {
                    ) {
                     app.iconPath = stablePath
                 }
-                // 解析与图标提取完成后，本次解压目录（Extracted/<base>-<uuid>，数百 MB~
-                // 数 GB 的完整副本）已无用：立即清理，与 zip 转换路径（convertToIPAIfNeeded）
-                // 的磁盘占用策略对齐——旧实现直接 .ipa 导入的解析目录要留到冷启动孤儿清扫。
-                try? FileManager.default.removeItem(at: parsedRootURL)
+                // 解析与图标提取完成后，本次解析产生的临时/解压目录已无用：
+                // 整包路径是 Extracted/<base>-<uuid>（数百 MB~数 GB 的完整副本），
+                // 轻量路径是 tmp 里的 Info.plist/图标中转目录，统一用后即清。
+                if let parsedRootURL = parsedRootURL {
+                    try? FileManager.default.removeItem(at: parsedRootURL)
+                }
                 DispatchQueue.main.async {
                     // bundleID 为空（Info.plist 损坏/顶层非字典等异常）时不按空串去重：
                     // 否则第二个坏包会静默覆盖上一个坏包的记录且无任何提示
@@ -1078,6 +1088,15 @@ final class AppState: ObservableObject {
         return result
     }
 
+    /// 上次投递扫描时刻（仅主线程读写）：一次回前台最多 4 个触发点——scenePhase
+    /// 与 applicationDidBecomeActive 几乎同时到、另有 2.5/10 秒延迟复查。扫描是
+    /// 主线程目录枚举（Documents 子目录树 + 各共享容器收件箱 + 任务 JSON 解码，
+    /// 文件多时可观），防抖窗口内的重复触发直接跳过（丢的只是即时性：延迟复查
+    /// 与下次回前台必然补扫，去重机制保证不重复导入）。用户主动触发
+    /// （日志页"立即扫描"、ipamanager:// 唤起）传 force=true 不受窗口限制。
+    private var lastInboxScanDate: Date = .distantPast
+    private static let inboxScanDebounce: TimeInterval = 0.8
+
     /// 扫描待处理投递（触发点：SwiftUI scenePhase == .active 与
     /// applicationDidBecomeActive 双挂——iOS 27 实测不再回调 application 级
     /// didBecomeActive，SwiftUI scenePhase 是可靠触发点；两者并存，扫描内部去重；
@@ -1090,7 +1109,12 @@ final class AppState: ObservableObject {
     /// 未登记 → 视为 open 事件丢失的投递，补走完整导入链路（handleFileOpenedFromOutside
     /// 内部登记在途 + 结算自删 + 自动一条龙签名安装）。
     /// 仅主线程调用；目录不存在/为空时开销仅几次目录探测。
-    func processInboxFilesIfNeeded() {
+    func processInboxFilesIfNeeded(force: Bool = false) {
+        let now = Date()
+        if !force, now.timeIntervalSince(lastInboxScanDate) < Self.inboxScanDebounce {
+            return
+        }
+        lastInboxScanDate = now
         let inboxFiles = (try? FileManager.default.contentsOfDirectory(
             at: inboxURL, includingPropertiesForKeys: [.contentModificationDateKey],
             options: [.skipsHiddenFiles])) ?? []
@@ -1276,7 +1300,7 @@ final class AppState: ObservableObject {
         // 收件箱，这里直接触发回前台扫描完成导入；不做文件导入路由
         if url.scheme == "ipamanager" {
             ExternalDeliveryJournal.record("收到主 App 唤起 URL: \(url.absoluteString)")
-            processInboxFilesIfNeeded()
+            processInboxFilesIfNeeded(force: true)
             return
         }
 
@@ -1861,8 +1885,31 @@ final class AppState: ObservableObject {
 
         var result: AppInfo
         var extractedRoot: URL? = nil
-        // parseAppInfoWithRoot 会解压 IPA 并读取 Info.plist / 提取图标
-        if let parsed = try? parser.parseAppInfoWithRoot(fileURL: url) {
+        // 轻量解析优先（中央目录直读 Info.plist + 图标，毫秒级）：已签应用刷新
+        // 对每个新产物都要解析一次，旧版首扫要整包解压（N 个大包 = N 次 GB 级
+        // IO）；失败回退整包解析，最坏 = 旧行为
+        if let light = parser.lightweightParsedAppInfo(from: url) {
+            var info = light.info
+            extractedRoot = light.workDir
+            // 覆盖回签名产物自身：parseAppInfo 返回的 path 是 .app 内部路径、
+            // size 是 IPA 大小。其它调用方（AppDetailView 按 path 匹配已签名列表、
+            // 详情/首页按 signedPath/path 取签名文件时间）依赖这些字段指向签名 IPA。
+            info.path = path
+            info.size = size
+            info.isSigned = true
+            info.signedPath = path
+            // 图标持久化到稳定位置再回填 iconPath（与整包路径一致）
+            if let iconPath = info.iconPath,
+               FileManager.default.fileExists(atPath: iconPath),
+               let stablePath = persistInstalledAppIcon(
+                   from: iconPath,
+                   baseName: url.deletingPathExtension().lastPathComponent,
+                   app: info
+               ) {
+                info.iconPath = stablePath
+            }
+            result = info
+        } else if let parsed = try? parser.parseAppInfoWithRoot(fileURL: url) {
             var info = parsed.info
             extractedRoot = parsed.rootURL
             // 覆盖回签名产物自身：parseAppInfo 返回的 path 是 .app 内部路径、
@@ -1894,8 +1941,8 @@ final class AppState: ObservableObject {
             result = fallback
         }
 
-        // 图标已持久化到 Extracted/Icons/ 稳定位置，本次解压目录（数百 MB~数 GB）
-        // 立即清理：旧实现要留到冷启动孤儿清扫，会话内每刷新一次就多攒一份。
+        // 图标已持久化到 Extracted/Icons/ 稳定位置，本次解析产生的目录立即清理：
+        // 整包路径是数百 MB~数 GB 的解压副本，轻量路径是 tmp 中转目录
         if let extractedRoot = extractedRoot {
             try? FileManager.default.removeItem(at: extractedRoot)
         }
@@ -1930,9 +1977,10 @@ final class AppState: ObservableObject {
         store.saveCertificates(certificates)
         store.saveProfiles(profiles)
         store.saveSigningTasks(signingTasks)
-        // 下载任务以 DownloadManager 的内存态为准，避免用恒为空的
-        // downloadTasks 覆盖 DownloadManager 已持久化的任务记录。
-        store.saveDownloadTasks(DownloadManager.shared.snapshotTasks())
+        // 下载任务不再在此重编码落盘：DownloadManager 在每次任务变更
+        // （创建/进度节流/暂停/恢复/重试/收尾）时自行持久化，这里再全量编码
+        // 一次（含 resumeData 的任务可达数百 KB）纯属重复 IO，且把 DownloadManager
+        // 的内存态与 AppState 的保存时机耦在一起。
         store.saveImportedApps(importedApps)
     }
 

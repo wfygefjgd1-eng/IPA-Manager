@@ -18,9 +18,9 @@ struct DeliveryLogView: View {
     /// 最近导入任务（Incoming 接收队列的任务 JSON，跨进程持久）
     @State private var importTasks: [ImportTask] = []
 
-    /// 手动刷新：触发一轮投递扫描 + 重载任务列表
+    /// 手动刷新：触发一轮投递扫描 + 重载任务列表（force 绕过防抖窗口）
     private func reload() {
-        appState.processInboxFilesIfNeeded()
+        appState.processInboxFilesIfNeeded(force: true)
         importTasks = ImportTaskStore.recentTasks(limit: 5)
     }
 
