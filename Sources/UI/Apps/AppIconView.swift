@@ -93,6 +93,12 @@ struct AppIconView: View {
         let value = (attributes?[.modificationDate] as? Date)?.timeIntervalSince1970 ?? 0
 
         mtimeLock.lock()
+        // 条目仅在读取时有 5s TTL 判定、从不移除——长会话浏览大量应用后随
+        // 图标路径数无限增长。超过上限时按过期时间剪枝一次（TTL 内的条目保留）
+        if mtimeMemo.count > 512 {
+            let cutoff = Date().addingTimeInterval(-5)
+            mtimeMemo = mtimeMemo.filter { $0.value.at >= cutoff }
+        }
         mtimeMemo[path] = (value, Date())
         mtimeLock.unlock()
         return value

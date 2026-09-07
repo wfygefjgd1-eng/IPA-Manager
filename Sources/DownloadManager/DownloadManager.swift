@@ -580,42 +580,56 @@ extension DownloadManager: URLSessionDownloadDelegate {
         // 换源时会把"前半旧内容 + 后半新内容"拼成损坏产物（zip 场景导入时报
         // "已损坏"，其它格式静默落盘）。偏移 + 本次期望字节数 ≠ 恢复前持久化的
         // 总大小 → 断点作废，取消后整包重下。
+        //
+        // 兼容 URLSession 续传的两种上报语义（不同系统版本/响应形态下
+        // totalBytesExpectedToWrite 的含义不一致，旧实现只认前者）：
+        // - 剩余量语义：expected = 剩余字节，未换内容 ⇒ offset + expected == total；
+        // - 全量语义：expected = 全文件大小且 totalBytesWritten 自续传偏移起累计，
+        //   未换内容 ⇒ expected == total 且首个回调的 written ≥ offset。
+        // 两种语义都不满足 ⇒ 服务器内容确实变了（总大小对不上 / 全量语义下
+        // written 落后于断点偏移，服务器忽略了 Range 从 0 重发）⇒ 整包重下。
+        // 旧实现在全量语义下每次续传都误判重下（断点续传形同虚设）；新判定在
+        // 两种语义下都只拦截真正的换源/重传，绝不误伤正常续传。
         if resumedTaskIDs.remove(id) != nil,
            let model = taskModels[id],
            model.totalBytes > 0, totalBytesExpectedToWrite > 0,
-           model.receivedBytes > 0,
-           model.receivedBytes + totalBytesExpectedToWrite != model.totalBytes {
-            Logger.warning("续传内容与原文件不一致（偏移 \(model.receivedBytes) + 期望 \(totalBytesExpectedToWrite) ≠ 原总大小 \(model.totalBytes)），放弃断点整包重下: \(model.fileName)")
-            tasks[id]?.cancel()
-            tasks.removeValue(forKey: id)
-            pausingTaskIDs.remove(id)
-            resumeRequestedTaskIDs.remove(id)
-            var retrying = model
-            retrying.retryCount = effectiveRetryCount(for: model) + 1
-            retrying.lastRetryDate = Date()
-            retrying.status = .downloading
-            retrying.error = nil
-            retrying.receivedBytes = 0
-            retrying.totalBytes = 0
-            retrying.resumeData = nil
-            sizePersistedTasks.remove(id)
-            if let url = URL(string: retrying.url) {
-                let sessionTask = session.downloadTask(with: url)
-                sessionTask.taskDescription = id.uuidString
-                taskModels[id] = retrying
-                tasks[id] = sessionTask
-                sessionTask.resume()
-                persistTasks()
-            } else {
-                // 防御：URL 失效（URLSession 存续期间基本不可达）时按失败收尾，
-                // 绝不留下"无 sessionTask 却显示下载中"的僵尸任务（永远卡在 0%）
-                retrying.status = .failed
-                retrying.error = "无效 URL"
+           model.receivedBytes > 0 {
+            let remainingSemantics = model.receivedBytes + totalBytesExpectedToWrite == model.totalBytes
+            let fullTotalSemantics = totalBytesExpectedToWrite == model.totalBytes
+                && totalBytesWritten >= model.receivedBytes
+            if !(remainingSemantics || fullTotalSemantics) {
+                Logger.warning("续传内容与原文件不一致（偏移 \(model.receivedBytes) + 期望 \(totalBytesExpectedToWrite) ≠ 原总大小 \(model.totalBytes)），放弃断点整包重下: \(model.fileName)")
+                tasks[id]?.cancel()
                 tasks.removeValue(forKey: id)
-                taskModels[id] = retrying
-                persistTasks()
+                pausingTaskIDs.remove(id)
+                resumeRequestedTaskIDs.remove(id)
+                var retrying = model
+                retrying.retryCount = effectiveRetryCount(for: model) + 1
+                retrying.lastRetryDate = Date()
+                retrying.status = .downloading
+                retrying.error = nil
+                retrying.receivedBytes = 0
+                retrying.totalBytes = 0
+                retrying.resumeData = nil
+                sizePersistedTasks.remove(id)
+                if let url = URL(string: retrying.url) {
+                    let sessionTask = session.downloadTask(with: url)
+                    sessionTask.taskDescription = id.uuidString
+                    taskModels[id] = retrying
+                    tasks[id] = sessionTask
+                    sessionTask.resume()
+                    persistTasks()
+                } else {
+                    // 防御：URL 失效（URLSession 存续期间基本不可达）时按失败收尾，
+                    // 绝不留下"无 sessionTask 却显示下载中"的僵尸任务（永远卡在 0%）
+                    retrying.status = .failed
+                    retrying.error = "无效 URL"
+                    tasks.removeValue(forKey: id)
+                    taskModels[id] = retrying
+                    persistTasks()
+                }
+                return
             }
-            return
         }
 
         taskModels[id]?.receivedBytes = totalBytesWritten

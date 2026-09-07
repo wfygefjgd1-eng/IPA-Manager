@@ -33,6 +33,12 @@ final class LocalInstallServer {
     /// 判定依据——整个 IPA 发完后 SpringBoard 不再需要旧服务器，可安全重启。
     /// 仅在服务器串行队列读写（sendFileChunks 及其 send 完成回调运行在该队列）。
     private var transferCompletedDate: Date?
+    /// 每连接"请求头空闲"看门狗（仅在服务器串行队列创建/触发/清理）：
+    /// 监听器绑定全部接口（安装会话期间），本机探测/扫描器可能建立连接后
+    /// 静默滞留、永不发送完整请求——无超时会无限占用连接与描述符，挤占
+    /// SpringBoard 的真实安装连接。30 秒未送出请求头即断开；
+    /// 请求进入 respond（manifest 404 / IPA 流式发送）时解除。
+    private var connectionIdleTimers: [ObjectIdentifier: DispatchSourceTimer] = [:]
 
     /// 持有并发探测结果的盒子，避免在并发 Task 中直接捕获可变变量（Sendable 警告）。
     private final class ProbeHolder: @unchecked Sendable {
@@ -149,11 +155,17 @@ final class LocalInstallServer {
     ///    （ready 等待，最长 5 秒）isRunning 仍为 false，不能据此判空闲；
     /// 2) 上一个会话的 IPA 已完整发出（EOF / 传输中止）且距今超过 5 秒——
     ///    SpringBoard 下载完成后（或已断开）不再需要旧服务器，可安全重启；
-    /// 3) **死会话解锁**：open 已发起但 SpringBoard 从未前来拉取（无任何请求/
-    ///    分块活动超过 45 秒）——该会话已无存在意义（典型成因：回桌面后进程
-    ///    被挂起、系统静默忽略弹窗），绝不能让下一次安装为它空等 15 分钟
-    ///    （实测"重新签名并安装/连续安装全部卡死、只有重启 App 才恢复"的根因；
-    ///    健康传输的分块活动会持续刷新活动时间戳，不受此规则影响）；
+    /// 3) **死会话解锁（仅限"零活动"会话）**：open 已发起但 SpringBoard 从未
+    ///    前来（自 start 起无任何连接/请求超过 45 秒）——该会话已无存在意义
+    ///    （典型成因：回桌面后进程被挂起、系统静默忽略弹窗），绝不能让下一
+    ///    次安装为它空等 15 分钟（实测"连续安装全部卡死、只有重启 App 才恢复"
+    ///    的根因；健康传输的分块活动会持续刷新活动时间戳，不受此规则影响）；
+    /// 3b) **弹窗停留会话保护（v1.0.176）**：SpringBoard 已来过（manifest 已
+    ///    拉取、安装确认弹窗正在展示）但用户尚未点"安装"的会话，绝不按 45 秒
+    ///    无差别解锁——旧规则下用户在弹窗停留超过 45 秒，下一个并发安装会把
+    ///    该会话的服务器当"死会话"杀掉，用户随后点"安装"必然失败。此类会话
+    ///    在安装会话窗口内（10 分钟，与回前台/保活的会话判定一致）保持忙，
+    ///    超窗后仍无活动才解锁（兜底防永久等待）；
     /// 4) 等待超过 15 分钟硬上限：兜底放弃等待，由调用方给出明确错误。
     /// 期间并发 stop() 会把 isRunning 置 false，循环随即退出。
     private func waitForPreviousInstallIdle() throws {
@@ -161,10 +173,18 @@ final class LocalInstallServer {
         let began = Date()
         while true {
             var idle = false
+            // 全部状态读取在单次 queue.sync 内完成（本函数运行在调用方后台队列，
+            // 不得在 sync 内再嵌套 sync——会话窗口判定按同一份快照内联计算）
             ServerQueue.shared.queue.sync {
+                let now = Date()
+                let neverContacted = (lastActivityDate == nil)
+                let sinceStart = startedDate.map { now.timeIntervalSince($0) } ?? 0
+                let sinceActivity = lastActivityDate.map { now.timeIntervalSince($0) } ?? 0
+                let sessionWindowOpen = isRunning && sinceStart < 600
                 idle = (!isRunning && !isStarting)
-                    || (transferCompletedDate.map { Date().timeIntervalSince($0) >= 5 } ?? false)
-                    || (lastActivityDate.map { Date().timeIntervalSince($0) >= 45 } ?? false)
+                    || (transferCompletedDate.map { now.timeIntervalSince($0) >= 5 } ?? false)
+                    || (neverContacted && sinceStart >= 45)
+                    || (!neverContacted && sinceActivity >= 45 && !sessionWindowOpen)
             }
             if idle { return }
             if Date().timeIntervalSince(began) >= hardCap {
@@ -364,6 +384,8 @@ final class LocalInstallServer {
             wasRunning = isRunning
             connections.forEach { $0.cancel() }
             connections.removeAll()
+            connectionIdleTimers.values.forEach { $0.cancel() }
+            connectionIdleTimers.removeAll()
             listener?.cancel()
             listener = nil
             servingIPA = nil
@@ -377,6 +399,31 @@ final class LocalInstallServer {
             Logger.info("本地安装服务器已停止")
         }
         BackgroundAudioKeepAlive.shared.stop()
+    }
+
+    /// 连接建立后安排 30 秒请求头空闲超时（运行在服务器串行队列，直接读写）
+    private func scheduleHeaderIdleTimeout(_ connection: NWConnection) {
+        let key = ObjectIdentifier(connection)
+        connectionIdleTimers[key]?.cancel()
+        let timer = DispatchSource.makeTimerSource(queue: ServerQueue.shared.queue)
+        timer.schedule(deadline: .now() + 30)
+        timer.setEventHandler { [weak self] in
+            guard let self = self else { return }
+            // 请求仍未进入 respond（未收到完整请求头）：断开并清理
+            self.connectionIdleTimers.removeValue(forKey: key)
+            Logger.info("本地服务器连接 30 秒未发送请求，已断开")
+            self.connections.removeAll { $0 === connection }
+            connection.cancel()
+        }
+        connectionIdleTimers[key] = timer
+        timer.resume()
+    }
+
+    /// 请求已开始处理（或连接已终止）：解除该连接的请求头空闲超时
+    private func cancelHeaderIdleTimeout(_ connection: NWConnection) {
+        let key = ObjectIdentifier(connection)
+        connectionIdleTimers[key]?.cancel()
+        connectionIdleTimers.removeValue(forKey: key)
     }
 
     private func handleConnection(_ connection: NWConnection) {
@@ -396,14 +443,19 @@ final class LocalInstallServer {
                 Logger.info("本地服务器连接就绪 (.ready)")
             case .failed(let error):
                 Logger.error("本地服务器连接失败: \(error.localizedDescription)")
+                self.cancelHeaderIdleTimeout(connection)
                 self.connections.removeAll { $0 === connection }
             case .cancelled:
+                self.cancelHeaderIdleTimeout(connection)
                 self.connections.removeAll { $0 === connection }
             default:
                 break
             }
         }
         connection.start(queue: ServerQueue.shared.queue)
+
+        // 请求头空闲看门狗：30 秒内未送出完整请求头即断开（防静默连接挤占描述符）
+        scheduleHeaderIdleTimeout(connection)
 
         // TCP 不保证请求头一次到达：循环累积直到出现 "\r\n\r\n"（请求头结束标记）
         // 再解析请求行。旧实现单次 receive（≥1 字节即回调）会把半包请求
@@ -451,6 +503,8 @@ final class LocalInstallServer {
     }
 
     private func respond(request: String, connection: NWConnection) {
+        // 完整请求头已到手：解除连接的 30 秒空闲超时（后续进入响应/流式发送阶段）
+        cancelHeaderIdleTimeout(connection)
         let path = requestPath(from: request)
         lastActivityDate = Date()
         // 用 INFO 级别记录请求路径：诊断报告只包含 ERROR/INFO，debug 级日志看不到，
