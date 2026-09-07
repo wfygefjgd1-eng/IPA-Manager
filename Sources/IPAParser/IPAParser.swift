@@ -267,11 +267,11 @@ final class IPAParser {
             if let plistData = try? Data(contentsOf: plistTempURL),
                let dict = (try? PropertyListSerialization.propertyList(from: plistData, options: [], format: nil)) as? [String: Any] {
                 info.iconPath = Self.lightweightIconEntry(in: archive, appDir: appDir, plist: dict)
-                    .flatMap { entry -> URL? in
+                    .flatMap { entry -> String? in
                         let ext = (entry.path as NSString).pathExtension.lowercased()
                         let iconURL = workDir.appendingPathComponent("icon.\(ext)")
                         try? ZipManager.shared.extractEntry(archiveURL: ipaURL, entryPath: entry.path, to: iconURL)
-                        return FileManager.default.fileExists(atPath: iconURL.path) ? iconURL : nil
+                        return FileManager.default.fileExists(atPath: iconURL.path) ? iconURL.path : nil
                     }
             }
             return (info, workDir)

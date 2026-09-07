@@ -1110,11 +1110,10 @@ final class AppState: ObservableObject {
     /// 内部登记在途 + 结算自删 + 自动一条龙签名安装）。
     /// 仅主线程调用；目录不存在/为空时开销仅几次目录探测。
     func processInboxFilesIfNeeded(force: Bool = false) {
-        let now = Date()
-        if !force, now.timeIntervalSince(lastInboxScanDate) < Self.inboxScanDebounce {
+        if !force, Date().timeIntervalSince(lastInboxScanDate) < Self.inboxScanDebounce {
             return
         }
-        lastInboxScanDate = now
+        lastInboxScanDate = Date()
         let inboxFiles = (try? FileManager.default.contentsOfDirectory(
             at: inboxURL, includingPropertiesForKeys: [.contentModificationDateKey],
             options: [.skipsHiddenFiles])) ?? []
