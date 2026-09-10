@@ -1170,6 +1170,12 @@ final class AppState: ObservableObject {
                     processedInboxPaths.remove(path)
                     store.saveProcessedInboxPaths(Array(processedInboxPaths))
                     Logger.info("清理超期分享投递残留: \(file.lastPathComponent)")
+                    ExternalDeliveryJournal.record("清理超期投递残留: \(file.lastPathComponent)", level: .info)
+                } else {
+                    // 曾静默 continue：结算删除失败残留 + 同名文件重投会永远命中此分支
+                    // （“分享了毫无反应”且日志为零）。必须落盘可见，超期前用户可手动处理。
+                    Logger.info("分享投递已结算但源文件仍在，跳过（24h 后自动清扫）: \(file.lastPathComponent)")
+                    ExternalDeliveryJournal.record("投递跳过（已结算残留，24h 后自动清扫；重投同名文件请先删旧文件或等清扫）: \(file.lastPathComponent)", level: .warning)
                 }
                 continue
             }
@@ -1183,14 +1189,22 @@ final class AppState: ObservableObject {
             // 内不重试——一次回前台最多触发 4 次扫描，没有窗口时坏文件每次进 App
             // 会被连续导入 4 遍
             if let record = failedDeliveryRecords[identity] {
-                if record.count >= Self.maxDeliveryRetries { continue }
+                if record.count >= Self.maxDeliveryRetries {
+                    // 曾静默 continue：文件明明在 Inbox 里躺着、用户反复重投也被吞，
+                    // 日志页零记录即本案“主 App 打开但不导入、完全无日志”。必须落盘可见。
+                    Logger.info("投递已达重试上限，跳过自动重试: \(file.lastPathComponent)")
+                    ExternalDeliveryJournal.record("投递跳过（连续失败 \(record.count) 次达上限，源文件保留）：\(file.lastPathComponent)", level: .warning)
+                    continue
+                }
                 if Date().timeIntervalSince(record.lastAttempt) < Timeouts.deliveryRetryThrottle {
                     Logger.info("投递重试节流中（上次失败距今过近）: \(file.lastPathComponent)")
+                    ExternalDeliveryJournal.record("投递跳过（重试节流中，稍后回前台/点日志页刷新即重试）: \(file.lastPathComponent)", level: .info)
                     continue
                 }
             }
             if !isInSystemInbox && importedDeliveryIdentities.contains(identity) {
                 Logger.info("跳过重复投递（同内容文件已导入过）: \(file.lastPathComponent)")
+                ExternalDeliveryJournal.record("投递跳过（同内容已导入过）: \(file.lastPathComponent)", level: .info)
                 continue
             }
             // 未登记 = open 事件丢失（正常投递的文件在结算时已自删，不会留到这里）。

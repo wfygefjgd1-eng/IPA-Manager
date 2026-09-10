@@ -104,9 +104,9 @@ targets:
         # 分享导入可靠性（v1.0.121）：关闭 in-place 后，所有「拷贝到 / 打开方式」投递
         # 一律由系统先把文件拷入 Documents/Inbox 再投递 openURL——回前台 Inbox 兜底扫描
         # （AppState.processInboxFilesIfNeeded）才能在 open 事件丢失时补处理。若开启
-        # in-place，投递可能直接给出来源 App 沙盒内的原位 URL（文件不落地），事件一旦
-        # 丢失无任何兜底手段。本 App 对外部文件只做导入复制、从不原位编辑，in-place
-        # 无实际收益。
+        # in-place（YES），投递可能直接给出来源 App 沙盒内的原位 URL（文件不落地），事件一旦
+        # 丢失无任何兜底手段，且原位 URL 需要全程持有安全作用域、本 App 又只做导入复制、
+        # 从不原位编辑，in-place 无实际收益——必须保持 false，不可改为 YES。
         LSSupportsOpeningDocumentsInPlace: false
         # 分享路由修正（v1.0.122）：UISupportsDocumentBrowser 声明本 App 为"文档浏览器"
         # 应用，与 UIFileSharingEnabled（文件共享）是 Apple 定位中两种互斥的文件暴露
@@ -147,15 +147,20 @@ targets:
         # 声明后 App 以「拷贝到 IPA Manager」出现在分享面板 App 行，系统把文件拷入
         # Documents/Inbox 并投递 openURL。public.data 是兜底（任意未知扩展名的文件
         # 动态 UTI 均 conforms 到它）；显式列出 com.ipamanager.ipa（下方 imported
-        # declaration）与 public.zip-archive 提升微信/QQ/Safari/文件等来源的匹配率。
+        # declaration）与 com.apple.itunes.ipa（系统侧对 .ipa 的通用标识，微信/QQ/
+        # Safari/文件等来源按此标记时命中）及 public.zip-archive / com.pkware.zip-archive /
+        # public.archive（zip 各别名，覆盖不同来源的 UTI 标记差异），提升匹配率。
         CFBundleDocumentTypes:
-          - CFBundleTypeName: IPA File
+          - CFBundleTypeName: iOS App Package
+            CFBundleTypeRole: Viewer
             LSHandlerRank: Owner
             LSItemContentTypes:
+              - com.apple.itunes.ipa
               - com.ipamanager.ipa
               - public.zip-archive
+              - com.pkware.zip-archive
+              - public.archive
               - public.data
-            CFBundleTypeRole: Viewer
         # 自定义 scheme：分享扩展保存文件后尝试 ipamanager://import 拉起主 App
         #（历史系统版本对分享扩展不支持 open，失败无副作用；主 App 收到后直接
         # 触发共享收件箱扫描）
@@ -165,12 +170,25 @@ targets:
               - ipamanager
         # .ipa 在 iOS 无系统 UTI，不声明时系统按动态 UTI（仅 conforms public.data）
         # 匹配；显式声明后按扩展名精确映射，分享面板/打开方式的匹配更可靠。
+        # com.apple.itunes.ipa 为系统侧对 .ipa 的通用标识（conforms public.zip-archive，
+        # 本体即 zip，文件 App/微信/QQ/Safari 按此标记时命中）；com.ipamanager.ipa
+        # 为本 App 自定义标识（历史兼容，conforms public.archive）。两者同映射 .ipa
+        # 后缀并存，可最大化各来源 App 的 UTI 匹配率。
         UTImportedTypeDeclarations:
+          - UTTypeIdentifier: com.apple.itunes.ipa
+            UTTypeDescription: iOS App Package
+            UTTypeConformsTo:
+              - public.zip-archive
+              - public.data
+            UTTypeTagSpecification:
+              public.filename-extension:
+                - ipa
           - UTTypeIdentifier: com.ipamanager.ipa
             UTTypeDescription: iOS 应用安装包 (IPA)
             UTTypeConformsTo:
               - public.data
               - public.archive
+              - public.zip-archive
             UTTypeTagSpecification:
               public.filename-extension:
                 - ipa

@@ -60,6 +60,12 @@ final class AppDelegate: NSObject, UIApplicationDelegate {
         DispatchQueue.main.asyncAfter(deadline: .now() + 2.5) {
             AppState.shared.processInboxFilesIfNeeded()
         }
+        // 大包慢拷贝兜底（暖启动同样需要：Safari/文件 App 投递数百 MB～GB 级
+        // ipa/zip 时系统拷贝可能超过 2.5s，两次扫描都错过则文件静默躺平、
+        // 表现为“主 App 打开但不导入”。冷启动已有 10s 复查，此处补齐暖启动）。
+        DispatchQueue.main.asyncAfter(deadline: .now() + 10) {
+            AppState.shared.processInboxFilesIfNeeded()
+        }
     }
 
     func application(

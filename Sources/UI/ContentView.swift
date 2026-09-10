@@ -74,6 +74,11 @@ struct ContentView: View {
             DispatchQueue.main.asyncAfter(deadline: .now() + 2.5) {
                 appState.processInboxFilesIfNeeded()
             }
+            // 大包慢拷贝兜底：Safari/文件 App 投递大包时系统拷贝可能超过 2.5s，
+            // 与 AppDelegate 暖启动 10s 复查对称，去重机制保证不重复导入
+            DispatchQueue.main.asyncAfter(deadline: .now() + 10) {
+                appState.processInboxFilesIfNeeded()
+            }
         }
     }
 
