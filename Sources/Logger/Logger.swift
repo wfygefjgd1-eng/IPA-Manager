@@ -175,9 +175,35 @@ enum Logger {
         }
         let mainGroup = AppGroup.resolvedIdentifier()
         // 主 App 自身描述文件里的组（与扩展的逐个比对，揪出“组错位”）
-        let mainProfileGroups = Self.groupsInMobileProvisionFile(
-            Bundle.main.url(forResource: "embedded", withExtension: "mobileprovision"))
+        let mainProfileURL = Bundle.main.url(forResource: "embedded", withExtension: "mobileprovision")
+        let mainProfileGroups = Self.groupsInMobileProvisionFile(mainProfileURL)
         lines.append("主 App 描述文件组：\(mainProfileGroups.isEmpty ? "读不到" : mainProfileGroups.joined(separator: "、"))")
+        // 主 App 自身描述文件 AppID：只查组不够——主包也可能被塞错描述文件
+        // （进站投递要求系统往本容器拷文件，包络异常时出站自分享正常、进站全灭，
+        // 与“txt 能出去、zip/pdf 全进不来”吻合；只看组看不出来，必须核 AppID）
+        if let mainProfileURL {
+            let ident = Self.provisionIdentityInfo(mainProfileURL)
+            if let appID = ident.appID {
+                lines.append("主 App 描述文件AppID：\(appID)\(Self.appexAppIDVerdict(profileAppID: appID, appexBid: Bundle.main.bundleIdentifier))")
+            } else {
+                lines.append("主 App 描述文件AppID：读不到（描述文件损坏或非标准结构！）")
+            }
+            if let exp = ident.expiresText {
+                lines.append("主 App 描述文件有效期至：\(exp)\(ident.expired == true ? "（⚠️已过期！）" : "")")
+            }
+        } else {
+            lines.append("主 App 描述文件：无 embedded.mobileprovision（侧载注入缺失，扩展与进站投递均会异常！）")
+        }
+        // 沙盒落点自证：进站拷贝的目的地是且仅是这个 Inbox，用户在文件 App 里
+        // 看到的位置必须与它对应；不存在/不可写则系统拷贝无处可落
+        if let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first {
+            let inbox = docs.appendingPathComponent("Inbox", isDirectory: true)
+            var isDir: ObjCBool = false
+            let exists = FileManager.default.fileExists(atPath: inbox.path, isDirectory: &isDir) && isDir.boolValue
+            let count = (try? FileManager.default.contentsOfDirectory(atPath: inbox.path))?.count
+            lines.append("沙盒 Documents：\(docs.path)")
+            lines.append("Inbox 落点：\(inbox.path)（\(exists ? "存在" : "不存在")\(count.map { "，\($0) 个文件" } ?? "")）")
+        }
         for appexURL in appexURLs {
             lines.append("── \(appexURL.lastPathComponent)")
             // 1) Info.plist：扩展点 / 主类 / 激活规则（原样打印，排查生成期写错）
