@@ -181,11 +181,12 @@ enum Logger {
         for appexURL in appexURLs {
             lines.append("── \(appexURL.lastPathComponent)")
             // 1) Info.plist：扩展点 / 主类 / 激活规则（原样打印，排查生成期写错）
-            if let infoURL = Optional(appexURL.appendingPathComponent("Info.plist")),
-               let data = try? Data(contentsOf: infoURL),
+            var appexBid: String?
+            if let data = try? Data(contentsOf: appexURL.appendingPathComponent("Info.plist")),
                let plist = try? PropertyListSerialization.propertyList(from: data, options: [], format: nil),
                let dict = plist as? [String: Any] {
-                lines.append("  BundleID：\(dict["CFBundleIdentifier"] as? String ?? "?")")
+                appexBid = dict["CFBundleIdentifier"] as? String
+                lines.append("  BundleID：\(appexBid ?? "?")")
                 lines.append("  显示名：\(dict["CFBundleDisplayName"] as? String ?? "?")")
                 if let ext = dict["NSExtension"] as? [String: Any] {
                     lines.append("  扩展点：\(ext["NSExtensionPointIdentifier"] as? String ?? "缺失！")")
@@ -204,11 +205,26 @@ enum Logger {
             // 2) 签名：_CodeSignature 缺失则 iOS 拒绝加载扩展（点图标无反应/直接开主 App 的嫌疑之一）
             let hasSig = FileManager.default.fileExists(
                 atPath: appexURL.appendingPathComponent("_CodeSignature").path)
-            lines.append("  签名：\(hasSig ? "有 _CodeSignature" : "无 _CodeSignature（未签名，iOS 会拒绝加载！）")")
+            let hasCodeRes = FileManager.default.fileExists(
+                atPath: appexURL.appendingPathComponent("_CodeSignature/CodeResources").path)
+            lines.append("  签名：\(hasSig ? "有 _CodeSignature" : "无 _CodeSignature（未签名，iOS 会拒绝加载！）")\(hasSig ? (hasCodeRes ? "" : "（缺 CodeResources，签名不完整，iOS 会拒载！）") : "")")
             // 3) 扩展自身描述文件里的组：与主 App 的组交叉比对
-            let extGroups = Self.groupsInMobileProvisionFile(
-                appexURL.appendingPathComponent("embedded.mobileprovision"))
+            let extProfileURL = appexURL.appendingPathComponent("embedded.mobileprovision")
+            let extGroups = Self.groupsInMobileProvisionFile(extProfileURL)
             lines.append("  描述文件组：\(extGroups.isEmpty ? "无/读不到" : extGroups.joined(separator: "、"))")
+            // 4) 描述文件身份与有效期：AppID 与扩展 BundleID 不匹配（第三方重签常把主 App
+            //    的描述文件塞进扩展）或已过期，iOS 在安装期即拒收该 appex——表现为
+            //    分享面板里扩展入口压根不出现（与本次“只有 App 行”吻合）。存在≠有效，
+            //    必须逐项核对。
+            let ident = Self.provisionIdentityInfo(extProfileURL)
+            if let appID = ident.appID {
+                lines.append("  描述文件AppID：\(appID)\(Self.appexAppIDVerdict(profileAppID: appID, appexBid: appexBid))")
+            } else if FileManager.default.fileExists(atPath: extProfileURL.path) {
+                lines.append("  描述文件AppID：读不到（描述文件损坏或非标准结构，iOS 会拒载！）")
+            }
+            if let exp = ident.expiresText {
+                lines.append("  描述文件有效期至：\(exp)\(ident.expired == true ? "（⚠️已过期，iOS 会拒载！）" : "")")
+            }
             if extGroups.isEmpty {
                 lines.append("  ⚠️ 扩展内没有 embedded.mobileprovision：iOS 17+ 会拒绝加载无描述文件的扩展（分享入口点了毫无反应的直接原因）。zsign 旧版只给主 App 写描述文件，用修复后的本引擎重签即可把描述文件补进每个扩展。")
             }
@@ -240,6 +256,46 @@ enum Logger {
     private static func groupsInMobileProvisionFile(_ url: URL?) -> [String] {
         guard let url, let data = try? Data(contentsOf: url) else { return [] }
         return AppGroup.groupsInProvisionData(data)
+    }
+
+    /// 描述文件身份信息：mobileprovision 是 CMS 包裹的 plist，但 AppID/Team/有效期
+    /// 均为 ASCII 明文，正则直取即可（与组名提取同源，无需 CMS 解析；诊断展示用）。
+    private static func provisionIdentityInfo(_ url: URL) -> (appID: String?, expiresText: String?, expired: Bool?) {
+        guard let data = try? Data(contentsOf: url), !data.isEmpty else { return (nil, nil, nil) }
+        let text = String(decoding: data, as: UTF8.self)
+        func first(_ pattern: String) -> String? {
+            guard let regex = try? NSRegularExpression(pattern: pattern),
+                  let m = regex.firstMatch(in: text, range: NSRange(text.startIndex..., in: text)),
+                  m.numberOfRanges > 1, let r = Range(m.range(at: 1), in: text) else { return nil }
+            return String(text[r])
+        }
+        let appID = first("application-identifier</key>\\s*<string>([^<]+)</string>")
+        let expText = first("ExpirationDate</key>\\s*<date>([^<]+)</date>")
+        var expired: Bool?
+        if let expText {
+            let fmt = ISO8601DateFormatter()
+            if let date = fmt.date(from: expText) {
+                expired = date < Date()
+            }
+        }
+        return (appID, expText, expired)
+    }
+
+    /// 核对描述文件 AppID 与扩展 BundleID 是否一致（精确匹配或通配符覆盖）。
+    /// 描述文件 AppID 形如 TEAM.com.ipamanager.app.Share（首段为 TeamID）。
+    private static func appexAppIDVerdict(profileAppID: String, appexBid: String?) -> String {
+        guard let appexBid, !appexBid.isEmpty else { return "" }
+        let parts = profileAppID.split(separator: ".", maxSplits: 1)
+        guard parts.count == 2 else { return "（⚠️AppID 结构异常，iOS 会拒载！）" }
+        let bidPart = String(parts[1])
+        if bidPart == appexBid { return "（与扩展一致）" }
+        if bidPart.hasSuffix(".*"),
+           appexBid.hasPrefix(String(bidPart.dropLast(2)) + ".") || String(bidPart.dropLast(2)) == appexBid {
+            return "（通配符覆盖）"
+        }
+        // 主 App 的描述文件被塞进扩展是最常见的第三方重签失误：组可能碰巧一致
+        // 但 AppID 不对，iOS 照样拒载，且“描述文件组”检查完全看不出来
+        return "（⚠️与扩展 BundleID \(appexBid) 不匹配，iOS 会拒载该扩展！）"
     }
 
     /// 激活规则摘要：字符串谓词原样打印；字典只列键（全量打印太长）。
