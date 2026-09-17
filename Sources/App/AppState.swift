@@ -377,6 +377,8 @@ final class AppState: ObservableObject {
         importProgressStateLock.unlock()
         guard !shouldThrottle else { return }
         DispatchQueue.main.async {
+            // 首次进度出现即登记一条龙计时起点（幂等；签名阶段接管时不会重置）
+            self.ensurePipelineTimerStart()
             self.importProgress = ImportProgress(
                 fileName: fileName,
                 currentIndex: index,
@@ -395,6 +397,9 @@ final class AppState: ObservableObject {
         importProgressStateLock.unlock()
         DispatchQueue.main.async {
             self.importProgress = nil
+            // 导入单独结束（未接自动签名）时收掉计时；延迟 0.5s 复查，
+            // 避免与紧随其后的签名状态置值竞态导致计时清零
+            self.clearPipelineTimerIfIdle()
         }
     }
 
@@ -769,7 +774,17 @@ final class AppState: ObservableObject {
     /// 用户以为 App 卡死、频繁切后台把导入/签名进程掐死（投递文件结算不了，
     /// 下次启动又重新导入——"重复导入/连续签两次"的连锁根源之一）。
     struct AutoPipelineStatus: Equatable {
+        /// 一条龙阶段（弹窗步骤指示器「导入 → 签名 → 安装」的落点）
+        enum Stage: Equatable {
+            /// 正在签名（zsign 真实进度 0~1）
+            case signing
+            /// 正在发起安装（本地服务器启动/manifest 预检，无可靠进度）
+            case installLaunching
+            /// 安装已发起（等待系统弹窗确认；弹窗停留数秒后收场）
+            case installInitiated
+        }
         let appName: String
+        let stage: Stage
         /// 阶段名：正在签名 / 发起安装 / 安装已发起
         let phase: String
         /// 阶段内明细（zsign 阶段文字、系统提示指引等）
@@ -780,18 +795,55 @@ final class AppState: ObservableObject {
 
     @Published var autoPipelineStatus: AutoPipelineStatus?
 
-    private func setPipelineStatus(_ appName: String, _ phase: String, _ detail: String = "", progress: Double? = nil) {
-        DispatchQueue.main.async {
-            self.autoPipelineStatus = AutoPipelineStatus(
-                appName: appName, phase: phase, detail: detail, progress: progress
-            )
+    /// 一条龙计时起点（从导入开始计时，0.1 秒精度展示在弹窗上，随弹窗一起消失）。
+    /// 生命周期覆盖导入→签名→安装全程：导入进度首次出现时登记；签名/安装接管时
+    /// 保持导入时刻不重置；批量导入/签名衔接期间维持连续计时，整条弹窗消失后才清除。
+    @Published private(set) var pipelineStartedAt: Date?
+
+    /// 计时起点只在首次进度出现时登记一次（幂等，任意线程可调）。
+    private func ensurePipelineTimerStart() {
+        if Thread.isMainThread {
+            if pipelineStartedAt == nil { pipelineStartedAt = Date() }
+        } else {
+            DispatchQueue.main.async { self.ensurePipelineTimerStart() }
         }
     }
 
-    func clearPipelineStatus() {
-        DispatchQueue.main.async {
-            self.autoPipelineStatus = nil
+    /// 弹窗收场后清除计时（与弹窗一起消失）。导入单独结束（未接自动签名）时
+    /// 延迟 0.5s 复查：若签名链路已接管（或下一批文件已开始导入）则保留起点，
+    /// 避免导入→签名交接、多文件衔接时计时中途清零。
+    private func clearPipelineTimerIfIdle() {
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
+            guard let self = self,
+                  self.importProgress == nil,
+                  self.autoPipelineStatus == nil else { return }
+            self.pipelineStartedAt = nil
         }
+    }
+
+    /// 主线程调用时同步赋值：导入成功→签名开始的交接发生在同一次主线程事务里
+    /// （clearImportProgress 之后紧接入队签名），同步赋值让 SwiftUI 把「导入卡消失/
+    /// 流水线卡出现」合并为一次更新，弹窗不会闪空一帧；后台线程调用仍走 main.async。
+    private func setPipelineStatus(_ appName: String, _ phase: String, _ detail: String = "", stage: AutoPipelineStatus.Stage, progress: Double? = nil) {
+        let apply = {
+            self.ensurePipelineTimerStart()
+            self.autoPipelineStatus = AutoPipelineStatus(
+                appName: appName, stage: stage, phase: phase, detail: detail, progress: progress
+            )
+        }
+        if Thread.isMainThread { apply() } else { DispatchQueue.main.async(execute: apply) }
+    }
+
+    func clearPipelineStatus() {
+        let apply = {
+            self.autoPipelineStatus = nil
+            // 弹窗收场：计时随弹窗一起消失（此刻导入卡必已清除；若仍在则属
+            // 多文件衔接，clearPipelineTimerIfIdle 的复查逻辑负责保留起点）
+            if self.importProgress == nil {
+                self.pipelineStartedAt = nil
+            }
+        }
+        if Thread.isMainThread { apply() } else { DispatchQueue.main.async(execute: apply) }
     }
 
     /// 同一 bundleID 的自动签名冷却期：签名完成后的短窗口内不再对同应用重复
@@ -890,12 +942,12 @@ final class AppState: ObservableObject {
         }
         isAutoSigning = true
         currentAutoSignBundleID = app.bundleID
-        setPipelineStatus(app.name, "正在签名…", "请保持 App 在前台，签名完成后自动发起安装")
+        setPipelineStatus(app.name, "正在签名…", "请保持 App 在前台，签名完成后自动发起安装", stage: .signing)
         Logger.info("自动签名开始: \(app.name)")
         signApp(app, certificate: cert, profile: profile, progress: { [weak self] p, phase in
             // 真实进度上屏：签名是大 IO（解压+签名+重打包，大包 20-60 秒），
             // 没有可见反馈时用户以为卡死（切后台会掐断整个流水线）
-            self?.setPipelineStatus(app.name, "正在签名…", phase, progress: p)
+            self?.setPipelineStatus(app.name, "正在签名…", phase, stage: .signing, progress: p)
         }) { [weak self] result in
             guard let self = self else { return }
             self.isAutoSigning = false
@@ -924,7 +976,7 @@ final class AppState: ObservableObject {
     private func autoSignAndInstallSucceeded(app: AppInfo, signedPath: String, certificate: CertificateInfo) {
         // 发起安装阶段（本地服务器启动 + manifest 生成 + 预检，约 2-5 秒）也上屏：
         // 这段同样无反馈，是"空白后突然弹安装窗"观感的另一半来源
-        setPipelineStatus(app.name, "正在发起安装…", "启动本地安装通道")
+        setPipelineStatus(app.name, "正在发起安装…", "启动本地安装通道", stage: .installLaunching)
         ExternalDeliveryJournal.record("自动签名完成，发起安装: \(app.name)（\((signedPath as NSString).lastPathComponent)）")
         do {
             try installSignedPath(signedPath, certificate: certificate) { [weak self] in
@@ -933,7 +985,7 @@ final class AppState: ObservableObject {
                 // 生成常超 1.2s——App 先退到后台，open 随后才执行会被系统忽略
                 // （后台态 open 常被忽略），表现为"自动安装静默失败"。
                 guard let self = self else { return }
-                self.setPipelineStatus(app.name, "安装已发起", "请在系统弹窗点「安装」确认")
+                self.setPipelineStatus(app.name, "安装已发起", "请在系统弹窗点「安装」确认", stage: .installInitiated)
                 // 提示停留几秒后收卡（用户点确认/回桌面的时间足够看到结果）
                 DispatchQueue.main.asyncAfter(deadline: .now() + 6) { [weak self] in
                     self?.clearPipelineStatus()

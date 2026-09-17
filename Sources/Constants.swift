@@ -25,6 +25,21 @@ enum ProgressWeight {
     static let throttleDelta: Double = 0.01
 }
 
+/// 一条龙弹窗（导入→签名→安装）整体百分比的阶段权重：
+/// 导入 0–50%（导入自身 0~1 真实字节进度线性映射）、签名 50–95%（zsign 进度映射）、
+/// 发起安装 95–100%（本地服务器/manifest 无可靠进度，按阶段定性推进到满格；
+/// 系统安装确认弹窗由 iOS 接管，不纳入本百分比）。
+enum PipelineOverallWeight {
+    /// 导入阶段占整体的比例（导入进度 × 该系数 → 0–50%）
+    static let importShare: Double = 0.5
+    /// 签名阶段整体起点（50%）
+    static let signStart: Double = 0.5
+    /// 签名阶段跨度（50% → 95%）
+    static let signRange: Double = 0.45
+    /// 发起安装阶段整体起点（95%）
+    static let installLaunch: Double = 0.95
+}
+
 /// Size / count limits used across modules.
 enum Limits {
     // ZipManager safety limits (zip bomb protection)
