@@ -192,6 +192,27 @@ targets:
             UTTypeTagSpecification:
               public.filename-extension:
                 - ipa
+          # p12/pfx 与 mobileprovision 必须显式声明（与 .ipa 同理）：iOS 系统类型库
+          # 未收录 mobileprovision（p12 在部分系统版本同样不可靠），代码里用
+          # UTType(filenameExtension:) 只会得到进程内动态 UTI（dyn.*）——而
+          # UIDocumentPickerViewController 的文件过滤在系统进程内完成，解析不了
+          # 动态 UTI → 证书页选择器打开后对应文件灰显/选不了（"导入不了证书"）。
+          # 声明后代码统一用 UTType(importedAs:) 引用，扩展名映射全局生效。
+          - UTTypeIdentifier: com.ipamanager.p12
+            UTTypeDescription: PKCS#12 证书 (P12/PFX)
+            UTTypeConformsTo:
+              - public.data
+            UTTypeTagSpecification:
+              public.filename-extension:
+                - p12
+                - pfx
+          - UTTypeIdentifier: com.ipamanager.mobileprovision
+            UTTypeDescription: 描述文件 (MobileProvision)
+            UTTypeConformsTo:
+              - public.data
+            UTTypeTagSpecification:
+              public.filename-extension:
+                - mobileprovision
   IPA Manager Share:
     type: app-extension
     platform: iOS

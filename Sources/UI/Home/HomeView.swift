@@ -18,6 +18,11 @@ struct HomeView: View {
     @State private var pendingBatchURLs: [URL] = []
     /// 本次批量是否允许自动签名并安装：仅导入时为 false，导入完成后重置为 true
     @State private var batchAutoSignAllowed = true
+    /// 首页直接选中证书文件（p12/pfx）时的密码框：证书不走 IPA 导入管线
+    ///（解析必然失败，旧实现弹"导入失败"，而证书页选择器此前又选不了文件，
+    /// 形成死循环）。mobileprovision 无需密码，直接导入不经过本密码框。
+    @State private var showCertPasswordSheet = false
+    @State private var pendingCertURL: URL?
 
     var body: some View {
         NavigationStack {
@@ -35,16 +40,22 @@ struct HomeView: View {
                     // 多选导入：串行逐个导入，进度 "正在导入 i/N" 随文件推进；每个文件独立出结果提示
                     onPickMany: { urls in
                         showFileImporter = false
+                        // 证书/描述文件不是应用包：先分流独立处理（p12 弹密码框、
+                        // mobileprovision 直接导入），不进应用串行批次——计数、批量
+                        // 确认、汇总都只针对应用文件，否则含证书文件的批次汇总对不上账
+                        let certURLs = urls.filter { Self.isCertificateMaterial($0) }
+                        let appURLs = urls.filter { !Self.isCertificateMaterial($0) }
                         importSuccessCount = 0
                         importFailureCount = 0
-                        pendingImportCount = urls.count
+                        pendingImportCount = appURLs.count
+                        certURLs.forEach { handleImportedFile($0) }
                         // 多选 + 自动签名开关开启：先问一句，让用户决定是否一条龙
-                        if urls.count > 1, appState.autoSignAndInstallEnabled() {
-                            pendingBatchURLs = urls
+                        if appURLs.count > 1, appState.autoSignAndInstallEnabled() {
+                            pendingBatchURLs = appURLs
                             showBatchModeConfirm = true
                         } else {
                             batchAutoSignAllowed = true
-                            importRemaining(urls, startIndex: 0)
+                            importRemaining(appURLs, startIndex: 0)
                         }
                     },
                     allowsMultiple: true
@@ -66,6 +77,22 @@ struct HomeView: View {
                 Button("确定", role: .cancel) {}
             } message: {
                 Text(alertMessage)
+            }
+            // 证书密码框：p12/pfx 在首页直接导入。延迟呈现——本 sheet 的触发点在
+            // 文件选择器的回调里（此时选择器 sheet 正在 dismiss），"边 dismiss 边
+            // present"会被 UIKit 间歇性丢弃（与 CertificatesView 同源问题），
+            // 延迟越过 dismiss 动画后状态仍在（pendingCertURL 非 nil）才呈现。
+            .sheet(isPresented: $showCertPasswordSheet, onDismiss: {
+                pendingCertURL = nil
+            }) {
+                PasswordPromptView(
+                    importURL: pendingCertURL,
+                    onImport: { cert in
+                        appState.addCertificate(cert)
+                        appState.showToast("证书已导入: \(cert.name.isEmpty ? "未命名证书" : cert.name)")
+                    },
+                    onCancel: nil
+                )
             }
             .sheet(item: $selectedApp) { app in
                 AppDetailView(app: app)
@@ -217,12 +244,45 @@ struct HomeView: View {
         return result
     }
 
+    /// 证书材料（p12/pfx/mobileprovision）：不是应用包，导入时与应用文件分流
+    private static func isCertificateMaterial(_ url: URL) -> Bool {
+        switch url.pathExtension.lowercased() {
+        case "p12", "pfx", "mobileprovision":
+            return true
+        default:
+            return false
+        }
+    }
+
     private func handleImportedFile(
         _ url: URL,
         index: Int = 1,
         total: Int = 1,
         completion: (() -> Void)? = nil
     ) {
+        // 证书/描述文件路由：走 IPA 导入管线必然解析失败（旧实现弹"导入失败"，
+        // 用户感知"导入不进去"）。分流后不打断应用文件的串行批次链。
+        switch url.pathExtension.lowercased() {
+        case "p12", "pfx":
+            // 需要密码：登记待导入 URL，延迟弹本页密码框。触发点在文件选择器回调
+            // 里（选择器 sheet 正在 dismiss），"边 dismiss 边 present"会被 UIKit
+            // 间歇性丢弃（CertificatesView 同源问题），延迟越过 dismiss 动画再呈现
+            pendingCertURL = url
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) {
+                if pendingCertURL != nil {
+                    showCertPasswordSheet = true
+                }
+            }
+            completion?()
+            return
+        case "mobileprovision":
+            // 无需密码：直接导入
+            importProfileFile(url)
+            completion?()
+            return
+        default:
+            break
+        }
         let isZip = (url.pathExtension.lowercased() == "zip")
         // progressContext 传入序号/总数，导入进度卡片据此显示 "正在导入 i/N"；
         // autoSign 透传"仅导入，不自动安装"的用户选择（AppState 统一出口按它决定
@@ -285,6 +345,28 @@ struct HomeView: View {
         guard startIndex < urls.count else { return }
         handleImportedFile(urls[startIndex], index: startIndex + 1, total: urls.count) {
             importRemaining(urls, startIndex: startIndex + 1)
+        }
+    }
+
+    /// 描述文件直接导入（无需密码）：解析 + 归档到 Documents/Profiles + 按 uuid 去重，
+    /// 与证书页同口径；成功用 toast 轻提示，失败弹 alert。
+    private func importProfileFile(_ url: URL) {
+        do {
+            let profile = try ProvisioningManager.shared.importProfile(from: url)
+            if let index = appState.profiles.firstIndex(where: { $0.uuid == profile.uuid }) {
+                appState.profiles[index].path = profile.path
+                if appState.selectedProfile?.uuid == profile.uuid {
+                    appState.selectedProfile?.path = profile.path
+                }
+                appState.saveState()
+                appState.showToast("描述文件已更新: \(profile.name)")
+            } else {
+                appState.addProfile(profile)
+                appState.showToast("描述文件已导入: \(profile.name)")
+            }
+        } catch {
+            alertMessage = error.localizedDescription
+            showAlert = true
         }
     }
 
