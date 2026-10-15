@@ -17,13 +17,20 @@ struct DocumentPicker: UIViewControllerRepresentable {
 
     func makeUIViewController(context: Context) -> UIDocumentPickerViewController {
         let types = contentTypes ?? [.item]
-        // asCopy=false：返回安全作用域 URL，消费方直接读原位置。旧实现 asCopy=true
-        // 会让系统先把文件整份拷进 tmp、导入流程再从 tmp 二次拷贝——GB 级 IPA 的
-        // 文件选择器导入凭空多一倍 IO 与磁盘峰值。全部消费方
-        // （AppState.importFile / CertificateBundleImporter.extract /
-        // ProvisioningManager.importProfile / CertificateManager.importCertificate）
-        // 均已自带 startAccessingSecurityScopedResource 成对管理，直接读作用域 URL。
-        let picker = UIDocumentPickerViewController(forOpeningContentTypes: types, asCopy: false)
+        // asCopy=true（Copy 模式）必须保留，实测回归教训：
+        // asCopy=false（Open 模式）有两个 Copy 模式没有的限制——
+        // 1) 严格类型过滤：文件可选性由系统进程解析出的 UTI 是否 conforms 到请求类型
+        //    决定。p12/mobileprovision 在 iOS 无系统 UTI（文件解析为 dyn.* 动态 UTI，
+        //    与 App 声明的 com.ipamanager.p12 只是 public.data 下的兄弟节点、不互相
+        //    conforms），Info.plist 声明也救不了文件提供方的解析 → 证书文件灰显、
+        //    点击无反应（"一键导入证书点不动"）；
+        // 2) 只能原位打开：位于其它 App 容器（下载器/微信 Documents 等）的 IPA 无
+        //    安全作用域权限 → 同样灰显选不了（"找到 IPA 点击打开无效"）。
+        // Copy 模式由系统代为拷贝进 tmp，任何位置/任何类型的文件都可点选，170 版本
+        // （asCopy=true）一直正常。代价是 GB 级 IPA 多一份 tmp 拷贝 IO——正确性优先，
+        // 不要再为省 IO 改回 Open 模式。tmp 拷贝非 security-scoped，消费方的
+        // startAccessingSecurityScopedResource 返回 false 即跳过，成对管理无副作用。
+        let picker = UIDocumentPickerViewController(forOpeningContentTypes: types, asCopy: true)
         picker.allowsMultipleSelection = allowsMultiple
         picker.delegate = context.coordinator
         return picker
