@@ -46,4 +46,45 @@ struct ProvisioningInfo: Identifiable, Codable, Hashable {
         guard let expire = expireDate else { return "未知" }
         return Self.cachedDateFormatter.string(from: expire)
     }
+
+    // MARK: - Bundle ID 覆盖校验（手动签名模式）
+
+    /// 校验手动修改后的 Bundle ID 是否与该描述文件兼容（签名时经 zsign 重写包内
+    /// CFBundleIdentifier，重写后的签名 ID 必须被描述文件的 application-identifier
+    /// 覆盖，否则 iOS 安装层必然拒签包）。镜像系统的通配覆盖语义：
+    /// - 通配 AppID（TEAMID.a.*）：允许任意「a.」开头的 Bundle ID（TEAMID.* 则任意）；
+    /// - 精确 AppID（TEAMID.a.b）：只允许「a.b」本身。
+    /// 返回 nil 表示通过；非 nil 为面向用户展示的错误说明。
+    func bundleIDOverrideError(_ newID: String) -> String? {
+        let trimmed = newID.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed.isEmpty { return "Bundle ID 不能为空" }
+        // 字符白名单：iOS bundle id 只允许字母/数字/点/横线/下划线（空格或中文
+        // 会让重写后的包无法安装）
+        let allowed = CharacterSet(
+            charactersIn: "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789.-_"
+        )
+        if trimmed.rangeOfCharacter(from: allowed.inverted) != nil {
+            return "Bundle ID 只能包含字母、数字、点、横线和下划线"
+        }
+        // AppID 缺失（畸形描述文件）时不拦：交给签名/安装链路的系统裁决，宁可放行
+        guard !bundleID.isEmpty else { return nil }
+        // 直接填完整 AppID（含 Team 前缀）视为一致
+        if trimmed == bundleID { return nil }
+
+        let teamPrefix = teamID.isEmpty ? "" : teamID + "."
+        let bare = trimmed.hasPrefix(teamPrefix) ? String(trimmed.dropFirst(teamPrefix.count)) : trimmed
+        if bundleID.hasSuffix("*") {
+            // 通配段包含结尾的点（"TEAMID.a.*" → base "TEAMID.a."）
+            let base = String(bundleID.dropLast())
+            if (teamPrefix + bare).hasPrefix(base) { return nil }
+            let wildcardName = String(bundleID.dropLast()).dropFirst(teamPrefix.count)
+            return "与描述文件不匹配：通配符仅允许「\(wildcardName)…」开头的 Bundle ID"
+        }
+        if teamPrefix + bare == bundleID { return nil }
+        // 描述文件缺 TeamIdentifier 字段时 teamPrefix 为空，退化为后缀比对
+        //（镜像 zsign 的 endsWith 匹配语义，避免误拦）
+        if teamPrefix.isEmpty && bundleID.hasSuffix(bare) { return nil }
+        let expected = bundleID.hasPrefix(teamPrefix) ? String(bundleID.dropFirst(teamPrefix.count)) : bundleID
+        return "与描述文件不匹配：该描述文件仅支持 Bundle ID「\(expected)」"
+    }
 }

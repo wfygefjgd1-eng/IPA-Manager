@@ -705,6 +705,7 @@ final class AppState: ObservableObject {
         _ app: AppInfo,
         certificate: CertificateInfo,
         profile: ProvisioningInfo,
+        bundleIDOverride: String = "",
         progress: @escaping (Double, String) -> Void,
         completion: ((Result<String, Error>) -> Void)? = nil
     ) {
@@ -735,6 +736,7 @@ final class AppState: ObservableObject {
                     sourcePath: app.path,
                     certificate: certificate,
                     profile: profile,
+                    bundleIDOverride: bundleIDOverride,
                     progress: { p, phase in
                         DispatchQueue.main.async {
                             progress(p, phase)
@@ -781,6 +783,38 @@ final class AppState: ObservableObject {
         }
     }
 
+    /// 手动签名模式下修改导入应用的 Bundle ID（元数据修改并落盘）。
+    /// 修改仅作用于本机记录（详情展示/去重都将随记录更新）；包内 CFBundleIdentifier
+    /// 的真正重写发生在下一次签名——bundleIDOverride 传入 zsign 的
+    /// ModifyBundleInfo（主程序与全部扩展一并改写），无重签不生效。
+    /// 已在签名中（bundleID 匹配去重冷却）的应用照常允许改，签名用旧值不受影响。
+    /// 按 id 优先匹配，失败退化按 path 匹配（已签名列表条目与导入记录不同 id）。
+    /// 未找到任何匹配的导入记录时返回 false（纯已签名产物无法挂接修改）。
+    @discardableResult
+    func updateImportedAppBundleID(id: UUID, path: String, newBundleID: String) -> Bool {
+        if Thread.isMainThread {
+            return updateImportedAppBundleIDOnMain(id: id, path: path, newBundleID: newBundleID)
+        }
+        return DispatchQueue.main.sync {
+            updateImportedAppBundleIDOnMain(id: id, path: path, newBundleID: newBundleID)
+        }
+    }
+
+    private func updateImportedAppBundleIDOnMain(id: UUID, path: String, newBundleID: String) -> Bool {
+        let index = importedApps.firstIndex { $0.id == id }
+            ?? importedApps.firstIndex { $0.path == path }
+        guard let index else {
+            Logger.warning("Bundle ID 修改失败：未找到对应的导入记录 (\(id.uuidString))")
+            return false
+        }
+        let old = importedApps[index].bundleID
+        importedApps[index].bundleID = newBundleID
+        saveState()
+        Logger.info("Bundle ID 已修改: \(old) → \(newBundleID)（下次签名时生效）")
+        ExternalDeliveryJournal.record("Bundle ID 手动修改: \(old) → \(newBundleID)（签名时生效）")
+        return true
+    }
+
     func installApp(
         _ app: AppInfo,
         certificate: CertificateInfo,
@@ -806,8 +840,18 @@ final class AppState: ObservableObject {
     }
 
     /// 导入/下载完成后是否自动签名并安装（设置开关，默认开）。
+    /// 「手动签名模式」开启时整体暂停：对自动一条龙等同开关关闭——导入/下载
+    /// 完成后不再自动签名，落到"未签名应用"列表由用户从详情页手动签名。
     func autoSignAndInstallEnabled() -> Bool {
-        store.autoSignAndInstallEnabled()
+        guard !manualSigningModeEnabled() else { return false }
+        return store.autoSignAndInstallEnabled()
+    }
+
+    /// 手动签名模式（设置开关，默认关）：开启后 (1) 应用详情页可手动修改
+    /// Bundle ID（签名时经 zsign 重写包内 CFBundleIdentifier 生效）；(2) 自动
+    /// 签名安装一条龙暂停（见 autoSignAndInstallEnabled 的覆盖语义）。
+    func manualSigningModeEnabled() -> Bool {
+        store.manualSigningModeEnabled()
     }
 
     // MARK: - 自动签名并安装（导入/下载完成后一条龙）
@@ -912,8 +956,8 @@ final class AppState: ObservableObject {
     ///   "启动→续跑→崩溃→再启动"的死循环（实测教训）。
     @discardableResult
     func enqueueAutoSignAndInstall(_ app: AppInfo, persist: Bool = true) -> Bool {
-        // 开关默认开启
-        guard store.autoSignAndInstallEnabled() else { return false }
+        // 开关默认开启（手动签名模式开启时自动一条龙整体暂停）
+        guard autoSignAndInstallEnabled() else { return false }
         // 拒绝对已签名应用重复自动签名（用户重签走手动流程）
         guard !app.isSigned else { return false }
         // 冷却期：同一应用刚自动签过（时间错开的重复投递/重复导入）不再签第二次。
@@ -973,13 +1017,13 @@ final class AppState: ObservableObject {
         // 出队时复验（与 enqueue 的校验对齐）：批量签名期间用户可能删除默认
         // 证书/描述文件（Keychain 私钥一并删除）、换成其它 Team 的组合、或关闭
         // 自动签名开关——用失效组合继续签会产出无法安装的包，直接放弃该项推进。
-        guard store.autoSignAndInstallEnabled(),
+        guard autoSignAndInstallEnabled(),
               let cert = selectedCertificate, cert.status == .valid,
               certificates.contains(where: { $0.id == cert.id }),
               let profile = selectedProfile, profile.status == .valid,
               profiles.contains(where: { $0.id == profile.id }) else {
             autoSigningAppIDs.remove(app.id)
-            Logger.warning("自动签名跳过（默认证书/描述文件已失效或开关已关闭）: \(app.name)")
+            Logger.warning("自动签名跳过（默认证书/描述文件已失效或开关已关闭/手动签名模式开启）: \(app.name)")
             pumpAutoSignQueue()
             return
         }

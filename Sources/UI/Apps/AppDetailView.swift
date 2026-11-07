@@ -43,6 +43,11 @@ struct AppDetailView: View {
     /// 旧实现把 FileManager.fileExists 直接写进 body 表达式，签名进度高频回调
     /// 期间 body 每次重算都 stat 磁盘。
     @State private var sourceFileMissing = false
+    /// 手动签名模式（设置开关，默认关）：开启后 Bundle ID 行变为可点击进入编辑，
+    /// 修改在本机记录，签名时经 zsign 重写包内 CFBundleIdentifier 生效
+    @AppStorage("setting_manual_signing_mode") private var manualSigningMode = false
+    /// Bundle ID 手动编辑弹窗（手动签名模式下出现）
+    @State private var showBundleIDEditor = false
 
     /// 展示层使用的“实时”AppInfo：
     /// - 签名刚完成 → 以签名输出为准（合并原快照的元数据，isSigned = true，path 指向签名产物）；
@@ -104,6 +109,10 @@ struct AppDetailView: View {
             SignOptionsView(app: app) { cert, profile, installAfter in
                 startSigning(certificate: cert, profile: profile, installAfter: installAfter)
             }
+        }
+        // 手动签名模式：Bundle ID 编辑弹窗（修改落库，签名时经 zsign 重写生效）
+        .sheet(isPresented: $showBundleIDEditor) {
+            BundleIDEditorView(app: liveApp)
         }
         .sheet(isPresented: $showInstallCertificatePicker) {
             InstallCertificatePicker { cert in
@@ -197,7 +206,7 @@ struct AppDetailView: View {
 
     private var infoList: some View {
         List {
-            infoRow("Bundle ID", liveApp.bundleID.isEmpty ? "未知" : liveApp.bundleID)
+            bundleIDRow
             infoRow("版本", liveApp.version.isEmpty ? "未知" : liveApp.version)
             infoRow("构建号", liveApp.build.isEmpty ? "未知" : liveApp.build)
             infoRow("文件大小", liveApp.sizeDescription)
@@ -206,6 +215,31 @@ struct AppDetailView: View {
         .listStyle(.insetGrouped)
         // 毛玻璃背景：隐藏 List 默认不透明底色，透出详情页的 GlassBackground
         .scrollContentBackground(.hidden)
+    }
+
+    /// Bundle ID 行：手动签名模式下可点击进入编辑（铅笔图标示意），
+    /// 其余情况保持纯展示行。
+    @ViewBuilder
+    private var bundleIDRow: some View {
+        if manualSigningMode {
+            Button {
+                showBundleIDEditor = true
+            } label: {
+                HStack {
+                    Text("Bundle ID")
+                        .foregroundColor(.secondary)
+                    Spacer()
+                    Text(liveApp.bundleID.isEmpty ? "未知" : liveApp.bundleID)
+                        .multilineTextAlignment(.trailing)
+                        .lineLimit(2)
+                    Image(systemName: "pencil")
+                        .font(.caption)
+                        .foregroundColor(.accentColor)
+                }
+            }
+        } else {
+            infoRow("Bundle ID", liveApp.bundleID.isEmpty ? "未知" : liveApp.bundleID)
+        }
     }
 
     private func infoRow(_ title: String, _ value: String) -> some View {
@@ -319,6 +353,13 @@ struct AppDetailView: View {
         }
     }
 
+    /// 手动签名模式的 Bundle ID 覆盖：仅开关开启且记录非空时传递（空串 =
+    /// 不覆盖，自动一条龙与常规签名路径不受影响）。校验在 SigningEngine.sign
+    /// 内完成（不兼容直接 fail-fast 报精确原因，早于任何签名 IO）。
+    private var signingBundleIDOverride: String {
+        manualSigningMode ? liveApp.bundleID.trimmingCharacters(in: .whitespacesAndNewlines) : ""
+    }
+
     /// 一键签名并安装：默认选中的有效证书 + 描述文件（且仍在证书/描述文件列表中）+ AppStorage
     /// installAfterSigning（默认 true，未设置过时按 true 处理）直接签名并安装；
     /// 默认证书/描述文件缺失或无效时退回 SignOptionsView 让用户手动选择。
@@ -348,7 +389,9 @@ struct AppDetailView: View {
         // 时间必须随真实时钟走，不能只依赖进度回调）
         signStartTime = Date()
         startSignTimer()
-        appState.signApp(app, certificate: certificate, profile: profile, progress: { progress, phase in
+        appState.signApp(app, certificate: certificate, profile: profile,
+                         bundleIDOverride: signingBundleIDOverride,
+                         progress: { progress, phase in
             // 进度节流：变化 ≥1% 或间隔 ≥0.1s 才更新 @State，避免详情页频繁重算
             let now = Date()
             if abs(progress - signProgress) >= 0.01 || now.timeIntervalSince(lastProgressUpdate) >= 0.1 {
@@ -558,6 +601,112 @@ struct InstallCertificatePicker: View {
                     }
                 }
             }
+        }
+    }
+}
+
+/// 手动签名模式的 Bundle ID 编辑弹窗（默认关，入口仅在该模式开启时出现）。
+/// 校验规则与签名时一致（ProvisioningInfo.bundleIDOverrideError，镜像 zsign/系统
+/// 通配覆盖语义）：不兼容的 ID 会在签名时被直接拒绝，编辑阶段先拦避免白签一整包。
+/// 修改只落本机记录，包内重写在下次签名时发生（详情页顶部有说明）。
+struct BundleIDEditorView: View {
+    @Environment(\.dismiss) private var dismiss
+    @EnvironmentObject private var appState: AppState
+    let app: AppInfo
+
+    @State private var draft = ""
+    @State private var saveError: String?
+
+    private var trimmedDraft: String {
+        draft.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    /// 实时校验：以默认描述文件为基准（签名默认走一键路径）；未设置默认描述文件时
+    /// 只做格式校验，兼容性交由签名时再次校验兜底。
+    private var draftError: String? {
+        guard let profile = appState.selectedProfile, profile.status == .valid else { return nil }
+        return profile.bundleIDOverrideError(trimmedDraft)
+    }
+
+    /// 展示给用户的兼容性基准（默认描述文件的 application-identifier）。
+    private var profileAppIDDescription: String {
+        guard let profile = appState.selectedProfile, !profile.bundleID.isEmpty else {
+            return "未设置默认描述文件（可在「证书」页设置）；暂时只校验格式，签名时会再校验兼容性"
+        }
+        return "\(profile.name)：\(profile.bundleID)"
+    }
+
+    var body: some View {
+        NavigationStack {
+            Form {
+                Section {
+                    TextField("com.example.myapp", text: $draft)
+                        .textInputAutocapitalization(.never)
+                        .autocorrectionDisabled()
+                        .keyboardType(.asciiCapable)
+                        // 弹窗再次出现时草稿始终对齐当前记录值（保存失败重开兜底）
+                        .onAppear { if draft.isEmpty { draft = app.bundleID } }
+                } header: {
+                    Text("新的 Bundle ID")
+                } footer: {
+                    Text("仅修改本机记录；包内 Bundle ID 在下次点击「开始签名」时被重写（主程序与扩展一并修改）。")
+                }
+
+                Section {
+                    Text(profileAppIDDescription)
+                        .font(.subheadline)
+                } header: {
+                    Text("签名将使用的描述文件")
+                } footer: {
+                    Text("通配描述文件允许通配段开头的任意 Bundle ID；精确描述文件只能还原为原值。与描述文件不匹配的包会被 iOS 安装层拒绝。")
+                }
+
+                if let error = draftError {
+                    Section {
+                        Label(error, systemImage: "exclamationmark.triangle.fill")
+                            .font(.subheadline)
+                            .foregroundColor(.red)
+                    }
+                }
+            }
+            .navigationTitle("修改 Bundle ID")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .navigationBarLeading) {
+                    Button("取消") {
+                        dismiss()
+                    }
+                }
+                ToolbarItem(placement: .navigationBarTrailing) {
+                    Button("保存") {
+                        save()
+                    }
+                    .disabled(trimmedDraft.isEmpty || draftError != nil)
+                }
+            }
+            .alert("保存失败", isPresented: Binding(
+                get: { saveError != nil },
+                set: { if !$0 { saveError = nil } }
+            )) {
+                Button("确定", role: .cancel) {}
+            } message: {
+                Text(saveError ?? "")
+            }
+        }
+    }
+
+    private func save() {
+        let newID = trimmedDraft
+        // 未发生变化：视为无操作，直接关闭（避免记一条无意义的修改日志）
+        guard newID != app.bundleID else {
+            dismiss()
+            return
+        }
+        if appState.updateImportedAppBundleID(id: app.id, path: app.path, newBundleID: newID) {
+            AppState.shared.showToast("Bundle ID 已更新，签名时生效")
+            dismiss()
+        } else {
+            saveError = "未找到对应的导入记录，无法保存修改（请从首页/待签名列表进入该应用后重试）"
         }
     }
 }

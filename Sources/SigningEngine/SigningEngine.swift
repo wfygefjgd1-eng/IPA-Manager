@@ -7,6 +7,10 @@ protocol SigningEngineProtocol {
         sourcePath: String,
         certificate: CertificateInfo,
         profile: ProvisioningInfo,
+        /// Bundle ID 覆盖（手动签名模式）：非空时签名重写包内 CFBundleIdentifier，
+        /// 必须通过描述文件兼容性校验（见 ProvisioningInfo.bundleIDOverrideError），
+        /// 校验不通过签名直接失败（fail-fast，在任何 IO 之前）。
+        bundleIDOverride: String,
         progress: @escaping (Double, String) -> Void
     ) throws -> String
 }
@@ -32,6 +36,7 @@ final class SigningEngine: SigningEngineProtocol {
         sourcePath: String,
         certificate: CertificateInfo,
         profile: ProvisioningInfo,
+        bundleIDOverride: String,
         progress: @escaping (Double, String) -> Void
     ) throws -> String {
         progress(0.0, "开始准备…")
@@ -62,6 +67,18 @@ final class SigningEngine: SigningEngineProtocol {
             let reason = "证书与描述文件的 Team ID 不匹配"
             Logger.error("签名失败: \(reason)（证书 \(certificate.teamID) / 描述文件 \(profile.teamID)）")
             throw AppError.signFailed(reason)
+        }
+
+        // Bundle ID 覆盖校验（手动签名模式，其余路径传空不覆盖）：重写后的签名 ID
+        // 必须被描述文件的 application-identifier 覆盖，否则设备安装层必然拒绝。
+        // 与签名大 IO 无关的失败一律在这里提前暴露，给出精确中文原因。
+        if !bundleIDOverride.isEmpty {
+            if let error = profile.bundleIDOverrideError(bundleIDOverride) {
+                let reason = "修改后的 Bundle ID \(error)（描述文件 AppID：\(profile.bundleID.isEmpty ? "未知" : profile.bundleID)），请返回修改 Bundle ID 或更换描述文件"
+                Logger.error("签名失败: Bundle ID 覆盖校验未通过 — \(reason)")
+                throw AppError.signFailed(reason)
+            }
+            Logger.info("签名时覆盖 Bundle ID: \(bundleIDOverride)（描述文件 AppID: \(profile.bundleID)）")
         }
 
         // 证书凭据检查（Keychain 标识 / 密码读取 / p12 与 PEM 导出）全部前移到
@@ -162,19 +179,26 @@ final class SigningEngine: SigningEngineProtocol {
                     profile.path.withCString { provCStr in
                         certPassword.withCString { pwdCStr in
                             tempDir.withCString { tempDirCStr in
-                                var options = ZSignOptions()
-                                options.inputIpaPath = inputCStr
-                                options.outputIpaPath = outputCStr
-                                options.pkeyPath = p12CStr
-                                options.provisionPath = provCStr
-                                options.password = pwdCStr
-                                options.tempFolder = tempDirCStr
-                                options.zipLevel = 1
-                                options.force = 1
-                                options.enableDocuments = 1
-                                options.context = context
-                                options.progressCallback = progressCallbackFunc
-                                return zsign_sign(&options)
+                                bundleIDOverride.withCString { bundleIdCStr in
+                                    var options = ZSignOptions()
+                                    options.inputIpaPath = inputCStr
+                                    options.outputIpaPath = outputCStr
+                                    options.pkeyPath = p12CStr
+                                    options.provisionPath = provCStr
+                                    options.password = pwdCStr
+                                    options.tempFolder = tempDirCStr
+                                    // Bundle ID 覆盖（手动签名模式）：zsign 会重写主程序与全部
+                                    // 扩展的 CFBundleIdentifier（ModifyBundleInfo/ModifyPluginsBundleId）
+                                    if !bundleIDOverride.isEmpty {
+                                        options.bundleId = bundleIdCStr
+                                    }
+                                    options.zipLevel = 1
+                                    options.force = 1
+                                    options.enableDocuments = 1
+                                    options.context = context
+                                    options.progressCallback = progressCallbackFunc
+                                    return zsign_sign(&options)
+                                }
                             }
                         }
                     }

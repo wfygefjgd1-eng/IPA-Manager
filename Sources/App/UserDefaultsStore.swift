@@ -14,6 +14,9 @@ final class UserDefaultsStore {
         static let autoSignAndInstall = "setting_auto_sign_and_install"
         /// 签名完成后自动返回桌面（默认开）
         static let autoReturnHomeAfterSigning = "setting_auto_return_home"
+        /// 手动签名模式（默认关）：开启后允许在应用详情手动修改 Bundle ID（签名时生效），
+        /// 且「导入→签名→安装」自动一条龙暂停（等同自动签名开关关闭，改为手动签名安装）
+        static let manualSigningMode = "setting_manual_signing_mode"
         /// 解码失败时备份原始数据的键（<key>_backup），避免迁移/排查时永久丢失
         static func backupKey(for key: String) -> String { "\(key)_backup" }
         /// 备份时间戳键（<key>_backup_date），用于 TTL 清理（>7 天自动删除）
@@ -230,6 +233,17 @@ final class UserDefaultsStore {
 
     func setAutoReturnHomeAfterSigningEnabled(_ enabled: Bool) {
         defaults.set(enabled, forKey: Keys.autoReturnHomeAfterSigning)
+    }
+
+    /// 手动签名模式是否开启（默认 false）。
+    /// 开启时：(1) 应用详情可手动修改 Bundle ID（签名时经 zsign 重写生效）；
+    /// (2) 自动签名安装一条龙整体暂停（对 automation 侧等同自动签名开关关闭）。
+    func manualSigningModeEnabled() -> Bool {
+        defaults.object(forKey: Keys.manualSigningMode) as? Bool ?? false
+    }
+
+    func setManualSigningModeEnabled(_ enabled: Bool) {
+        defaults.set(enabled, forKey: Keys.manualSigningMode)
     }
 
     /// 解码失败保护：失败时备份原始 Data（不覆盖），并清空该键让 UI 走空态。

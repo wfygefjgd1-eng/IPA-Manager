@@ -12,6 +12,9 @@ struct SettingsView: View {
     @AppStorage("setting_auto_sign_and_install") private var autoSignAndInstall = true
     /// 签名完成后自动返回桌面（默认开）
     @AppStorage("setting_auto_return_home") private var autoReturnHomeAfterSigning = true
+    /// 手动签名模式（默认关）：开启后允许在应用详情修改 Bundle ID（签名时生效），
+    /// 且自动签名安装一条龙暂停，导入后改为打开详情页手动签名
+    @AppStorage("setting_manual_signing_mode") private var manualSigningMode = false
 
     var body: some View {
         NavigationStack {
@@ -27,10 +30,20 @@ struct SettingsView: View {
 
                 Section {
                     toggleRow(
+                        icon: "square.and.pencil",
+                        tint: .orange,
+                        title: "手动签名模式",
+                        subtitle: "允许修改 Bundle ID（签名时生效）；导入后改为手动签名安装",
+                        isOn: $manualSigningMode
+                    )
+                    .rowCard()
+                    toggleRow(
                         icon: "arrow.triangle.2.circlepath",
-                        tint: .accentColor,
+                        tint: manualSigningMode ? Color.secondary : Color.accentColor,
                         title: "导入后自动签名",
-                        subtitle: "导入 IPA / 下载完成后立即自动签名并安装",
+                        subtitle: manualSigningMode
+                            ? "已被「手动签名模式」暂停：导入后仅导入，请手动签名"
+                            : "导入 IPA / 下载完成后立即自动签名并安装",
                         isOn: $autoSignAndInstall
                     )
                     .rowCard()
