@@ -78,7 +78,9 @@ struct DocumentPicker: UIViewControllerRepresentable {
 
         func documentPickerWasCancelled(_ controller: UIDocumentPickerViewController) {
             ExternalDeliveryJournal.record("文件选择器已取消")
-            onCancel?()
+            // Coordinator 是嵌套类：必须经 parent 访问外层 struct 的实例属性
+            //（裸写 onCancel?() 会编译失败 "cannot be used on instance of nested type"）
+            parent.onCancel?()
         }
     }
 }
