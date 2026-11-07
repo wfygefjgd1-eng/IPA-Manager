@@ -18,6 +18,9 @@ struct AppDetailView: View {
     @State private var showSignedAlert = false
     /// 签名完成后是否已自动安装（决定弹窗文案与“返回”行为）
     @State private var signedDidInstall = false
+    /// 本次签名产物的实际主 App Bundle ID：签名完成弹窗直接展示，让“改名是否
+    /// 真的写进包里”当场可见（不再靠猜或重新导入核对）
+    @State private var signedBundleID: String?
     /// 删除二次确认
     @State private var showDeleteConfirm = false
     /// 进度节流：仅当变化 ≥1% 或距离上次更新 ≥0.1s 才写入 @State
@@ -50,21 +53,39 @@ struct AppDetailView: View {
     @State private var showBundleIDEditor = false
 
     /// 展示层使用的“实时”AppInfo：
-    /// - 签名刚完成 → 以签名输出为准（合并原快照的元数据，isSigned = true，path 指向签名产物）；
-    /// - 否则优先 importedApps 中 id 相同的最新副本，其次 installedApps 中 path 相同的条目；
+    /// - 编辑后的 Bundle ID 直接落在 importedApps 记录里（updateImportedAppBundleID），
+    ///   这里必须优先取最新记录（id 优先，其次按源文件 path）。否则展示/签名拿到的是
+    ///   进入详情页时的旧快照——实测症状：改完名点签名，签出的包仍是改名前的名字；
+    /// - 签名刚完成 → 以签名输出为准（元数据仍取最新记录，path 指向签名产物）；
+    /// - 否则优先 importedApps 最新副本，其次 installedApps 中 path 相同的条目；
     /// - 兜底使用传入快照。
     private var liveApp: AppInfo {
+        let fresh = appState.importedApps.first(where: { $0.id == app.id })
+            ?? appState.importedApps.first(where: { $0.path == app.path })
+            ?? appState.importedApps.first(where: { $0.signedPath == app.path })
         if let signedPath = signedOutputPath,
            let installed = appState.installedApps.first(where: { $0.path == signedPath }) {
-            var merged = app
+            var merged = fresh ?? app
             merged.isSigned = true
             merged.path = installed.path
             merged.signedPath = installed.path
             merged.size = installed.size
             return merged
         }
-        if let imported = appState.importedApps.first(where: { $0.id == app.id }) {
-            return imported
+        // 从「已签应用」列表进入（app.path 即签名产物）：路径/图标/大小以产物
+        // 为准，Bundle ID 等元数据取最新导入记录（按 signedPath 关联）——否则
+        // 改完名后详情页仍显示旧值，签名也会继续用旧名字。
+        if let installed = appState.installedApps.first(where: { $0.path == app.path }),
+           installed.isSigned {
+            var merged = fresh ?? installed
+            merged.isSigned = true
+            merged.path = installed.path
+            merged.signedPath = installed.path
+            merged.size = installed.size
+            return merged
+        }
+        if let fresh = fresh {
+            return fresh
         }
         if let installed = appState.installedApps.first(where: { $0.path == app.path }) {
             return installed
@@ -148,7 +169,7 @@ struct AppDetailView: View {
                 performReturnHome()
             }
         } message: {
-            Text(signedDidInstall ? "签名完成，已发起安装" : "签名完成，未自动安装")
+            Text(signedAlertMessage)
         }
         .confirmationDialog(
             "删除后文件不可恢复，确定删除吗？",
@@ -394,8 +415,15 @@ struct AppDetailView: View {
         // 重写包内 CFBundleIdentifier（主程序与扩展一并）。无兼容性校验、无
         // 兜底改写——与自动模式同源直出；仅字符格式（空格/中文等任何证书都
         // 救不回的非法名）在引擎内 fail-fast 秒级报错，便于用户"改到成功为止"。
-        appState.signApp(app, certificate: certificate, profile: profile,
-                         bundleIDOverride: appState.manualSigningBundleIDOverride(app),
+        // **必须取最新导入记录**（id 优先，其次 path）：详情页是快照进入的，
+        // 直接传 `app` 会拿到编辑前的旧 bundleID——实测症状：改完名签名，包里
+        // 仍是改名前的名字（编辑只更新了 appState.importedApps）。
+        let signingApp = appState.importedApps.first(where: { $0.id == app.id })
+            ?? appState.importedApps.first(where: { $0.path == app.path })
+            ?? appState.importedApps.first(where: { $0.signedPath == app.path })
+            ?? app
+        appState.signApp(signingApp, certificate: certificate, profile: profile,
+                         bundleIDOverride: appState.manualSigningBundleIDOverride(signingApp),
                          progress: { progress, phase in
             // 进度节流：变化 ≥1% 或间隔 ≥0.1s 才更新 @State，避免详情页频繁重算
             let now = Date()
@@ -428,6 +456,11 @@ struct AppDetailView: View {
                 // 记录签名产物路径，供 liveApp 实时反映“已签名”状态（installedApps 会在回调前由 refreshInstalledApps 刷新）
                 signedOutputPath = signedPath
                 signedDidInstall = installAfter
+                // 直接读签名产物的主 App Bundle ID（轻量：zip 中央目录单条目，毫秒级），
+                // 在完成弹窗里展示——改名是否生效当场可见，避免“签完还要自己解包核对”。
+                signedBundleID = IPAParser()
+                    .lightweightAppInfo(from: URL(fileURLWithPath: signedPath))?
+                    .bundleID
                 // 归正显示：进度 100% + 阶段"签名完成"（smoother 已归正，但兜底再设一次）
                 signProgress = 1.0
                 signPhase = "签名完成"
@@ -542,6 +575,13 @@ struct AppDetailView: View {
         appState.selectedTab = 0
         // 挂起 App 回到 iOS 桌面（主屏幕）；App 保留在后台，点图标可恢复
         appState.minimizeToHomeScreen()
+    }
+
+    /// 签名完成弹窗文案：附加签名包实际主 App Bundle ID，让改名结果当场可见。
+    private var signedAlertMessage: String {
+        let base = signedDidInstall ? "签名完成，已发起安装" : "签名完成，未自动安装"
+        guard let signedBundleID, !signedBundleID.isEmpty else { return base }
+        return base + "\n\n签名包 Bundle ID：\(signedBundleID)"
     }
 
     /// 当失败原因是“源文件丢失”时，在错误信息后附加一行恢复指引，

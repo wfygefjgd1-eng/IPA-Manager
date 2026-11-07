@@ -817,8 +817,11 @@ final class AppState: ObservableObject {
     }
 
     private func updateImportedAppBundleIDOnMain(id: UUID, path: String, newBundleID: String) -> Bool {
+        // 匹配顺序：id → 源文件 path → 签名产物 path（signedPath）。从「已签应用」
+        // 列表进入编辑时 app.path 是签名产物，必须走第三级，否则保存会落空。
         let index = importedApps.firstIndex { $0.id == id }
             ?? importedApps.firstIndex { $0.path == path }
+            ?? importedApps.firstIndex { $0.signedPath == path }
         guard let index else {
             Logger.warning("Bundle ID 修改失败：未找到对应的导入记录 (\(id.uuidString))")
             return false
