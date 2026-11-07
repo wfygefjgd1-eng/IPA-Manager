@@ -16,7 +16,9 @@ concurrency:
 
 jobs:
   build:
-    runs-on: macos-14
+    # macos-14 镜像已于 2026-11-02 退役（"configuration not supported"，任何 run
+    # 都无法匹配 runner 直接取消）；现用 macos-15（arm64，预装 Xcode 16.0-16.4）。
+    runs-on: macos-15
     timeout-minutes: 60
     steps:
       - name: Checkout
@@ -24,9 +26,26 @@ jobs:
 
       - name: Select Xcode
         run: |
-          sudo xcode-select --switch /Applications/Xcode_15.2.app 2>/dev/null \
-            || sudo xcode-select --switch /Applications/Xcode_15.1.app 2>/dev/null \
-            || { echo "Required Xcode not found"; exit 1; }
+          # macos-15 镜像预装 Xcode 16.x 系列（默认 16.4，自带 iOS 18.5 SDK）。
+          # 按版本降序挑选一个实际存在的，避免镜像周更移除某个小版本后整条流水线失败；
+          # 镜像上另有 Xcode 26.x（iOS 26 SDK），工具链跨度太大，不主动选用。
+          selected=""
+          for v in 16.4 16.3 16.2 16.1 16.0; do
+            if [ -e "/Applications/Xcode_${v}.app" ] && sudo xcode-select --switch "/Applications/Xcode_${v}.app" 2>/dev/null; then
+              selected="$v"
+              break
+            fi
+          done
+          # 兜底：选系统默认 Xcode.app（macos-15 上即 16.4）
+          if [ -z "$selected" ]; then
+            if sudo xcode-select --switch /Applications/Xcode.app 2>/dev/null; then
+              selected="Xcode.app(default)"
+            else
+              echo "No usable Xcode found on runner image"
+              exit 1
+            fi
+          fi
+          echo "Selected $selected"
 
       - name: Verify Xcode
         run: xcodebuild -version

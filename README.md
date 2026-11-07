@@ -32,7 +32,7 @@
 
 ### 前置要求
 
-- macOS 14+，Xcode 15.2（构建脚本在 macos-14 镜像与本地均已验证）
+- macOS 14+，Xcode 15.2 或更高（构建脚本在本地已验证；CI 使用 macos-15 镜像 + Xcode 16.4）
 - [XcodeGen](https://github.com/yonaskolb/XcodeGen)（`brew install xcodegen`）
 - 网络可达 GitHub（下载 OpenSSL 3.3.2 源码）
 
