@@ -701,39 +701,17 @@ final class AppState: ObservableObject {
     }
 
 
-    // MARK: - Bundle ID 覆盖决议（手动签名模式）
+    // MARK: - Bundle ID 覆盖传递（手动签名模式）
 
-    /// 签名前解析实际传给签名引擎的 Bundle ID 覆盖：
-    /// - 手动模式关闭 → ""（自动一条龙不受影响）；
-    /// - 改的名字与所选描述文件【兼容】→ 原样传递（改名正规通道）；
-    /// - 【不兼容】→ 按该描述文件的"原生可装身份"改写后传递（native 重写）。
-    ///   v1.0.199 试点过的"不兼容时同款传空覆盖"是错误设计：空覆盖保留包内
-    ///   原包名，装包时与设备上已装的同包名应用身份相同，被 iOS 当更新直接
-    ///   【顶掉】——用户实测反馈。改写为原生身份后装出的是独立应用（不与
-    ///   原包名身份相同），改名愿望在"能落地的范围"内生效。
-    ///   （原生身份只可能是一个；后续同名身份重复安装仍会替换，精确绑定描述
-    ///   文件一条只有一个身份，属证书固有属性，提示里说明。）
-    /// - 原生身份也不可用（描述文件缺 AppID 等畸形）→ 最后退级传空覆盖
-    ///   （与自动模式同款），此时 usedNativeFallback=false、emptyOverrideFallback=true。
-    /// 引擎内 fail-fast 仅作未来调用方的防御层，本决议保证 UI 路径不触达。
-    func resolveSigningBundleIDOverride(app appInfo: AppInfo, profile: ProvisioningInfo) -> (override: String, usedNativeFallback: Bool, emptyOverrideFallback: Bool, intended: String, native: String) {
-        guard manualSigningModeEnabled() else {
-            return (override: "", usedNativeFallback: false, emptyOverrideFallback: false, intended: "", native: "")
-        }
-        let intended = appInfo.bundleID.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !intended.isEmpty else {
-            return (override: "", usedNativeFallback: false, emptyOverrideFallback: false, intended: "", native: "")
-        }
-        if profile.bundleIDOverrideError(intended) == nil {
-            return (override: intended, usedNativeFallback: false, emptyOverrideFallback: false, intended: intended, native: "")
-        }
-        if let native = profile.nativeInstallBundleID,
-           profile.bundleIDOverrideError(native) == nil {
-            Logger.info("签名覆盖兜底: 改的 Bundle ID「\(intended)」证书不认，按其支持的身份「\(native)」改写签名（独立安装，不覆盖原包名应用）")
-            return (override: native, usedNativeFallback: true, emptyOverrideFallback: false, intended: intended, native: native)
-        }
-        Logger.info("签名覆盖兜底: 描述文件「\(profile.name)」无法解析可装身份，按包内原包名签名（与自动模式一致）")
-        return (override: "", usedNativeFallback: false, emptyOverrideFallback: true, intended: intended, native: "")
+    /// 手动签名模式签名时传给引擎的 Bundle ID 覆盖（其余路径传空不覆盖）。
+    /// **不做任何兜底**（用户明确要求）：兼容则按用户改的名字覆盖签名成功；
+    /// 不兼容则签名直接失败，由引擎 fail-fast 给出精确原因与出路，用户调整
+    /// 名字（替换到覆盖该名字的描述文件）后重签，改到成功为止。曾经试过的
+    /// 两轮兜底（v1.0.199 同款空覆盖→顶掉已装应用；v1.0.201 原生身份改写→
+    /// 静默改变身份）均已按用户意见废弃。自动模式路径不受影响。
+    func manualSigningBundleIDOverride(_ appInfo: AppInfo) -> String {
+        guard manualSigningModeEnabled() else { return "" }
+        return appInfo.bundleID.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
     func signApp(

@@ -353,10 +353,12 @@ struct AppDetailView: View {
         }
     }
 
-    /// 手动签名模式的 Bundle ID 覆盖：仅开关开启且记录非空时传递（空串 =
-    /// 不覆盖，自动一条龙与常规签名路径不受影响）。这个名字是否生效由
-    /// AppState.resolveSigningBundleIDOverride 决议：兼容原样传；不兼容与自动
-    /// 模式同款传空（不重写包名），保证手动安装行为与自动一致。
+    /// 手动签名模式的 Bundle ID 覆盖（仅详情页一键路径的预检值用）：仅开关
+    /// 开启且记录非空时传递（空串 = 不覆盖，自动一条龙与常规签名路径不受
+    /// 影响）。实际签名时的覆盖与它同值（startSigning 传
+    /// AppState.manualSigningBundleIDOverride），是否生效由引擎兼容性校验
+    /// 决定——不兼容签名直接失败（手动模式无任何兜底改写，用户要求失败了
+    /// 就是失败，改到证书认的名字为止）。
     private var signingBundleIDOverride: String {
         manualSigningMode ? liveApp.bundleID.trimmingCharacters(in: .whitespacesAndNewlines) : ""
     }
@@ -365,10 +367,10 @@ struct AppDetailView: View {
     /// installAfterSigning（默认 true，未设置过时按 true 处理）直接签名并安装；
     /// 默认证书/描述文件缺失或无效时退回 SignOptionsView 让用户手动选择。
     /// 手动签名模式补充：默认描述文件与新改的 Bundle ID 不兼容时（精确绑定的
-    /// 默认描述文件 + 库里另存通配描述文件的常见组合），自动改选任一条兼容的
-    /// 有效描述文件并提示；库里没有兼容替代时也不拦——由 startSigning 内的
-    /// resolveSigningBundleIDOverride 与自动模式同款兜底（不重写包名出包），
-    /// 保证手动路径的签名/安装终态与自动路径一致。
+    /// 默认描述文件 + 库里另存通配/兼容描述文件的常见组合），自动改选任一条
+    /// 兼容的有效描述文件并提示——此时用户的名字真实生效。库里没有兼容替
+    /// 代时**不做任何兜底**（用户明确要求）：保持用户的名字直传引擎，校验
+    /// 不过签名直接失败，失败提示给出精确原因与出路，改到成功为止。
     private func startSigningWithDefaults() {
         guard let cert = appState.selectedCertificate, cert.status == .valid,
               appState.certificates.contains(where: { $0.id == cert.id }) else {
@@ -409,19 +411,12 @@ struct AppDetailView: View {
         // 时间必须随真实时钟走，不能只依赖进度回调）
         signStartTime = Date()
         startSignTimer()
-        // Bundle ID 覆盖决议（手动签名模式）：兼容即按用户改的名字（改名正规
-        // 通道）；不兼容 → 按证书支持的身份「native」改写签名——签出的包 entitlement
-        // 与包名严格一致必可装，且身份与原名不同 → 独立应用，不会顶掉设备上
-        // 已装的原始 App（v1.0.199 曾按"与自动同款不重写"兜底，实测导致覆盖已装
-        // 应用，已废弃）。名称被改写时 toast 明示实际身份，避免疑惑。
-        let resolution = appState.resolveSigningBundleIDOverride(app: app, profile: profile)
-        if resolution.usedNativeFallback {
-            AppState.shared.showToast("改的包名「\(resolution.intended)」证书不认，已按它支持的「\(resolution.native)」改写签名——与原 App 是互不覆盖的独立身份")
-        } else if resolution.emptyOverrideFallback {
-            AppState.shared.showToast("描述文件无法解析可装身份，本次按包内原包名签名（与自动模式一致）")
-        }
+        // Bundle ID 覆盖（手动签名模式）：兼容则按用户改的名字覆盖签名成功；
+        // 不兼容则签名直接失败（无兜底，用户要求失败就是失败、改到成功为止），
+        // 引擎 fail-fast 在解压/签名大 IO 之前给出精确原因（含所用描述文件与
+        // 其 AppID，及"换通配描述文件/向供应商申请"的出路）。
         appState.signApp(app, certificate: certificate, profile: profile,
-                         bundleIDOverride: resolution.override,
+                         bundleIDOverride: appState.manualSigningBundleIDOverride(app),
                          progress: { progress, phase in
             // 进度节流：变化 ≥1% 或间隔 ≥0.1s 才更新 @State，避免详情页频繁重算
             let now = Date()
@@ -703,18 +698,19 @@ struct BundleIDEditorView: View {
             selected.status == .valid && compatibleProfiles.contains(where: { $0.id == selected.id })
         } ?? false
         if compatibleProfiles.isEmpty {
-            // 默认描述文件的原生身份（证书唯一可装名）用于 footer 具体指点
-            let nativeHint: String
+            // 默认描述文件的正主身份（唯一能被它接受的签名名）作具体指引：
+            // 改到这个名字即可签成，无需猜测
+            let supportedHint: String
             if let selected = appState.selectedProfile, selected.status == .valid,
-               let native = selected.nativeInstallBundleID {
-                nativeHint = "签名时会按这套证书支持的「\(native)」改写身份出包——装出来的是与原包名互不覆盖的独立应用。"
+               !selected.bundleID.isEmpty {
+                supportedHint = "这套证书只认「\(selected.nativeInstallBundleID ?? selected.bundleID)」这一个签名身份。"
             } else {
-                nativeHint = "签名时将按包内原包名出包（当前描述文件解析不出可装身份）。"
+                supportedHint = ""
             }
             if trimmedDraft == app.bundleID {
-                return "这个名字不被当前任何描述文件接受（描述文件只认自己的 AppID，与这个应用的原始名无关）。\(nativeHint)想让改名生效，需要通配描述文件（application-identifier 以 * 结尾）或让证书供应商按此名字出一条精确描述文件。"
+                return "这个名字不被当前任何描述文件接受（描述文件只认自己的 AppID，与这个应用的原始名无关）——不改名字直接签名也会失败。\(supportedHint)想签成：把名字改到证书支持的那个，或向供应商申请通配描述文件（application-identifier 以 * 结尾）。"
             }
-            return "当前所有描述文件都无法接受这个 Bundle ID（多见于「每应用精确绑定」描述文件）。\(nativeHint)想让改的名字生效需要：① 通配描述文件（可向证书供应商申请）；或 ② 让供应商直接按这个名字出一条精确描述文件。"
+            return "当前所有描述文件都无法接受这个 Bundle ID（多见于「每应用精确绑定」描述文件），签名会直接失败——手动模式不做改写兜底（失败了就是失败了），一直调整到证书认的名字为止即可签成。\(supportedHint)"
         }
         if defaultCompatible {
             return "默认描述文件兼容，可直接一键签名。"
@@ -821,10 +817,10 @@ struct BundleIDEditorView: View {
             return
         }
         if appState.updateImportedAppBundleID(id: app.id, path: app.path, newBundleID: newID) {
-            // 零兼容时说明签名行为（按证书支持身份改写、独立安装不覆盖原应用）
+            // 零兼容时说明失败语义（无兜底、签前调整名字），避免"存了就以为能签成"
             let zeroCompatible = !validProfiles.isEmpty && compatibleProfiles.isEmpty
             AppState.shared.showToast(zeroCompatible
-                ? "Bundle ID 已保存；这个名字当前证书不认，下次签名会按证书支持的包名改写身份出包（独立安装，不覆盖原应用）"
+                ? "Bundle ID 已保存；这个名字当前证书不认，签名会直接失败（无兜底），签名前请改到证书认的名字"
                 : "Bundle ID 已更新，签名时生效")
             dismiss()
         } else {
