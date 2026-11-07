@@ -46,7 +46,9 @@ struct CertificatesView: View {
                     onPick: { url in
                         handleImportedFile(url)
                     },
-                    contentTypes: pickerContentTypes(for: importTarget)
+                    contentTypes: pickerContentTypes(for: importTarget),
+                    // 取消接管：系统取消路径不会收起本 sheet，显式复位（与首页同源修复）
+                    onCancel: { showImporter = false }
                 )
             }
             .sheet(isPresented: $showPasswordSheet, onDismiss: {

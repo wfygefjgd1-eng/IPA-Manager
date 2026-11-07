@@ -40,11 +40,24 @@ struct HomeView: View {
                     // 多选导入：串行逐个导入，进度 "正在导入 i/N" 随文件推进；每个文件独立出结果提示
                     onPickMany: { urls in
                         showFileImporter = false
+                        // 系统偶发空数组回调（历史已知问题："didPickDocumentURLs
+                        // called with nil or 0 URLS"）：不给提示就等于又一次"点了
+                        // 打开没反应"。明确告知并指路兜底导入通道。
+                        guard !urls.isEmpty else {
+                            alertMessage = "文件选择器没有返回可导入的文件，请重试。\n反复出现可改用：文件 App → 把 IPA 文件放入「IPA Manager」文件夹 → 回到本 App 自动导入。"
+                            showAlert = true
+                            ExternalDeliveryJournal.record("首页选择器回调为空数组", level: .error)
+                            return
+                        }
+                        ExternalDeliveryJournal.record("首页选择器回收 \(urls.count) 个文件")
                         // 证书/描述文件不是应用包：先分流独立处理（p12 弹密码框、
                         // mobileprovision 直接导入），不进应用串行批次——计数、批量
                         // 确认、汇总都只针对应用文件，否则含证书文件的批次汇总对不上账
                         let certURLs = urls.filter { Self.isCertificateMaterial($0) }
                         let appURLs = urls.filter { !Self.isCertificateMaterial($0) }
+                        ExternalDeliveryJournal.record(
+                            "首页导入分流：应用 \(appURLs.count) 个 / 证书 \(certURLs.count) 个"
+                        )
                         importSuccessCount = 0
                         importFailureCount = 0
                         pendingImportCount = appURLs.count
@@ -58,7 +71,10 @@ struct HomeView: View {
                             importRemaining(appURLs, startIndex: 0)
                         }
                     },
-                    allowsMultiple: true
+                    allowsMultiple: true,
+                    // 取消接管：选择器嵌在 sheet 里，系统取消路径不会自己收起 sheet，
+                    // 必须显式复位状态，否则该窗口会一直留在页面上
+                    onCancel: { showFileImporter = false }
                 )
             }
             .alert("批量导入 \(pendingImportCount) 个应用", isPresented: $showBatchModeConfirm) {
@@ -180,6 +196,9 @@ struct HomeView: View {
     // 两路导入会互踩进度卡（来回跳）与批量汇总计数。
     private var importBar: some View {
         Button {
+            // 打开选择器前清扫系统代拷 tmp 残留：残留既占空间，也会在磁盘紧张时
+            // 让下一次系统代拷无声失败（delegate 不回调，表现为"点打开没反应"）
+            AppFileManager.shared.sweepPickerInboxResidue()
             showFileImporter = true
         } label: {
             HStack(spacing: 12) {

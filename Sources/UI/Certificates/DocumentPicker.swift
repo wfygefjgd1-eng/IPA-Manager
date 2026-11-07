@@ -10,6 +10,10 @@ struct DocumentPicker: UIViewControllerRepresentable {
     /// 可选：限定可选的文档类型（如仅 p12/pfx/zip 或仅 mobileprovision/zip）；
     /// nil 时允许所有类型（.item）
     var contentTypes: [UTType]? = nil
+    /// 可选：用户在系统选择器里点「取消」的回调。旧实现保持 no-op，但嵌在 SwiftUI
+    /// sheet 里的选择器取消后系统并不接管 sheet 的收起——页面表现为选择器窗口
+    /// 关不掉（消失的回调链请去投递追踪日志核对），调用方需要显式复位 sheet 状态。
+    var onCancel: (() -> Void)? = nil
 
     func makeCoordinator() -> Coordinator {
         Coordinator(self)
@@ -46,6 +50,11 @@ struct DocumentPicker: UIViewControllerRepresentable {
         }
 
         func documentPicker(_ controller: UIDocumentPickerViewController, didPickDocumentsAt urls: [URL]) {
+            // 落投递追踪：回调是否到达、带几个文件——"点击打开后毫无反应"类反馈
+            // 的第一诊断口径（回调缺失 ⇒ 断在系统拷贝/回调环节，而非 App 导入环节）
+            let shown = urls.prefix(3).map { $0.lastPathComponent }.joined(separator: "、")
+            let more = urls.count > 3 ? " 等 \(urls.count) 个" : ""
+            ExternalDeliveryJournal.record("文件选择器回调：\(urls.count) 个文件（\(shown)\(more)）")
             if let onPickMany = parent.onPickMany {
                 onPickMany(urls)
             } else if let url = urls.first {
@@ -53,6 +62,9 @@ struct DocumentPicker: UIViewControllerRepresentable {
             }
         }
 
-        func documentPickerWasCancelled(_ controller: UIDocumentPickerViewController) {}
+        func documentPickerWasCancelled(_ controller: UIDocumentPickerViewController) {
+            ExternalDeliveryJournal.record("文件选择器已取消")
+            onCancel?()
+        }
     }
 }

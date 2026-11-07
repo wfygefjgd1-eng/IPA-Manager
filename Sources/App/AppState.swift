@@ -504,6 +504,10 @@ final class AppState: ObservableObject {
                         }
                     }
                     // 阶段：复制到 IPA 目录（权重 60~80%）
+                    // 文件选择器 Copy 模式的产物是系统代拷进本 App tmp 的副本（详见
+                    // isPickerInboxTmpCopy）：摄取走同卷 rename 级 moveItem——GB 级
+                    // IPA 旧实现要再整份 copyItem 一遍（"复制文件…"因此是导入时长
+                    // 最长的一段），move 后这段几乎消失；其余来源仍走完整复制。
                     self.updateImportProgress(fileName: fileName, index: index, total: total, phase: "复制文件…", progress: ProgressWeight.copyProgress)
                     if isSameApp {
                         // 同 bundleID 重复导入（数据安全）：绝不“先删旧文件再拷”——
@@ -512,7 +516,11 @@ final class AppState: ObservableObject {
                         let tempURL = self.fileManager.directoryURL(.ipa)
                             .appendingPathComponent(".tmp-\(UUID().uuidString)-\(destination.lastPathComponent)")
                         do {
-                            try FileManager.default.copyItem(at: importURL, to: tempURL)
+                            if Self.isPickerInboxTmpCopy(importURL) {
+                                try Self.ingestPickerTmpCopy(from: importURL, to: tempURL)
+                            } else {
+                                try FileManager.default.copyItem(at: importURL, to: tempURL)
+                            }
                         } catch {
                             // 复制失败：旧文件原封未动，删掉临时残留后抛错
                             try? FileManager.default.removeItem(at: tempURL)
@@ -528,7 +536,11 @@ final class AppState: ObservableObject {
                             throw error
                         }
                     } else {
-                        try self.fileManager.copyItem(from: importURL, to: destination)
+                        if Self.isPickerInboxTmpCopy(importURL) {
+                            try Self.ingestPickerTmpCopy(from: importURL, to: destination)
+                        } else {
+                            try self.fileManager.copyItem(from: importURL, to: destination)
+                        }
                     }
                 }
                 // 走到这里 destination 必为本次导入写入/产生的文件（复制分支成功后，
@@ -644,6 +656,12 @@ final class AppState: ObservableObject {
                     }
                     // 导入失败：同样清除进度，错误提示走既有逻辑
                     self.clearImportProgress()
+                    // 失败落投递追踪：与选择器回调遥相呼应——"点开没导入"排障时
+                    // 有一条链可以核对（回调到达 ⇒ 导入失败/未回调 = 断点在此之前）
+                    ExternalDeliveryJournal.record(
+                        "导入失败: \(fileName)：\(error.localizedDescription)",
+                        level: .error
+                    )
                     completion(.failure(error))
                 }
             }
@@ -657,6 +675,31 @@ final class AppState: ObservableObject {
     private func persistImportedAppIcon(from iconPath: String, baseName: String) -> String? {
         IconPersistenceService.persist(iconPath: iconPath, baseName: baseName)
     }
+
+    // MARK: - 文件选择器代拷副本摄取
+
+    /// 文件选择器 Copy 模式的"系统代拷"判定：回调 URL 位于本 App tmp 的
+    /// "<bundleID>-Inbox" 目录（系统把选中文件先拷进这里再回调导入，无安全作用域）。
+    /// 这类副本用后即弃、可整体迁移——摄取到库目录时优先走同卷 moveItem。
+    static func isPickerInboxTmpCopy(_ url: URL) -> Bool {
+        let directory = url.deletingLastPathComponent()
+        guard directory.lastPathComponent.hasSuffix("-Inbox") else { return false }
+        return directory.path.contains(FileManager.default.temporaryDirectory.path)
+    }
+
+    /// 把"系统代拷的 tmp 副本"摄取到目标位置：优先同卷 rename（moveItem，
+    /// GB 级 IPA 旧实现再整份 copyItem 占掉"复制文件…"大半时长）；move 失败
+    /// （出现异卷等场景）回退 copyItem，成功后清掉 tmp 原件腾出空间。
+    /// 目标位置必须尚不存在——冲突已由调用方解析（唯一名/覆盖换位流程）。
+    static func ingestPickerTmpCopy(from source: URL, to destination: URL) throws {
+        do {
+            try FileManager.default.moveItem(at: source, to: destination)
+        } catch {
+            try FileManager.default.copyItem(at: source, to: destination)
+            try? FileManager.default.removeItem(at: source)
+        }
+    }
+
 
     func signApp(
         _ app: AppInfo,
