@@ -703,29 +703,37 @@ final class AppState: ObservableObject {
 
     // MARK: - Bundle ID 覆盖决议（手动签名模式）
 
-    /// 签名前解析实际传给签名引擎的 Bundle ID 覆盖，核心原则：**手动路径的
-    /// 签名/安装行为与自动路径对齐**（用户反馈"自动模式能安装、手动模式连签
-    /// 都签不成"——差异就是手动传了覆盖包名触发引擎 fail-fast，自动传空覆盖
-    /// 由 zsign 零改写直接出包）。手动签名模式关闭 → ""（与自动一致）；开启 →
-    /// 记录的 Bundle ID 与所选描述文件【兼容】时原样传递（改名的正规通道）；
-    /// 不兼容时**不拦截、不重写**→ 兜底传空覆盖，产出包与自动模式完全同款
-    ///（保留包内原包名），保证自动模式装得上的手动模式也一定装得上。
-    /// usedFallback=true 时 incompatibleOverride 为被放行的名字（调用方据此
-    /// toast 说明"这个名字这次没生效"）；引擎内 fail-fast 仅作为未来调用方的
-    /// 防御层，本决议保证 UI 路径不再触达。
-    func resolveSigningBundleIDOverride(app appInfo: AppInfo, profile: ProvisioningInfo) -> (override: String, usedFallback: Bool, incompatibleOverride: String) {
+    /// 签名前解析实际传给签名引擎的 Bundle ID 覆盖：
+    /// - 手动模式关闭 → ""（自动一条龙不受影响）；
+    /// - 改的名字与所选描述文件【兼容】→ 原样传递（改名正规通道）；
+    /// - 【不兼容】→ 按该描述文件的"原生可装身份"改写后传递（native 重写）。
+    ///   v1.0.199 试点过的"不兼容时同款传空覆盖"是错误设计：空覆盖保留包内
+    ///   原包名，装包时与设备上已装的同包名应用身份相同，被 iOS 当更新直接
+    ///   【顶掉】——用户实测反馈。改写为原生身份后装出的是独立应用（不与
+    ///   原包名身份相同），改名愿望在"能落地的范围"内生效。
+    ///   （原生身份只可能是一个；后续同名身份重复安装仍会替换，精确绑定描述
+    ///   文件一条只有一个身份，属证书固有属性，提示里说明。）
+    /// - 原生身份也不可用（描述文件缺 AppID 等畸形）→ 最后退级传空覆盖
+    ///   （与自动模式同款），此时 usedNativeFallback=false、emptyOverrideFallback=true。
+    /// 引擎内 fail-fast 仅作未来调用方的防御层，本决议保证 UI 路径不触达。
+    func resolveSigningBundleIDOverride(app appInfo: AppInfo, profile: ProvisioningInfo) -> (override: String, usedNativeFallback: Bool, emptyOverrideFallback: Bool, intended: String, native: String) {
         guard manualSigningModeEnabled() else {
-            return (override: "", usedFallback: false, incompatibleOverride: "")
+            return (override: "", usedNativeFallback: false, emptyOverrideFallback: false, intended: "", native: "")
         }
         let intended = appInfo.bundleID.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !intended.isEmpty else {
-            return (override: "", usedFallback: false, incompatibleOverride: "")
+            return (override: "", usedNativeFallback: false, emptyOverrideFallback: false, intended: "", native: "")
         }
         if profile.bundleIDOverrideError(intended) == nil {
-            return (override: intended, usedFallback: false, incompatibleOverride: "")
+            return (override: intended, usedNativeFallback: false, emptyOverrideFallback: false, intended: intended, native: "")
         }
-        Logger.info("签名覆盖兜底: 改后的 Bundle ID「\(intended)」与描述文件「\(profile.name)」不兼容，本次按自动模式同款不重写包名（保留包内原包名出包，不拦安装）")
-        return (override: "", usedFallback: true, incompatibleOverride: intended)
+        if let native = profile.nativeInstallBundleID,
+           profile.bundleIDOverrideError(native) == nil {
+            Logger.info("签名覆盖兜底: 改的 Bundle ID「\(intended)」证书不认，按其支持的身份「\(native)」改写签名（独立安装，不覆盖原包名应用）")
+            return (override: native, usedNativeFallback: true, emptyOverrideFallback: false, intended: intended, native: native)
+        }
+        Logger.info("签名覆盖兜底: 描述文件「\(profile.name)」无法解析可装身份，按包内原包名签名（与自动模式一致）")
+        return (override: "", usedNativeFallback: false, emptyOverrideFallback: true, intended: intended, native: "")
     }
 
     func signApp(

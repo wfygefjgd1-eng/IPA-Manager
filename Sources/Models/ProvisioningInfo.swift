@@ -98,4 +98,16 @@ struct ProvisioningInfo: Identifiable, Codable, Hashable {
         let expected = bundleID.hasPrefix(teamPrefix) ? String(bundleID.dropFirst(teamPrefix.count)) : bundleID
         return "该描述文件是精确绑定（非通配符），只支持不改名为「\(expected)」。想改名需要通配描述文件（application-identifier 以 * 结尾，如 TEAMID.xxx.*）：可在「签名选项」中改选通配描述文件，或向证书供应商申请"
     }
+
+    /// 该描述文件"原生可装"的包名：application-identifier 去掉 TeamID 前缀。
+    /// 精确绑定描述文件（如供应商签发的 app.xxxx.yyyy）只有这一个身份能被
+    /// iOS 接受——用它改写签出的包 entitlement 与包名严格一致，必然可装；
+    /// 且这个身份与包内原包名不同 → 是独立应用，不会顶掉设备上已装的原始包。
+    /// bundleID 缺失（畸形描述文件）返回 nil；teamID 缺失时退化为完整 AppID
+    ///（zsign 的 endsWith 匹配语义下同样可用）。
+    var nativeInstallBundleID: String? {
+        guard !bundleID.isEmpty else { return nil }
+        let prefix = teamID.isEmpty ? "" : teamID + "."
+        return bundleID.hasPrefix(prefix) ? String(bundleID.dropFirst(prefix.count)) : bundleID
+    }
 }
