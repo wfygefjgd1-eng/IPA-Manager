@@ -624,12 +624,12 @@ struct InstallCertificatePicker: View {
 
 /// 手动签名模式的 Bundle ID 编辑弹窗（默认关，入口仅在该模式开启时出现）。
 /// 兼容性判定规则与签名时一致（ProvisioningInfo.bundleIDOverrideError，镜像
-/// zsign/系统通配覆盖语义）。与签名引擎的差异：编辑器对【全部】有效描述文件
-/// 做兼容性对比——"任一兼容"即允许保存（一键签名会自动改选那条兼容的；
-/// 默认描述文件不兼容时旧版会在这里把保存卡死，形成"别人能改我却不能改"
-/// 的误会）。精确绑定描述文件（非通配符）确实无法匹配任何改名的 ID，此时
-/// footer 给出"需要通配描述文件/找供应商"的明确出路而非冷冰冰的"不匹配"。
-/// 修改只落本机记录，包内重写在下次签名时发生（详情页顶部有说明）。
+/// zsign/系统通配覆盖语义）。编辑器对【全部】有效描述文件做兼容性对比并展示
+/// ✓/✗ + footer 论断，但【不拦截保存】：保存门槛只有"非空"（空 = 什么都没改，
+/// 等效取消）——实测 v1.0.195 的"零兼容描述文件时禁保存"把「先改名、稍后再
+/// 导入兼容描述文件 / 换证书」的正常路径也卡死；字符格式同样不拦，用户要的
+/// 是"改完直接能存"，非法字符的代价出现在签名环节（引擎 fail-fast 给出精确
+/// 原因），不在编辑环节设卡。修改只落本机记录，包内重写在下次签名时发生。
 struct BundleIDEditorView: View {
     @Environment(\.dismiss) private var dismiss
     @EnvironmentObject private var appState: AppState
@@ -642,8 +642,9 @@ struct BundleIDEditorView: View {
         draft.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
-    /// 字符格式等硬性错误（非法字符/为空），与描述文件无关，绝不放行
-    private var formatError: String? {
+    /// 字符白名单提示（纯信息展示，不拦截保存：非法字符由签名环节的引擎
+    /// fail-fast 校验给出精确原因；放这里仅让用户提前看到"这样改签不成"）
+    private var formatWarning: String? {
         ProvisioningInfo.bundleIDFormatError(trimmedDraft)
     }
 
@@ -657,11 +658,11 @@ struct BundleIDEditorView: View {
         validProfiles.filter { $0.bundleIDOverrideError(trimmedDraft) == nil }
     }
 
-    /// 允许保存的条件：格式合法，且——库里没有任何有效描述文件时放行（签名时
-    /// 引擎会兜底校验并指路），否则至少一条兼容才放行（一条没有改了也无法签成）。
+    /// 允许保存的条件：输入非空即可直接保存（空 = 等效取消）。字符白名单与
+    /// 描述文件兼容性一律不拦——用户要的是"改完直接能存"；兼容性按信息展示，
+    /// 格式问题在签名环节由引擎 fail-fast 精确报出，编辑环节不设卡。
     private var canSave: Bool {
-        formatError == nil
-            && (validProfiles.isEmpty || !compatibleProfiles.isEmpty)
+        !trimmedDraft.isEmpty
     }
 
     /// 兼容性展示行（Identifiable 包装：key path 不支持元组成员，ForEach 需走结构体 id）
@@ -686,7 +687,10 @@ struct BundleIDEditorView: View {
             selected.status == .valid && compatibleProfiles.contains(where: { $0.id == selected.id })
         } ?? false
         if compatibleProfiles.isEmpty {
-            return "当前所有描述文件都无法接受这个 Bundle ID（多见于「每应用精确绑定」描述文件）。想改名需要通配描述文件（application-identifier 以 * 结尾）：可在「签名选项」中改选描述文件，或向证书供应商申请。"
+            if trimmedDraft == app.bundleID {
+                return "原值本身就不被当前任何描述文件覆盖（描述文件只认自己的 AppID，与这个应用的原始名无关）——用现有描述文件，这个应用不改名也签不成。想签成需要一条能覆盖「\(trimmedDraft)」的描述文件：通配（application-identifier 以 * 结尾）或让证书供应商按此名字出一条精确描述文件。"
+            }
+            return "当前所有描述文件都无法接受这个 Bundle ID（多见于「每应用精确绑定」描述文件）。仍可保存，但用现有描述文件签名会失败。想签成需要：① 通配描述文件（application-identifier 以 * 结尾，可向证书供应商申请）；或 ② 让供应商直接按你想改的名字出一条精确描述文件。保存后可先搁置，等描述文件到位再签名。"
         }
         if defaultCompatible {
             return "默认描述文件兼容，可直接一键签名。"
@@ -710,11 +714,14 @@ struct BundleIDEditorView: View {
                     Text("仅修改本机记录；包内 Bundle ID 在下次点击「开始签名」时被重写（主程序与扩展一并修改）。原值：\(app.bundleID.isEmpty ? "未知" : app.bundleID)")
                 }
 
-                if let formatError {
+                if let formatWarning {
                     Section {
-                        Label(formatError, systemImage: "exclamationmark.triangle.fill")
+                        Label(formatWarning, systemImage: "exclamationmark.triangle.fill")
                             .font(.subheadline)
                             .foregroundColor(.red)
+                        Text("此提示不拦保存；非法字符的名字在签名时会被拦下并说明原因")
+                            .font(.caption2)
+                            .foregroundColor(.secondary)
                     }
                 }
 

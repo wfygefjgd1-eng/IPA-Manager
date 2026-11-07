@@ -72,9 +72,17 @@ final class SigningEngine: SigningEngineProtocol {
         // Bundle ID 覆盖校验（手动签名模式，其余路径传空不覆盖）：重写后的签名 ID
         // 必须被【本次实际选用】描述文件的 application-identifier 覆盖，否则设备
         // 安装层必然拒绝。与签名大 IO 无关的失败一律在这里提前暴露，给出精确中文原因
-        //（编辑界面已按"任一描述文件兼容"放行，但一键默认描述文件可能与改后 ID
-        // 不兼容——此时错误要直接给出"换描述文件/改回原名"两条出路）。
+        //（编辑界面已放开保存门槛——只留非空，格式/兼容性不做编辑期拦截，全部在
+        // 这里兜底：字符问题按格式错误单独报，兼容性问题给出"换描述文件/改回
+        // 原名/申请通配或按名出精确描述文件"的出路）。
         if !bundleIDOverride.isEmpty {
+            // 字符格式先行：空格/中文等是 Bundle ID 自身的问题，与描述文件无关，
+            // 单独成类报出，避免被下面的兼容性检查包装成"与描述文件不匹配"误导
+            if let formatError = ProvisioningInfo.bundleIDFormatError(bundleIDOverride) {
+                let reason = "Bundle ID「\(bundleIDOverride)」\(formatError)。请返回编辑修正（合法字符：字母、数字、点、横线、下划线），或改回原值"
+                Logger.error("签名失败: Bundle ID 格式校验未通过 — \(reason)")
+                throw AppError.signFailed(reason)
+            }
             if let error = profile.bundleIDOverrideError(bundleIDOverride) {
                 let reason = "Bundle ID「\(bundleIDOverride)」与描述文件「\(profile.name)」不兼容：\(error)（AppID：\(profile.bundleID.isEmpty ? "未知" : profile.bundleID)）"
                 Logger.error("签名失败: Bundle ID 覆盖校验未通过 — \(reason)")
