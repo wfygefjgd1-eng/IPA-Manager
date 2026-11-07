@@ -52,13 +52,27 @@ struct DocumentPicker: UIViewControllerRepresentable {
         func documentPicker(_ controller: UIDocumentPickerViewController, didPickDocumentsAt urls: [URL]) {
             // 落投递追踪：回调是否到达、带几个文件——"点击打开后毫无反应"类反馈
             // 的第一诊断口径（回调缺失 ⇒ 断在系统拷贝/回调环节，而非 App 导入环节）
-            let shown = urls.prefix(3).map { $0.lastPathComponent }.joined(separator: "、")
-            let more = urls.count > 3 ? " 等 \(urls.count) 个" : ""
-            ExternalDeliveryJournal.record("文件选择器回调：\(urls.count) 个文件（\(shown)\(more)）")
+            if urls.isEmpty {
+                // 已知 iOS 系统问题：Copy 模式代拷 materialize 失败时回调带空数组
+                // （系统日志 "items failed to be prepared and materialized on disk"），
+                // 文件名含中文/空格/特殊字符时高发；代拷残留由调用方恢复导入
+                ExternalDeliveryJournal.record(
+                    "文件选择器回调空数组（系统代拷 materialize 失败类，常由文件名中文/空格/特殊字符触发）",
+                    level: .error
+                )
+            } else {
+                let shown = urls.prefix(3).map { $0.lastPathComponent }.joined(separator: "、")
+                let more = urls.count > 3 ? " 等 \(urls.count) 个" : ""
+                ExternalDeliveryJournal.record("文件选择器回调：\(urls.count) 个文件（\(shown)\(more)）")
+            }
             if let onPickMany = parent.onPickMany {
                 onPickMany(urls)
             } else if let url = urls.first {
                 parent.onPick(url)
+            } else if urls.isEmpty {
+                // 单文件选择器（证书页等）收到空回调且无 onPickMany 恢复入口：
+                // 给出可直接行动的指引，避免又一个"点了没反应"
+                AppState.shared.showToast("未取到所选文件（系统拷贝失败）：把文件改英文名后重试，或用文件 App 导入")
             }
         }
 

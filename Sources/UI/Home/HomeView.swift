@@ -40,13 +40,42 @@ struct HomeView: View {
                     // 多选导入：串行逐个导入，进度 "正在导入 i/N" 随文件推进；每个文件独立出结果提示
                     onPickMany: { urls in
                         showFileImporter = false
-                        // 系统偶发空数组回调（历史已知问题："didPickDocumentURLs
-                        // called with nil or 0 URLS"）：不给提示就等于又一次"点了
-                        // 打开没反应"。明确告知并指路兜底导入通道。
+                        // 系统偶发空数组回调（已知 iOS 问题："didPickDocumentURLs
+                        // called with nil or 0 URLS"，系统日志点名 "failed to be
+                        // prepared and materialized on disk"——文件名含中文/空格/
+                        // 特殊字符时高发）：不给提示就等于又一次"点了打开没反应"。
                         guard !urls.isEmpty else {
-                            alertMessage = "文件选择器没有返回可导入的文件，请重试。\n反复出现可改用：文件 App → 把 IPA 文件放入「IPA Manager」文件夹 → 回到本 App 自动导入。"
+                            ExternalDeliveryJournal.record("首页选择器回调为空数组（系统代拷 materialize 失败类）", level: .error)
+                            // 代拷若已落盘，直接按 tmp 残留恢复导入（与正常选中同一摄取管线）
+                            let recovered = AppFileManager.shared.recoverRecentPickerInboxPayloads(maxAge: 180)
+                            if !recovered.isEmpty {
+                                ExternalDeliveryJournal.record("恢复导入：发现 \(recovered.count) 个代拷残留")
+                                pendingImportCount = recovered.count
+                                importSuccessCount = 0
+                                importFailureCount = 0
+                                appState.showToast("检测到系统已拷贝 \(recovered.count) 个文件（回调丢失），正在恢复导入…")
+                                importRemaining(recovered, startIndex: 0)
+                                return
+                            }
+                            alertMessage = "文件选择器没有返回可导入的文件。这是 iOS 系统拷贝所选文件时的已知失败，文件名包含中文、空格或特殊字符时更容易发生。\n\n可以尝试：\n· 在来源位置把文件改名为纯英文，再重新选择导入\n· 或到「文件 App」把 IPA 拷入「IPA Manager」文件夹，回到本 App 会自动导入\n\n（若系统稍后才完成拷贝，本 App 会检测到并自动续导，无需重复操作。）"
                             showAlert = true
-                            ExternalDeliveryJournal.record("首页选择器回调为空数组", level: .error)
+                            // 系统偶发"回调先空、代拷迟几秒才落盘"的异步 materialize：
+                            // 稍后复查一次并自动续导。仍按 mtime 年龄过滤，绝不误吞陈旧残留；
+                            // 且仅在本页无进行中/待结算批次时执行——若撞上用户紧接的重新
+                            // 操作或上一个大批次仍在排队，宁可放过也不抢跑（避免计数错乱）
+                            DispatchQueue.main.asyncAfter(deadline: .now() + 6) { [self] in
+                                let idle = pendingImportCount == 0
+                                    || importSuccessCount + importFailureCount >= pendingImportCount
+                                guard idle, !showBatchModeConfirm else { return }
+                                let lateRecovery = AppFileManager.shared.recoverRecentPickerInboxPayloads(maxAge: 180)
+                                guard !lateRecovery.isEmpty else { return }
+                                ExternalDeliveryJournal.record("复查恢复导入：发现 \(lateRecovery.count) 个迟到代拷文件", level: .ok)
+                                pendingImportCount = lateRecovery.count
+                                importSuccessCount = 0
+                                importFailureCount = 0
+                                appState.showToast("检测到系统迟到的文件拷贝，正在恢复导入 \(lateRecovery.count) 个文件…")
+                                importRemaining(lateRecovery, startIndex: 0)
+                            }
                             return
                         }
                         ExternalDeliveryJournal.record("首页选择器回收 \(urls.count) 个文件")

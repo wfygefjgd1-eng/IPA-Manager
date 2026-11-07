@@ -103,6 +103,49 @@ final class AppFileManager {
         }
     }
 
+    /// 恢复"系统代拷已落盘但回调丢失/返回空数组"的文件选择器副本。
+    /// 已知 iOS 系统问题：选择器 Copy 模式把选中文件拷入 "<bundleID>-Inbox"
+    /// 代拷目录后，回调可能带回空数组（系统日志："This indicates the items
+    /// failed to be prepared and materialized on disk"——实测文件名含中文、
+    /// 空格或特殊字符时高发；App 侧表现为"点打开没反应"）。这份代拷副本有时
+    /// 已经完整落在 tmp 里可直接利用：这里枚举全部 -Inbox 目录，收集修改时间
+    /// 在 maxAge 之内、扩展名可导入（ipa/zip/p12/pfx/mobileprovision）的文件。
+    /// 恢复出的 URL 走与正常选中一致的摄取管线（importFile 的零 IO move）。
+    /// 找不到返回空数组（代拷确实未落盘时，由调用方给出改英文文件名 /
+    /// 文件 App 导入的指引）。
+    /// - Parameter maxAge: 只回收新近写入的文件（按秒），避免误吞陈旧残留。
+    func recoverRecentPickerInboxPayloads(maxAge: TimeInterval) -> [URL] {
+        let tmpDirectory = fileManager.temporaryDirectory
+        guard let entries = try? fileManager.contentsOfDirectory(
+            at: tmpDirectory,
+            includingPropertiesForKeys: [.contentModificationDateKey],
+            options: []
+        ) else { return [] }
+        let importableExtensions: Set<String> = ["ipa", "zip", "p12", "pfx", "mobileprovision"]
+        let cutoff = Date().addingTimeInterval(-maxAge)
+        var payloads: [URL] = []
+        for entry in entries where entry.lastPathComponent.hasSuffix("-Inbox") {
+            var isDirectory: ObjCBool = false
+            guard fileManager.fileExists(atPath: entry.path, isDirectory: &isDirectory),
+                  isDirectory.boolValue else { continue }
+            let residue = (try? fileManager.contentsOfDirectory(
+                at: entry,
+                includingPropertiesForKeys: [.contentModificationDateKey],
+                options: []
+            )) ?? []
+            for item in residue {
+                guard importableExtensions.contains(item.pathExtension.lowercased())
+                else { continue }
+                let mtime = (try? item.resourceValues(forKeys: [.contentModificationDateKey]))?
+                    .contentModificationDate ?? .distantPast
+                guard mtime >= cutoff else { continue }
+                payloads.append(item)
+                Logger.info("恢复扫描命中代拷副本: \(item.lastPathComponent)")
+            }
+        }
+        return payloads
+    }
+
     private func createDirectoryIfNeeded(_ url: URL) {
         var isDirectory: ObjCBool = false
         if !fileManager.fileExists(atPath: url.path, isDirectory: &isDirectory) {
