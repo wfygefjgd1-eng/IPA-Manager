@@ -63,13 +63,17 @@ struct AppDetailView: View {
         let fresh = appState.importedApps.first(where: { $0.id == app.id })
             ?? appState.importedApps.first(where: { $0.path == app.path })
             ?? appState.importedApps.first(where: { $0.signedPath == app.path })
-        if let signedPath = signedOutputPath,
-           let installed = appState.installedApps.first(where: { $0.path == signedPath }) {
+        // 本次会话刚签名完成：立即以签名产物为准。不能等 refreshInstalledApps
+        // 异步完成后才切换——中间窗口里 isSigned 已为 true 而 path 仍指向源
+        // （未签名）IPA，此时点「安装」会把未签名包发出去。
+        if let signedPath = signedOutputPath {
             var merged = fresh ?? app
             merged.isSigned = true
-            merged.path = installed.path
-            merged.signedPath = installed.path
-            merged.size = installed.size
+            merged.path = signedPath
+            merged.signedPath = signedPath
+            if let installed = appState.installedApps.first(where: { $0.path == signedPath }) {
+                merged.size = installed.size
+            }
             return merged
         }
         // 从「已签应用」列表进入（app.path 即签名产物）：路径/图标/大小以产物
@@ -411,17 +415,21 @@ struct AppDetailView: View {
         // 时间必须随真实时钟走，不能只依赖进度回调）
         signStartTime = Date()
         startSignTimer()
+        signedBundleID = nil
         // Bundle ID 覆盖（手动签名模式）：开关开启且记录非空时原样传给引擎
         // 重写包内 CFBundleIdentifier（主程序与扩展一并）。无兼容性校验、无
         // 兜底改写——与自动模式同源直出；仅字符格式（空格/中文等任何证书都
         // 救不回的非法名）在引擎内 fail-fast 秒级报错，便于用户"改到成功为止"。
-        // **必须取最新导入记录**（id 优先，其次 path）：详情页是快照进入的，
-        // 直接传 `app` 会拿到编辑前的旧 bundleID——实测症状：改完名签名，包里
-        // 仍是改名前的名字（编辑只更新了 appState.importedApps）。
-        let signingApp = appState.importedApps.first(where: { $0.id == app.id })
+        // 覆盖值必须取最新导入记录（id → 源 path → signedPath）：详情页是快照
+        // 进入的，直接传 `app` 会拿到编辑前的旧 bundleID（实测：改完名签名，
+        // 包里仍是原名）。签名源文件仍用详情页当前指向的那份（从「已签应用」
+        // 进入时即签名产物），不强行改回导入源文件——源文件被清理后仍可重签。
+        var signingApp = app
+        if let fresh = appState.importedApps.first(where: { $0.id == app.id })
             ?? appState.importedApps.first(where: { $0.path == app.path })
-            ?? appState.importedApps.first(where: { $0.signedPath == app.path })
-            ?? app
+            ?? appState.importedApps.first(where: { $0.signedPath == app.path }) {
+            signingApp.bundleID = fresh.bundleID
+        }
         appState.signApp(signingApp, certificate: certificate, profile: profile,
                          bundleIDOverride: appState.manualSigningBundleIDOverride(signingApp),
                          progress: { progress, phase in
@@ -693,7 +701,7 @@ struct BundleIDEditorView: View {
                 } header: {
                     Text("新的 Bundle ID")
                 } footer: {
-                    Text("仅修改本机记录；包内 Bundle ID 在下次点击「开始签名」时被重写（主程序与扩展一并修改）。原值：\(app.bundleID.isEmpty ? "未知" : app.bundleID)")
+                    Text("仅修改本机记录；包内 Bundle ID 在下次点击「开始签名」时被重写（主程序与扩展一并修改）。签名包会以新 ID 安装为独立应用，不会覆盖已安装的原应用。原值：\(app.bundleID.isEmpty ? "未知" : app.bundleID)")
                 }
 
                 if let formatWarning {

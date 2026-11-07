@@ -486,11 +486,17 @@ final class AppState: ObservableObject {
                     var isSameApp = false
                     if FileManager.default.fileExists(atPath: destination.path) {
                         let existing = importedAppsSnapshot.first { $0.path == destination.path }
-                        // 轻量 bundleID 读取（zip 中央目录单条目，毫秒级）：旧实现为比对
-                        // bundleID 把新 IPA 整包解压一遍（1GB 包纯 IO 翻倍）。读取失败
-                        // 返回 nil，与原 parseAppInfo 失败同语义（视为不同应用走唯一后缀）。
+                        // 用【磁盘上现有文件】的真实 bundleID 比对，而不是记录里的 bundleID：
+                        // 手动模式允许改记录中的 Bundle ID，改过后记录值 ≠ 文件真实值；若仍按
+                        // 记录值比对，重导入同一个 IPA 会被误判成"另一个应用"，白占一份 GB 级
+                        // 副本（新旧两份相同的 IPA 并存，记录也重复）。
+                        let newBundleID = self.parser.lightweightAppInfo(from: importURL)?.bundleID
+                        let existingBundleID = existing.flatMap {
+                            self.parser.lightweightAppInfo(from: URL(fileURLWithPath: $0.path))?.bundleID
+                        }
                         isSameApp = existing != nil
-                            && existing?.bundleID == self.parser.lightweightAppInfo(from: importURL)?.bundleID
+                            && newBundleID != nil
+                            && existingBundleID == newBundleID
                         if !isSameApp {
                             let base = destination.deletingPathExtension().lastPathComponent
                             var candidate = self.fileManager.directoryURL(.ipa)
@@ -624,9 +630,19 @@ final class AppState: ObservableObject {
                     try? FileManager.default.removeItem(at: parsedRootURL)
                 }
                 DispatchQueue.main.async {
-                    // bundleID 为空（Info.plist 损坏/顶层非字典等异常）时不按空串去重：
-                    // 否则第二个坏包会静默覆盖上一个坏包的记录且无任何提示
-                    if !app.bundleID.isEmpty,
+                    // 去重顺序：
+                    // ① 同文件路径（手动模式改过 Bundle ID 的记录：解析值是文件真实
+                    //    原名、记录值是用户改的名字，两者不同，但磁盘上是同一个 IPA）
+                    //    → 替换记录并保留用户改的名字，否则同一文件会挂两条记录，
+                    //    且重导入会把用户改的名字"弄丢"；
+                    // ② 同 bundleID（同应用从不同文件名重导入）→ 替换记录；
+                    // ③ 都不中 → 新增。
+                    if let index = self.importedApps.firstIndex(where: { $0.path == destination.path }) {
+                        let editedBundleID = self.importedApps[index].bundleID
+                        var merged = app
+                        if !editedBundleID.isEmpty { merged.bundleID = editedBundleID }
+                        self.importedApps[index] = merged
+                    } else if !app.bundleID.isEmpty,
                        let index = self.importedApps.firstIndex(where: { $0.bundleID == app.bundleID }) {
                         self.importedApps[index] = app
                     } else {
@@ -774,7 +790,8 @@ final class AppState: ObservableObject {
                     }
                     // 同步更新 importedApps 旧记录：签名成功后置 isSigned=true 并回填签名产物路径，
                     // 否则首页“待签名”列表一直显示已签名应用（用户误以为签名失败）。
-                    if let index = self.importedApps.firstIndex(where: { $0.path == app.path || $0.id == app.id }) {
+                    // signedPath 也参与匹配：从「已签应用」再次签名时 app.path 是签名产物。
+                    if let index = self.importedApps.firstIndex(where: { $0.path == app.path || $0.id == app.id || $0.signedPath == app.path }) {
                         self.importedApps[index].isSigned = true
                         self.importedApps[index].signedPath = signedPath
                     }
@@ -804,7 +821,8 @@ final class AppState: ObservableObject {
     /// 的真正重写发生在下一次签名——bundleIDOverride 传入 zsign 的
     /// ModifyBundleInfo（主程序与全部扩展一并改写），无重签不生效。
     /// 已在签名中（bundleID 匹配去重冷却）的应用照常允许改，签名用旧值不受影响。
-    /// 按 id 优先匹配，失败退化按 path 匹配（已签名列表条目与导入记录不同 id）。
+    /// 匹配顺序：id → 源文件 path → 签名产物 signedPath（从「已签应用」列表
+    /// 进入编辑时 app.path 是签名产物，必须走第三级）。
     /// 未找到任何匹配的导入记录时返回 false（纯已签名产物无法挂接修改）。
     @discardableResult
     func updateImportedAppBundleID(id: UUID, path: String, newBundleID: String) -> Bool {
@@ -842,7 +860,19 @@ final class AppState: ObservableObject {
         guard app.isSigned else {
             throw AppError.installFailed("应用尚未签名")
         }
-        try Installer.shared.install(ipaPath: app.path, certificate: certificate, onInstallOpened: onInstallOpened)
+        // 安装必须以【签名产物】为准：导入记录本身 isSigned 后 path 仍指向源
+        //（未签名）IPA，signedPath 才是签名包。旧实现直接装 app.path，从下载页
+        // 打开一个"已签名导入记录"的详情时会把未签名源包发出去（装不上/被系统
+        // 拒绝），这里优先 signedPath 并校验文件仍在。
+        let installPath: String
+        if let signedPath = app.signedPath, FileManager.default.fileExists(atPath: signedPath) {
+            installPath = signedPath
+        } else if app.signedPath == nil, FileManager.default.fileExists(atPath: app.path) {
+            installPath = app.path
+        } else {
+            throw AppError.installFailed("签名产物不存在或已被清理，请重新签名后再安装")
+        }
+        try Installer.shared.install(ipaPath: installPath, certificate: certificate, onInstallOpened: onInstallOpened)
     }
 
     func installSignedPath(
