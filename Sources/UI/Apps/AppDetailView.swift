@@ -672,6 +672,11 @@ struct BundleIDEditorView: View {
 
     @State private var draft = ""
     @State private var saveError: String?
+    /// 磁盘上该 IPA 文件内真实的 CFBundleIdentifier（包内当前值）。
+    /// 与记录值分开：手动改名只改记录，包内值要等下次签名才重写；编辑器必须
+    /// 展示真实包内值，否则改过一次后「原值」会变成用户自己改的名字（误导）。
+    /// nil = 读取失败（仅省略展示，不阻断编辑）。
+    @State private var packageBundleID: String?
 
     private var trimmedDraft: String {
         draft.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -688,6 +693,36 @@ struct BundleIDEditorView: View {
         !trimmedDraft.isEmpty
     }
 
+    /// 说明文案：包内真实值与本机记录分开标注。包内值读取失败时只省略该行，
+    /// 不阻断编辑（轻量解析失败不影响保存/签名链路）。
+    private var footerText: String {
+        var lines = [
+            "仅修改本机记录；包内 Bundle ID 在下次点击「开始签名」时被重写（主程序与扩展一并修改）。签名包会以新 ID 安装为独立应用，不会覆盖已安装的原应用。"
+        ]
+        if let packageBundleID, !packageBundleID.isEmpty {
+            lines.append("包内当前 Bundle ID：\(packageBundleID)")
+        }
+        if !app.bundleID.isEmpty {
+            lines.append("本机记录：\(app.bundleID)")
+        }
+        return lines.joined(separator: "\n")
+    }
+
+    /// 轻量读取包内真实 Bundle ID（zip 中央目录单条目，毫秒级）。放后台队列
+    /// 避免个别情况下中央目录扫描阻塞弹窗首帧；失败保持 nil，仅少一行展示。
+    private func loadPackageBundleID() {
+        guard packageBundleID == nil else { return }
+        let path = app.path
+        DispatchQueue.global(qos: .userInitiated).async {
+            let bundleID = IPAParser()
+                .lightweightAppInfo(from: URL(fileURLWithPath: path))?
+                .bundleID
+            DispatchQueue.main.async {
+                packageBundleID = bundleID
+            }
+        }
+    }
+
     var body: some View {
         NavigationStack {
             Form {
@@ -701,7 +736,23 @@ struct BundleIDEditorView: View {
                 } header: {
                     Text("新的 Bundle ID")
                 } footer: {
-                    Text("仅修改本机记录；包内 Bundle ID 在下次点击「开始签名」时被重写（主程序与扩展一并修改）。签名包会以新 ID 安装为独立应用，不会覆盖已安装的原应用。原值：\(app.bundleID.isEmpty ? "未知" : app.bundleID)")
+                    Text(footerText)
+                }
+
+                // 记录值与包内真实值不一致时提供一键恢复：改过多次后「原值」
+                // 已不可追溯，包内 Info.plist 才是签名真正会基于的那份文件。
+                if let packageBundleID, !packageBundleID.isEmpty,
+                   packageBundleID != trimmedDraft {
+                    Section {
+                        Button {
+                            draft = packageBundleID
+                        } label: {
+                            Label("恢复为包内当前值", systemImage: "arrow.uturn.backward")
+                                .font(.subheadline)
+                        }
+                    } footer: {
+                        Text("将输入框改回该 IPA 文件内真实的 Bundle ID（\(packageBundleID)），保存后本机记录同步恢复一致。")
+                    }
                 }
 
                 if let formatWarning {
@@ -717,6 +768,7 @@ struct BundleIDEditorView: View {
             }
             .navigationTitle("修改 Bundle ID")
             .navigationBarTitleDisplayMode(.inline)
+            .onAppear(perform: loadPackageBundleID)
             .toolbar {
                 ToolbarItem(placement: .navigationBarLeading) {
                     Button("取消") {
