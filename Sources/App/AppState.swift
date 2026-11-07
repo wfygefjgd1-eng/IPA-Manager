@@ -701,6 +701,33 @@ final class AppState: ObservableObject {
     }
 
 
+    // MARK: - Bundle ID 覆盖决议（手动签名模式）
+
+    /// 签名前解析实际传给签名引擎的 Bundle ID 覆盖，核心原则：**手动路径的
+    /// 签名/安装行为与自动路径对齐**（用户反馈"自动模式能安装、手动模式连签
+    /// 都签不成"——差异就是手动传了覆盖包名触发引擎 fail-fast，自动传空覆盖
+    /// 由 zsign 零改写直接出包）。手动签名模式关闭 → ""（与自动一致）；开启 →
+    /// 记录的 Bundle ID 与所选描述文件【兼容】时原样传递（改名的正规通道）；
+    /// 不兼容时**不拦截、不重写**→ 兜底传空覆盖，产出包与自动模式完全同款
+    ///（保留包内原包名），保证自动模式装得上的手动模式也一定装得上。
+    /// usedFallback=true 时 incompatibleOverride 为被放行的名字（调用方据此
+    /// toast 说明"这个名字这次没生效"）；引擎内 fail-fast 仅作为未来调用方的
+    /// 防御层，本决议保证 UI 路径不再触达。
+    func resolveSigningBundleIDOverride(app appInfo: AppInfo, profile: ProvisioningInfo) -> (override: String, usedFallback: Bool, incompatibleOverride: String) {
+        guard manualSigningModeEnabled() else {
+            return (override: "", usedFallback: false, incompatibleOverride: "")
+        }
+        let intended = appInfo.bundleID.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !intended.isEmpty else {
+            return (override: "", usedFallback: false, incompatibleOverride: "")
+        }
+        if profile.bundleIDOverrideError(intended) == nil {
+            return (override: intended, usedFallback: false, incompatibleOverride: "")
+        }
+        Logger.info("签名覆盖兜底: 改后的 Bundle ID「\(intended)」与描述文件「\(profile.name)」不兼容，本次按自动模式同款不重写包名（保留包内原包名出包，不拦安装）")
+        return (override: "", usedFallback: true, incompatibleOverride: intended)
+    }
+
     func signApp(
         _ app: AppInfo,
         certificate: CertificateInfo,

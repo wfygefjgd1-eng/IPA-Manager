@@ -354,8 +354,9 @@ struct AppDetailView: View {
     }
 
     /// 手动签名模式的 Bundle ID 覆盖：仅开关开启且记录非空时传递（空串 =
-    /// 不覆盖，自动一条龙与常规签名路径不受影响）。校验在 SigningEngine.sign
-    /// 内完成（不兼容直接 fail-fast 报精确原因，早于任何签名 IO）。
+    /// 不覆盖，自动一条龙与常规签名路径不受影响）。这个名字是否生效由
+    /// AppState.resolveSigningBundleIDOverride 决议：兼容原样传；不兼容与自动
+    /// 模式同款传空（不重写包名），保证手动安装行为与自动一致。
     private var signingBundleIDOverride: String {
         manualSigningMode ? liveApp.bundleID.trimmingCharacters(in: .whitespacesAndNewlines) : ""
     }
@@ -365,7 +366,9 @@ struct AppDetailView: View {
     /// 默认证书/描述文件缺失或无效时退回 SignOptionsView 让用户手动选择。
     /// 手动签名模式补充：默认描述文件与新改的 Bundle ID 不兼容时（精确绑定的
     /// 默认描述文件 + 库里另存通配描述文件的常见组合），自动改选任一条兼容的
-    /// 有效描述文件并提示，而不是让它卡死在"签名失败：不兼容"上再手动进面板换。
+    /// 有效描述文件并提示；库里没有兼容替代时也不拦——由 startSigning 内的
+    /// resolveSigningBundleIDOverride 与自动模式同款兜底（不重写包名出包），
+    /// 保证手动路径的签名/安装终态与自动路径一致。
     private func startSigningWithDefaults() {
         guard let cert = appState.selectedCertificate, cert.status == .valid,
               appState.certificates.contains(where: { $0.id == cert.id }) else {
@@ -406,8 +409,16 @@ struct AppDetailView: View {
         // 时间必须随真实时钟走，不能只依赖进度回调）
         signStartTime = Date()
         startSignTimer()
+        // Bundle ID 覆盖决议（手动签名模式）：兼容即按用户改的名字（改名正规
+        // 通道）；不兼容 → **与自动模式完全同款**传空覆盖（不重写包名出包），
+        // 保证自动模式装得上的手动模式也一定装得上，不再弹「不兼容」拦签名。
+        // 名称被放行未生效时 toast 说明，避免"改了名却没变"的困惑。
+        let resolution = appState.resolveSigningBundleIDOverride(app: app, profile: profile)
+        if resolution.usedFallback {
+            AppState.shared.showToast("改的包名「\(resolution.incompatibleOverride)」与描述文件不兼容，本次按包内原包名签名（与自动模式一致）")
+        }
         appState.signApp(app, certificate: certificate, profile: profile,
-                         bundleIDOverride: signingBundleIDOverride,
+                         bundleIDOverride: resolution.override,
                          progress: { progress, phase in
             // 进度节流：变化 ≥1% 或间隔 ≥0.1s 才更新 @State，避免详情页频繁重算
             let now = Date()
@@ -558,9 +569,11 @@ struct AppDetailView: View {
 
     /// 当失败原因是“源文件丢失”时，在错误信息后附加一行恢复指引，
     /// 避免用户只看到 zsign 桥接层返回的 "Input file not found" 英文错误。
+    /// AppError.signFailed 的 errorDescription 自带"签名失败: "前缀，这里
+    /// 识别后不再叠加，避免出现"签名失败: 签名失败: …"的重复读感。
     private func signingFailureMessage(for error: Error) -> String {
-        let base = "签名失败: \(error.localizedDescription)"
         let description = error.localizedDescription
+        let base = description.hasPrefix("签名失败: ") ? description : "签名失败: \(description)"
         if description.contains("文件已被删除") || description.contains("Input file not found") || description.contains("源文件") {
             return base + "\n\n该应用的源文件已丢失（可能被清理），请在首页重新导入后再签名。"
         }
@@ -688,9 +701,9 @@ struct BundleIDEditorView: View {
         } ?? false
         if compatibleProfiles.isEmpty {
             if trimmedDraft == app.bundleID {
-                return "原值本身就不被当前任何描述文件覆盖（描述文件只认自己的 AppID，与这个应用的原始名无关）——用现有描述文件，这个应用不改名也签不成。想签成需要一条能覆盖「\(trimmedDraft)」的描述文件：通配（application-identifier 以 * 结尾）或让证书供应商按此名字出一条精确描述文件。"
+                return "这个名字不被当前任何描述文件接受（描述文件只认自己的 AppID，与这个应用的原始名无关）。签名不受影响：会按包内原包名出包（与自动模式完全一致，能装上）；但想改名生效，需要通配描述文件（application-identifier 以 * 结尾）或让证书供应商按此名字出一条精确描述文件。"
             }
-            return "当前所有描述文件都无法接受这个 Bundle ID（多见于「每应用精确绑定」描述文件）。仍可保存，但用现有描述文件签名会失败。想签成需要：① 通配描述文件（application-identifier 以 * 结尾，可向证书供应商申请）；或 ② 让供应商直接按你想改的名字出一条精确描述文件。保存后可先搁置，等描述文件到位再签名。"
+            return "当前所有描述文件都无法接受这个 Bundle ID（多见于「每应用精确绑定」描述文件）。保存不受影响：签名时会按包内原包名出包（与自动模式完全一致，能装上），你改的这个名字那次签名不会生效。想让它生效需要：① 通配描述文件（可向证书供应商申请）；或 ② 让供应商直接按这个名字出一条精确描述文件。"
         }
         if defaultCompatible {
             return "默认描述文件兼容，可直接一键签名。"
@@ -797,7 +810,11 @@ struct BundleIDEditorView: View {
             return
         }
         if appState.updateImportedAppBundleID(id: app.id, path: app.path, newBundleID: newID) {
-            AppState.shared.showToast("Bundle ID 已更新，签名时生效")
+            // 零兼容时说明签名行为（按包内原包名兜底、与自动模式一致），避免误解
+            let zeroCompatible = !validProfiles.isEmpty && compatibleProfiles.isEmpty
+            AppState.shared.showToast(zeroCompatible
+                ? "Bundle ID 已保存；这个名字当前描述文件不认，下次签名会按包内原包名出包（与自动模式一致，不影响安装）"
+                : "Bundle ID 已更新，签名时生效")
             dismiss()
         } else {
             saveError = "未找到对应的导入记录，无法保存修改（请从首页/待签名列表进入该应用后重试）"
