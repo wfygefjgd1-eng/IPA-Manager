@@ -353,44 +353,23 @@ struct AppDetailView: View {
         }
     }
 
-    /// 手动签名模式的 Bundle ID 覆盖（仅详情页一键路径的预检值用）：仅开关
-    /// 开启且记录非空时传递（空串 = 不覆盖，自动一条龙与常规签名路径不受
-    /// 影响）。实际签名时的覆盖与它同值（startSigning 传
-    /// AppState.manualSigningBundleIDOverride），是否生效由引擎兼容性校验
-    /// 决定——不兼容签名直接失败（手动模式无任何兜底改写，用户要求失败了
-    /// 就是失败，改到证书认的名字为止）。
-    private var signingBundleIDOverride: String {
-        manualSigningMode ? liveApp.bundleID.trimmingCharacters(in: .whitespacesAndNewlines) : ""
-    }
+    /// Bundle ID 覆盖（手动签名模式）在 startSigning 内取自
+    /// AppState.manualSigningBundleIDOverride：开关开启且记录非空时原样传给
+    /// 引擎重写包内 CFBundleIdentifier——无兼容性校验、无改写兜底、不自动换
+    /// profile（与自动模式同源直出，名字由用户全权决定）。
 
     /// 一键签名并安装：默认选中的有效证书 + 描述文件（且仍在证书/描述文件列表中）+ AppStorage
     /// installAfterSigning（默认 true，未设置过时按 true 处理）直接签名并安装；
     /// 默认证书/描述文件缺失或无效时退回 SignOptionsView 让用户手动选择。
-    /// 手动签名模式补充：默认描述文件与新改的 Bundle ID 不兼容时（精确绑定的
-    /// 默认描述文件 + 库里另存通配/兼容描述文件的常见组合），自动改选任一条
-    /// 兼容的有效描述文件并提示——此时用户的名字真实生效。库里没有兼容替
-    /// 代时**不做任何兜底**（用户明确要求）：保持用户的名字直传引擎，校验
-    /// 不过签名直接失败，失败提示给出精确原因与出路，改到成功为止。
+    /// Bundle ID 覆盖（手动签名模式）在 startSigning 内原样下传——无兼容性
+    /// 校验、无改写兜底、不自动换 profile（与自动模式同源，名字由用户全权
+    /// 决定；描述文件本身就是用户在「签名选项」里指定的）。
     private func startSigningWithDefaults() {
         guard let cert = appState.selectedCertificate, cert.status == .valid,
-              appState.certificates.contains(where: { $0.id == cert.id }) else {
-            showSignOptions = true
-            return
-        }
-        var chosenProfile = appState.selectedProfile
-        let override = signingBundleIDOverride
-        if !override.isEmpty, chosenProfile?.bundleIDOverrideError(override) != nil {
-            if let candidate = appState.profiles.first(where: {
-                $0.status == .valid && $0.bundleIDOverrideError(override) == nil
-            }) {
-                chosenProfile = candidate
-                Logger.info("一键签名自动改选兼容描述文件: \(candidate.name)（默认描述文件与 Bundle ID \(override) 不兼容）")
-                AppState.shared.showToast("默认描述文件与改后的 Bundle ID 不兼容，已自动改选「\(candidate.name)」")
-            }
-        }
-        guard let profile = chosenProfile, profile.status == .valid,
+              let profile = appState.selectedProfile, profile.status == .valid,
+              appState.certificates.contains(where: { $0.id == cert.id }),
               appState.profiles.contains(where: { $0.id == profile.id }) else {
-            showSignOptions = true   // fallback 让用户选
+            showSignOptions = true
             return
         }
         let installAfter = (UserDefaults.standard.object(forKey: "installAfterSigning") as? Bool) ?? true
@@ -411,10 +390,10 @@ struct AppDetailView: View {
         // 时间必须随真实时钟走，不能只依赖进度回调）
         signStartTime = Date()
         startSignTimer()
-        // Bundle ID 覆盖（手动签名模式）：兼容则按用户改的名字覆盖签名成功；
-        // 不兼容则签名直接失败（无兜底，用户要求失败就是失败、改到成功为止），
-        // 引擎 fail-fast 在解压/签名大 IO 之前给出精确原因（含所用描述文件与
-        // 其 AppID，及"换通配描述文件/向供应商申请"的出路）。
+        // Bundle ID 覆盖（手动签名模式）：开关开启且记录非空时原样传给引擎
+        // 重写包内 CFBundleIdentifier（主程序与扩展一并）。无兼容性校验、无
+        // 兜底改写——与自动模式同源直出；仅字符格式（空格/中文等任何证书都
+        // 救不回的非法名）在引擎内 fail-fast 秒级报错，便于用户"改到成功为止"。
         appState.signApp(app, certificate: certificate, profile: profile,
                          bundleIDOverride: appState.manualSigningBundleIDOverride(app),
                          progress: { progress, phase in
@@ -634,13 +613,10 @@ struct InstallCertificatePicker: View {
 }
 
 /// 手动签名模式的 Bundle ID 编辑弹窗（默认关，入口仅在该模式开启时出现）。
-/// 兼容性判定规则与签名时一致（ProvisioningInfo.bundleIDOverrideError，镜像
-/// zsign/系统通配覆盖语义）。编辑器对【全部】有效描述文件做兼容性对比并展示
-/// ✓/✗ + footer 论断，但【不拦截保存】：保存门槛只有"非空"（空 = 什么都没改，
-/// 等效取消）——实测 v1.0.195 的"零兼容描述文件时禁保存"把「先改名、稍后再
-/// 导入兼容描述文件 / 换证书」的正常路径也卡死；字符格式同样不拦，用户要的
-/// 是"改完直接能存"，非法字符的代价出现在签名环节（引擎 fail-fast 给出精确
-/// 原因），不在编辑环节设卡。修改只落本机记录，包内重写在下次签名时发生。
+/// 名字由用户全权决定：保存门槛只有"非空"；输入是否装得上的裁决完全不设卡
+/// （自动模式零改写保持原包名照样装机成功，证明签名层预判无意义），非法
+/// 字符（空格/中文等必然连不了机的名字）在签名时由引擎 fail-fast 秒级报错。
+/// 修改只落本机记录，包内重写在下次签名时发生（主程序与扩展一并）。
 struct BundleIDEditorView: View {
     @Environment(\.dismiss) private var dismiss
     @EnvironmentObject private var appState: AppState
@@ -659,63 +635,9 @@ struct BundleIDEditorView: View {
         ProvisioningInfo.bundleIDFormatError(trimmedDraft)
     }
 
-    /// 有效描述文件（未过期）：兼容性判定的对比范围
-    private var validProfiles: [ProvisioningInfo] {
-        appState.profiles.filter { $0.status == .valid }
-    }
-
-    /// 能接受当前草稿的描述文件（兼容 = 签名成功可安装）
-    private var compatibleProfiles: [ProvisioningInfo] {
-        validProfiles.filter { $0.bundleIDOverrideError(trimmedDraft) == nil }
-    }
-
-    /// 允许保存的条件：输入非空即可直接保存（空 = 等效取消）。字符白名单与
-    /// 描述文件兼容性一律不拦——用户要的是"改完直接能存"；兼容性按信息展示，
-    /// 格式问题在签名环节由引擎 fail-fast 精确报出，编辑环节不设卡。
+    /// 允许保存的条件：输入非空即可直接保存（空 = 等效取消）
     private var canSave: Bool {
         !trimmedDraft.isEmpty
-    }
-
-    /// 兼容性展示行（Identifiable 包装：key path 不支持元组成员，ForEach 需走结构体 id）
-    private struct CompatibilityRow: Identifiable {
-        let profile: ProvisioningInfo
-        let compatible: Bool
-        var id: UUID { profile.id }
-    }
-
-    /// 兼容性展示：兼容在前，最多 6 条（证书包一导入可能挂几十条描述文件）
-    private var displayProfileRows: [CompatibilityRow] {
-        let rows = validProfiles.map { CompatibilityRow(profile: $0, compatible: $0.bundleIDOverrideError(trimmedDraft) == nil) }
-        return Array((rows.filter { $0.compatible } + rows.filter { !$0.compatible }).prefix(6))
-    }
-
-    /// 兼容性 section 的 footer 结论（用户看得懂下一步怎么办）
-    private var compatibilityFooter: String {
-        if validProfiles.isEmpty {
-            return "还没有可用描述文件：可以先保存（签名时会再次校验），或先到「证书」页导入描述文件。"
-        }
-        let defaultCompatible = appState.selectedProfile.map { selected in
-            selected.status == .valid && compatibleProfiles.contains(where: { $0.id == selected.id })
-        } ?? false
-        if compatibleProfiles.isEmpty {
-            // 默认描述文件的正主身份（唯一能被它接受的签名名）作具体指引：
-            // 改到这个名字即可签成，无需猜测
-            let supportedHint: String
-            if let selected = appState.selectedProfile, selected.status == .valid,
-               !selected.bundleID.isEmpty {
-                supportedHint = "这套证书只认「\(selected.nativeInstallBundleID ?? selected.bundleID)」这一个签名身份。"
-            } else {
-                supportedHint = ""
-            }
-            if trimmedDraft == app.bundleID {
-                return "这个名字不被当前任何描述文件接受（描述文件只认自己的 AppID，与这个应用的原始名无关）——不改名字直接签名也会失败。\(supportedHint)想签成：把名字改到证书支持的那个，或向供应商申请通配描述文件（application-identifier 以 * 结尾）。"
-            }
-            return "当前所有描述文件都无法接受这个 Bundle ID（多见于「每应用精确绑定」描述文件），签名会直接失败——手动模式不做改写兜底（失败了就是失败了），一直调整到证书认的名字为止即可签成。\(supportedHint)"
-        }
-        if defaultCompatible {
-            return "默认描述文件兼容，可直接一键签名。"
-        }
-        return "默认描述文件不与改后的 ID 兼容：一键签名时会自动改选兼容的描述文件，也可在「签名选项」中手动选择。"
     }
 
     var body: some View {
@@ -743,44 +665,6 @@ struct BundleIDEditorView: View {
                             .font(.caption2)
                             .foregroundColor(.secondary)
                     }
-                }
-
-                Section {
-                    ForEach(displayProfileRows) { row in
-                        HStack(spacing: 10) {
-                            Image(systemName: row.compatible ? "checkmark.circle.fill" : "xmark.circle.fill")
-                                .font(.subheadline)
-                                .foregroundColor(row.compatible ? .green : .red)
-                            VStack(alignment: .leading, spacing: 2) {
-                                Text(row.profile.name)
-                                    .font(.subheadline)
-                                    .lineLimit(1)
-                                Text(row.profile.bundleID.isEmpty ? "未知 AppID" : row.profile.bundleID)
-                                    .font(.caption2)
-                                    .foregroundColor(.secondary)
-                                    .lineLimit(1)
-                                    .truncationMode(.middle)
-                            }
-                            Spacer()
-                            if row.profile.id == appState.selectedProfile?.id {
-                                Text("默认")
-                                    .font(.caption2.weight(.semibold))
-                                    .foregroundColor(.accentColor)
-                                    .padding(.horizontal, 6)
-                                    .padding(.vertical, 2)
-                                    .background(Capsule().fill(Color.accentColor.opacity(0.15)))
-                            }
-                        }
-                    }
-                    if validProfiles.count > displayProfileRows.count {
-                        Text("…共 \(validProfiles.count) 条有效描述文件，其中 \(compatibleProfiles.count) 条兼容（仅展示前 6 条）")
-                            .font(.caption2)
-                            .foregroundColor(.secondary)
-                    }
-                } header: {
-                    Text("描述文件兼容性（哪个名字能签成）")
-                } footer: {
-                    Text(compatibilityFooter)
                 }
             }
             .navigationTitle("修改 Bundle ID")
@@ -817,11 +701,7 @@ struct BundleIDEditorView: View {
             return
         }
         if appState.updateImportedAppBundleID(id: app.id, path: app.path, newBundleID: newID) {
-            // 零兼容时说明失败语义（无兜底、签前调整名字），避免"存了就以为能签成"
-            let zeroCompatible = !validProfiles.isEmpty && compatibleProfiles.isEmpty
-            AppState.shared.showToast(zeroCompatible
-                ? "Bundle ID 已保存；这个名字当前证书不认，签名会直接失败（无兜底），签名前请改到证书认的名字"
-                : "Bundle ID 已更新，签名时生效")
+            AppState.shared.showToast("Bundle ID 已更新，签名时按这个名字重写包名")
             dismiss()
         } else {
             saveError = "未找到对应的导入记录，无法保存修改（请从首页/待签名列表进入该应用后重试）"

@@ -49,7 +49,11 @@ struct ProvisioningInfo: Identifiable, Codable, Hashable {
 
     // MARK: - Bundle ID 覆盖校验（手动签名模式）
 
-    /// Bundle ID 字符格式校验（与描述文件无关的两条硬性规则，任何 profile 下都不合法）。
+    /// Bundle ID 字符格式校验（与描述文件无关的硬性规则，任何 profile 下都不合法）。
+    /// 仅保留字符门槛：空格/中文等非法字符会让重写后的 Info.plist/entitlement
+    /// 无法成立，装不上设备；提前 fail-fast 把迭代成本从"数十秒签名+安装失败"
+    /// 压缩到秒级报错。描述文件兼容性判定已整体移除——签名层不再预判"名字
+    /// 能不能装"（自动模式零改写照样装机成功即为反例），是否可装交系统裁决。
     static func bundleIDFormatError(_ newID: String) -> String? {
         let trimmed = newID.trimmingCharacters(in: .whitespacesAndNewlines)
         if trimmed.isEmpty { return "Bundle ID 不能为空" }
@@ -62,52 +66,5 @@ struct ProvisioningInfo: Identifiable, Codable, Hashable {
             return "Bundle ID 只能包含字母、数字、点、横线和下划线"
         }
         return nil
-    }
-
-    /// 校验手动修改后的 Bundle ID 是否与该描述文件兼容（签名时经 zsign 重写包内
-    /// CFBundleIdentifier，重写后的签名 ID 必须被描述文件的 application-identifier
-    /// 覆盖，否则 iOS 安装层必然拒签包）。镜像系统的通配覆盖语义：
-    /// - 通配 AppID（TEAMID.a.*）：允许任意「a.」开头的 Bundle ID（TEAMID.* 则任意）；
-    /// - 精确 AppID（TEAMID.a.b）：只允许「a.b」本身。
-    /// 注意：这只是【单条描述文件】的兼容性判定——编辑界面应同时对比全部有效
-    /// 描述文件（见 AppDetailView 的编辑器），"任一兼容"即可保存改用那条签名；
-    /// 不能只拿默认描述文件把保存卡死（此前版本的误拦：库里明明有通配
-    /// 描述文件可用，编辑框却按默认那条直接拒绝）。
-    /// 返回 nil 表示通过；非 nil 为面向用户展示的错误说明。
-    func bundleIDOverrideError(_ newID: String) -> String? {
-        if let formatError = Self.bundleIDFormatError(newID) { return formatError }
-        let trimmed = newID
-        // AppID 缺失（畸形描述文件）时不拦：交给签名/安装链路的系统裁决，宁可放行
-        guard !bundleID.isEmpty else { return nil }
-        // 直接填完整 AppID（含 Team 前缀）视为一致
-        if trimmed == bundleID { return nil }
-
-        let teamPrefix = teamID.isEmpty ? "" : teamID + "."
-        let bare = trimmed.hasPrefix(teamPrefix) ? String(trimmed.dropFirst(teamPrefix.count)) : trimmed
-        if bundleID.hasSuffix("*") {
-            // 通配段包含结尾的点（"TEAMID.a.*" → base "TEAMID.a."）
-            let base = String(bundleID.dropLast())
-            if (teamPrefix + bare).hasPrefix(base) { return nil }
-            let wildcardName = String(bundleID.dropLast()).dropFirst(teamPrefix.count)
-            return "该描述文件的通配段仅允许「\(wildcardName)…」开头的 Bundle ID"
-        }
-        if teamPrefix + bare == bundleID { return nil }
-        // 描述文件缺 TeamIdentifier 字段时 teamPrefix 为空，退化为后缀比对
-        //（镜像 zsign 的 endsWith 匹配语义，避免误拦）
-        if teamPrefix.isEmpty && bundleID.hasSuffix(bare) { return nil }
-        let expected = bundleID.hasPrefix(teamPrefix) ? String(bundleID.dropFirst(teamPrefix.count)) : bundleID
-        return "该描述文件是精确绑定（非通配符），只支持不改名为「\(expected)」。想改名需要通配描述文件（application-identifier 以 * 结尾，如 TEAMID.xxx.*）：可在「签名选项」中改选通配描述文件，或向证书供应商申请"
-    }
-
-    /// 该描述文件"原生可装"的包名：application-identifier 去掉 TeamID 前缀。
-    /// 精确绑定描述文件（如供应商签发的 app.xxxx.yyyy）只有这一个身份能被
-    /// iOS 接受——用它改写签出的包 entitlement 与包名严格一致，必然可装；
-    /// 且这个身份与包内原包名不同 → 是独立应用，不会顶掉设备上已装的原始包。
-    /// bundleID 缺失（畸形描述文件）返回 nil；teamID 缺失时退化为完整 AppID
-    ///（zsign 的 endsWith 匹配语义下同样可用）。
-    var nativeInstallBundleID: String? {
-        guard !bundleID.isEmpty else { return nil }
-        let prefix = teamID.isEmpty ? "" : teamID + "."
-        return bundleID.hasPrefix(prefix) ? String(bundleID.dropFirst(prefix.count)) : bundleID
     }
 }

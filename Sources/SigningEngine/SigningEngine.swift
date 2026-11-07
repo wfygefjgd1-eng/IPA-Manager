@@ -7,9 +7,9 @@ protocol SigningEngineProtocol {
         sourcePath: String,
         certificate: CertificateInfo,
         profile: ProvisioningInfo,
-        /// Bundle ID 覆盖（手动签名模式）：非空时签名重写包内 CFBundleIdentifier，
-        /// 必须通过描述文件兼容性校验（见 ProvisioningInfo.bundleIDOverrideError），
-        /// 校验不通过签名直接失败（fail-fast，在任何 IO 之前）。
+        /// Bundle ID 覆盖（手动签名模式）：非空时签名重写包内 CFBundleIdentifier
+        ///（主程序与全部扩展）。是否装得上完全交给系统裁决——与自动模式同源
+        ///（自动模式零改写照样装机成功），签名层不做描述文件兼容性拦截。
         bundleIDOverride: String,
         progress: @escaping (Double, String) -> Void
     ) throws -> String
@@ -69,26 +69,21 @@ final class SigningEngine: SigningEngineProtocol {
             throw AppError.signFailed(reason)
         }
 
-        // Bundle ID 覆盖校验（手动签名模式，其余路径传空不覆盖）：重写后的签名 ID
-        // 必须被【本次实际选用】描述文件的 application-identifier 覆盖，否则设备
-        // 安装层必然拒绝。与签名大 IO 无关的失败一律在这里提前暴露，给出精确中文原因
-        //（编辑界面已放开保存门槛——只留非空，格式/兼容性不做编辑期拦截，全部在
-        // 这里兜底：字符问题按格式错误单独报，兼容性问题给出"换描述文件/改回
-        // 原名/申请通配或按名出精确描述文件"的出路）。
+        // Bundle ID 覆盖（手动签名模式，其余路径传空不覆盖）：直接接受用户改的
+        // 名字，交 zsign 重写包内 CFBundleIdentifier（主程序与扩展一并）。
+        // **不做描述文件兼容性校验**——自动模式零改写、包名保持原样照样装机
+        // 成功（用户实测足够多的真实安装），证明装机可行性由系统与证书环境
+        // 决定，签名层没有资格替用户预判。唯一保留的是字符格式门槛（空格/
+        // 中文等会让 Info.plist/entitlement 无法成立，任何证书都救不回）：这类
+        // 名字必然连不了机，提前 fail-fast 把迭代成本从"数十秒签名+安装失败
+        // 弹窗"压缩到秒级报错；其余一律放行，失败就失败，改到成功为止。
         if !bundleIDOverride.isEmpty {
-            // 字符格式先行：空格/中文等是 Bundle ID 自身的问题，与描述文件无关，
-            // 单独成类报出，避免被下面的兼容性检查包装成"与描述文件不匹配"误导
             if let formatError = ProvisioningInfo.bundleIDFormatError(bundleIDOverride) {
                 let reason = "Bundle ID「\(bundleIDOverride)」\(formatError)。请返回编辑修正（合法字符：字母、数字、点、横线、下划线），或改回原值"
                 Logger.error("签名失败: Bundle ID 格式校验未通过 — \(reason)")
                 throw AppError.signFailed(reason)
             }
-            if let error = profile.bundleIDOverrideError(bundleIDOverride) {
-                let reason = "Bundle ID「\(bundleIDOverride)」与描述文件「\(profile.name)」不兼容：\(error)（AppID：\(profile.bundleID.isEmpty ? "未知" : profile.bundleID)）"
-                Logger.error("签名失败: Bundle ID 覆盖校验未通过 — \(reason)")
-                throw AppError.signFailed(reason)
-            }
-            Logger.info("签名时覆盖 Bundle ID: \(bundleIDOverride)（描述文件 AppID: \(profile.bundleID)）")
+            Logger.info("签名时覆盖 Bundle ID: \(bundleIDOverride)（不校验描述文件兼容性，与自动模式同源直出）")
         }
 
         // 证书凭据检查（Keychain 标识 / 密码读取 / p12 与 PEM 导出）全部前移到
