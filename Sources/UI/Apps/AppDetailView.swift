@@ -363,16 +363,33 @@ struct AppDetailView: View {
     /// 一键签名并安装：默认选中的有效证书 + 描述文件（且仍在证书/描述文件列表中）+ AppStorage
     /// installAfterSigning（默认 true，未设置过时按 true 处理）直接签名并安装；
     /// 默认证书/描述文件缺失或无效时退回 SignOptionsView 让用户手动选择。
+    /// 手动签名模式补充：默认描述文件与新改的 Bundle ID 不兼容时（精确绑定的
+    /// 默认描述文件 + 库里另存通配描述文件的常见组合），自动改选任一条兼容的
+    /// 有效描述文件并提示，而不是让它卡死在"签名失败：不兼容"上再手动进面板换。
     private func startSigningWithDefaults() {
-        if let cert = appState.selectedCertificate, cert.status == .valid,
-           let profile = appState.selectedProfile, profile.status == .valid,
-           appState.certificates.contains(where: { $0.id == cert.id }),
-           appState.profiles.contains(where: { $0.id == profile.id }) {
-            let installAfter = (UserDefaults.standard.object(forKey: "installAfterSigning") as? Bool) ?? true
-            startSigning(certificate: cert, profile: profile, installAfter: installAfter)
-        } else {
-            showSignOptions = true   // fallback 让用户选
+        guard let cert = appState.selectedCertificate, cert.status == .valid,
+              appState.certificates.contains(where: { $0.id == cert.id }) else {
+            showSignOptions = true
+            return
         }
+        var chosenProfile = appState.selectedProfile
+        let override = signingBundleIDOverride
+        if !override.isEmpty, chosenProfile?.bundleIDOverrideError(override) != nil {
+            if let candidate = appState.profiles.first(where: {
+                $0.status == .valid && $0.bundleIDOverrideError(override) == nil
+            }) {
+                chosenProfile = candidate
+                Logger.info("一键签名自动改选兼容描述文件: \(candidate.name)（默认描述文件与 Bundle ID \(override) 不兼容）")
+                AppState.shared.showToast("默认描述文件与改后的 Bundle ID 不兼容，已自动改选「\(candidate.name)」")
+            }
+        }
+        guard let profile = chosenProfile, profile.status == .valid,
+              appState.profiles.contains(where: { $0.id == profile.id }) else {
+            showSignOptions = true   // fallback 让用户选
+            return
+        }
+        let installAfter = (UserDefaults.standard.object(forKey: "installAfterSigning") as? Bool) ?? true
+        startSigning(certificate: cert, profile: profile, installAfter: installAfter)
     }
 
     private func startSigning(certificate: CertificateInfo, profile: ProvisioningInfo, installAfter: Bool) {
@@ -606,8 +623,12 @@ struct InstallCertificatePicker: View {
 }
 
 /// 手动签名模式的 Bundle ID 编辑弹窗（默认关，入口仅在该模式开启时出现）。
-/// 校验规则与签名时一致（ProvisioningInfo.bundleIDOverrideError，镜像 zsign/系统
-/// 通配覆盖语义）：不兼容的 ID 会在签名时被直接拒绝，编辑阶段先拦避免白签一整包。
+/// 兼容性判定规则与签名时一致（ProvisioningInfo.bundleIDOverrideError，镜像
+/// zsign/系统通配覆盖语义）。与签名引擎的差异：编辑器对【全部】有效描述文件
+/// 做兼容性对比——"任一兼容"即允许保存（一键签名会自动改选那条兼容的；
+/// 默认描述文件不兼容时旧版会在这里把保存卡死，形成"别人能改我却不能改"
+/// 的误会）。精确绑定描述文件（非通配符）确实无法匹配任何改名的 ID，此时
+/// footer 给出"需要通配描述文件/找供应商"的明确出路而非冷冰冰的"不匹配"。
 /// 修改只落本机记录，包内重写在下次签名时发生（详情页顶部有说明）。
 struct BundleIDEditorView: View {
     @Environment(\.dismiss) private var dismiss
@@ -621,19 +642,56 @@ struct BundleIDEditorView: View {
         draft.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
-    /// 实时校验：以默认描述文件为基准（签名默认走一键路径）；未设置默认描述文件时
-    /// 只做格式校验，兼容性交由签名时再次校验兜底。
-    private var draftError: String? {
-        guard let profile = appState.selectedProfile, profile.status == .valid else { return nil }
-        return profile.bundleIDOverrideError(trimmedDraft)
+    /// 字符格式等硬性错误（非法字符/为空），与描述文件无关，绝不放行
+    private var formatError: String? {
+        ProvisioningInfo.bundleIDFormatError(trimmedDraft)
     }
 
-    /// 展示给用户的兼容性基准（默认描述文件的 application-identifier）。
-    private var profileAppIDDescription: String {
-        guard let profile = appState.selectedProfile, !profile.bundleID.isEmpty else {
-            return "未设置默认描述文件（可在「证书」页设置）；暂时只校验格式，签名时会再校验兼容性"
+    /// 有效描述文件（未过期）：兼容性判定的对比范围
+    private var validProfiles: [ProvisioningInfo] {
+        appState.profiles.filter { $0.status == .valid }
+    }
+
+    /// 能接受当前草稿的描述文件（兼容 = 签名成功可安装）
+    private var compatibleProfiles: [ProvisioningInfo] {
+        validProfiles.filter { $0.bundleIDOverrideError(trimmedDraft) == nil }
+    }
+
+    /// 允许保存的条件：格式合法，且——库里没有任何有效描述文件时放行（签名时
+    /// 引擎会兜底校验并指路），否则至少一条兼容才放行（一条没有改了也无法签成）。
+    private var canSave: Bool {
+        formatError == nil
+            && (validProfiles.isEmpty || !compatibleProfiles.isEmpty)
+    }
+
+    /// 兼容性展示行（Identifiable 包装：key path 不支持元组成员，ForEach 需走结构体 id）
+    private struct CompatibilityRow: Identifiable {
+        let profile: ProvisioningInfo
+        let compatible: Bool
+        var id: UUID { profile.id }
+    }
+
+    /// 兼容性展示：兼容在前，最多 6 条（证书包一导入可能挂几十条描述文件）
+    private var displayProfileRows: [CompatibilityRow] {
+        let rows = validProfiles.map { CompatibilityRow(profile: $0, compatible: $0.bundleIDOverrideError(trimmedDraft) == nil) }
+        return Array((rows.filter { $0.compatible } + rows.filter { !$0.compatible }).prefix(6))
+    }
+
+    /// 兼容性 section 的 footer 结论（用户看得懂下一步怎么办）
+    private var compatibilityFooter: String {
+        if validProfiles.isEmpty {
+            return "还没有可用描述文件：可以先保存（签名时会再次校验），或先到「证书」页导入描述文件。"
         }
-        return "\(profile.name)：\(profile.bundleID)"
+        let defaultCompatible = appState.selectedProfile.map { selected in
+            selected.status == .valid && compatibleProfiles.contains(where: { $0.id == selected.id })
+        } ?? false
+        if compatibleProfiles.isEmpty {
+            return "当前所有描述文件都无法接受这个 Bundle ID（多见于「每应用精确绑定」描述文件）。想改名需要通配描述文件（application-identifier 以 * 结尾）：可在「签名选项」中改选描述文件，或向证书供应商申请。"
+        }
+        if defaultCompatible {
+            return "默认描述文件兼容，可直接一键签名。"
+        }
+        return "默认描述文件不与改后的 ID 兼容：一键签名时会自动改选兼容的描述文件，也可在「签名选项」中手动选择。"
     }
 
     var body: some View {
@@ -649,24 +707,53 @@ struct BundleIDEditorView: View {
                 } header: {
                     Text("新的 Bundle ID")
                 } footer: {
-                    Text("仅修改本机记录；包内 Bundle ID 在下次点击「开始签名」时被重写（主程序与扩展一并修改）。")
+                    Text("仅修改本机记录；包内 Bundle ID 在下次点击「开始签名」时被重写（主程序与扩展一并修改）。原值：\(app.bundleID.isEmpty ? "未知" : app.bundleID)")
                 }
 
-                Section {
-                    Text(profileAppIDDescription)
-                        .font(.subheadline)
-                } header: {
-                    Text("签名将使用的描述文件")
-                } footer: {
-                    Text("通配描述文件允许通配段开头的任意 Bundle ID；精确描述文件只能还原为原值。与描述文件不匹配的包会被 iOS 安装层拒绝。")
-                }
-
-                if let error = draftError {
+                if let formatError {
                     Section {
-                        Label(error, systemImage: "exclamationmark.triangle.fill")
+                        Label(formatError, systemImage: "exclamationmark.triangle.fill")
                             .font(.subheadline)
                             .foregroundColor(.red)
                     }
+                }
+
+                Section {
+                    ForEach(displayProfileRows) { row in
+                        HStack(spacing: 10) {
+                            Image(systemName: row.compatible ? "checkmark.circle.fill" : "xmark.circle.fill")
+                                .font(.subheadline)
+                                .foregroundColor(row.compatible ? .green : .red)
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text(row.profile.name)
+                                    .font(.subheadline)
+                                    .lineLimit(1)
+                                Text(row.profile.bundleID.isEmpty ? "未知 AppID" : row.profile.bundleID)
+                                    .font(.caption2)
+                                    .foregroundColor(.secondary)
+                                    .lineLimit(1)
+                                    .truncationMode(.middle)
+                            }
+                            Spacer()
+                            if row.profile.id == appState.selectedProfile?.id {
+                                Text("默认")
+                                    .font(.caption2.weight(.semibold))
+                                    .foregroundColor(.accentColor)
+                                    .padding(.horizontal, 6)
+                                    .padding(.vertical, 2)
+                                    .background(Capsule().fill(Color.accentColor.opacity(0.15)))
+                            }
+                        }
+                    }
+                    if validProfiles.count > displayProfileRows.count {
+                        Text("…共 \(validProfiles.count) 条有效描述文件，其中 \(compatibleProfiles.count) 条兼容（仅展示前 6 条）")
+                            .font(.caption2)
+                            .foregroundColor(.secondary)
+                    }
+                } header: {
+                    Text("描述文件兼容性（哪个名字能签成）")
+                } footer: {
+                    Text(compatibilityFooter)
                 }
             }
             .navigationTitle("修改 Bundle ID")
@@ -681,7 +768,7 @@ struct BundleIDEditorView: View {
                     Button("保存") {
                         save()
                     }
-                    .disabled(trimmedDraft.isEmpty || draftError != nil)
+                    .disabled(!canSave)
                 }
             }
             .alert("保存失败", isPresented: Binding(
