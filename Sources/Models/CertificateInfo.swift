@@ -31,6 +31,16 @@ struct CertificateInfo: Identifiable, Codable, Hashable {
         }
     }
 
+    /// 证书身份指纹：Team ID + 证书 CN + 生效/到期时间。
+    /// 同一张证书重新打包后（p12 换密码/重新加密 → 文件字节变化 →
+    /// keychainIdentifier 变化）这四个字段不变，用它去重可避免"每重新导入
+    /// 一次就多一条重复记录"。字段缺失时返回 nil（退回按 Keychain 标识去重）。
+    var identityKey: String? {
+        let cn = commonName.isEmpty ? name : commonName
+        guard !cn.isEmpty, let start = startDate, let expire = expireDate else { return nil }
+        return "\(teamID)|\(cn)|\(Int(start.timeIntervalSince1970))|\(Int(expire.timeIntervalSince1970))"
+    }
+
     /// 缓存的日期格式化器：避免每次访问都重新创建 DateFormatter（创建开销约数毫秒），
     /// 与 Logger.cachedTimestampFormatter 同模式，全局复用。
     private static let cachedDateFormatter: DateFormatter = {

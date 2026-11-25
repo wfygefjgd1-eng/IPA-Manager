@@ -390,6 +390,9 @@ struct AppDetailView: View {
     /// 校验、无改写兜底、不自动换 profile（与自动模式同源，名字由用户全权
     /// 决定；描述文件本身就是用户在「签名选项」里指定的）。
     private func startSigningWithDefaults() {
+        // 一键签名前校正默认组合：过期/被删除/Team 不匹配时自动切到最新有效项，
+        // 避免用户被退回“签名选项”面板手动挑选（旧证书续期后的常见卡点）。
+        _ = appState.ensureValidSigningDefaults(notify: true)
         guard let cert = appState.selectedCertificate, cert.status == .valid,
               let profile = appState.selectedProfile, profile.status == .valid,
               appState.certificates.contains(where: { $0.id == cert.id }),

@@ -1009,6 +1009,9 @@ final class AppState: ObservableObject {
         guard autoSignAndInstallEnabled() else { return false }
         // 拒绝对已签名应用重复自动签名（用户重签走手动流程）
         guard !app.isSigned else { return false }
+        // 签名前校正默认组合：默认证书/描述文件过期、被删除或 Team 不匹配时，
+        // 自动切到最新的有效项。续期导入新证书后不必先删除旧证书。
+        _ = ensureValidSigningDefaults(notify: true)
         // 冷却期：同一应用刚自动签过（时间错开的重复投递/重复导入）不再签第二次。
         // 跳过必须可见：静默跳过在用户视角就是"一条龙失效"
         if !app.bundleID.isEmpty,
@@ -1066,6 +1069,8 @@ final class AppState: ObservableObject {
         // 出队时复验（与 enqueue 的校验对齐）：批量签名期间用户可能删除默认
         // 证书/描述文件（Keychain 私钥一并删除）、换成其它 Team 的组合、或关闭
         // 自动签名开关——用失效组合继续签会产出无法安装的包，直接放弃该项推进。
+        // 先校正一次：批量期间默认项恰好过期/被替换时自动接管，而不是整批跳过。
+        _ = ensureValidSigningDefaults()
         guard autoSignAndInstallEnabled(),
               let cert = selectedCertificate, cert.status == .valid,
               certificates.contains(where: { $0.id == cert.id }),
@@ -1849,13 +1854,12 @@ final class AppState: ObservableObject {
         // 既要后台执行（残留可能数 GB，主线程同步删会卡启动），又要保证在
         // 首次已签应用扫描之后跑（清扫期间引用列表才完整，不会误删解析中的目录）。
 
-        // 选中项不持久化，恢复后必须重新挑选，避免首页显示“未选择证书”
-        if selectedCertificate == nil {
-            selectedCertificate = certificates.first { $0.status == .valid } ?? certificates.first
-        }
-        if selectedProfile == nil {
-            selectedProfile = profiles.first { $0.status == .valid } ?? profiles.first
-        }
+        // 选中项不持久化，恢复后必须重新挑选：优先“最新签发”的有效证书/描述文件。
+        // 不能简单取 first(valid)——数组按导入顺序排列，续期换证后旧证书可能仍
+        // 未到期（甚至已被苹果吊销但本地状态看不出来），继续占着默认位会签出
+        // iOS 拒绝安装的包（“无法验证其完整性”）。旧实现只在 nil 时取第一个有效项，
+        // 且证书页被改成纯展示后用户无法手动改默认——这正是“删掉证书重导才好”的根源。
+        _ = ensureValidSigningDefaults()
 
         // 启动清扫证书导入残留：上次会话若在"托管 P12 副本已复制、证书导入未完成"
         // 的窗口被杀/崩溃，明文 cert-*.p12（含私钥材料，文件共享可导出）与
@@ -2185,24 +2189,193 @@ final class AppState: ObservableObject {
         store.saveImportedApps(importedApps)
     }
 
+    // MARK: - 默认证书 / 描述文件选择
+
+    /// 最新签发的有效证书（notBefore 最晚；同刻取到期更晚者），可限定 Team。
+    /// 续期后新旧证书会同时存在：必须优先新证书——旧证书即便还没到期也可能
+    /// 已被苹果吊销，本地状态看不出来，继续用它签名会产出 iOS 拒绝安装的包。
+    private func bestValidCertificate(preferredTeamID: String? = nil) -> CertificateInfo? {
+        var candidates = certificates.filter { $0.status == .valid }
+        if let team = preferredTeamID, !team.isEmpty {
+            let matched = candidates.filter { $0.teamID == team }
+            if !matched.isEmpty { candidates = matched }
+        }
+        return candidates.max { lhs, rhs in
+            let l = lhs.startDate ?? .distantPast
+            let r = rhs.startDate ?? .distantPast
+            if l != r { return l < r }
+            return (lhs.expireDate ?? .distantPast) < (rhs.expireDate ?? .distantPast)
+        }
+    }
+
+    /// 最新的有效描述文件（创建时间最晚；缺失时按到期时间），优先同 Team。
+    private func bestValidProfile(preferredTeamID: String? = nil) -> ProvisioningInfo? {
+        var candidates = profiles.filter { $0.status == .valid }
+        if let team = preferredTeamID, !team.isEmpty {
+            let matched = candidates.filter { $0.teamID == team }
+            if !matched.isEmpty { candidates = matched }
+        }
+        return candidates.max { lhs, rhs in
+            let l = lhs.createdAt ?? lhs.expireDate ?? .distantPast
+            let r = rhs.createdAt ?? rhs.expireDate ?? .distantPast
+            if l != r { return l < r }
+            return (lhs.expireDate ?? .distantPast) < (rhs.expireDate ?? .distantPast)
+        }
+    }
+
+    /// 描述文件创建时间早于证书签发时间 → 该描述文件内嵌的 DeveloperCertificates
+    /// 不可能包含这张新证书（zsign 在只拿到私钥时会用描述文件里的证书签名）。
+    /// 任一字段缺失或 Team 不同则返回 false，避免误换用户有意选择的描述文件。
+    private func profilePredatesCertificate(_ profile: ProvisioningInfo?, certificate: CertificateInfo?) -> Bool {
+        guard let profile, let certificate,
+              !certificate.teamID.isEmpty,
+              !profile.teamID.isEmpty,
+              certificate.teamID == profile.teamID,
+              let certStart = certificate.startDate,
+              let created = profile.createdAt else { return false }
+        return created < certStart
+    }
+
+    /// 校正默认证书/描述文件：当前选择已过期、已被删除，或与另一项 Team 不一致时，
+    /// 自动切到最新的有效项。返回默认组合是否可用。
+    ///
+    /// 背景：选中项不持久化，但一次会话内导入续期证书/描述文件时旧选择会一直
+    /// 占着默认位——旧证书即使仍显示“有效”也可能已被苹果吊销（本地无法离线
+    /// 判定），继续用它签名就是“安装时提示无法验证其完整性”。旧实现只能靠
+    /// 删除旧证书触发重选，这正是用户“删掉重导才好”的根源。
+    /// - Parameter notify: 发生自动切换时是否 toast 告知（签名入口传 true，启动静默）。
+    @discardableResult
+    func ensureValidSigningDefaults(notify: Bool = false) -> Bool {
+        // @Published 状态只在主线程改；后台调用方（导入/下载回调）同步切主。
+        if !Thread.isMainThread {
+            var usable = false
+            DispatchQueue.main.sync { usable = self.ensureValidSigningDefaults(notify: notify) }
+            return usable
+        }
+
+        var messages: [String] = []
+
+        let selectedCertExists = selectedCertificate.map { selected in
+            certificates.contains(where: { $0.id == selected.id })
+        } ?? false
+        if selectedCertificate == nil || selectedCertificate?.status != .valid || !selectedCertExists {
+            if let best = bestValidCertificate() {
+                if let old = selectedCertificate, old.id != best.id {
+                    messages.append("默认证书「\(old.name)」已失效，已自动改用「\(best.name)」")
+                }
+                selectedCertificate = best
+            }
+        }
+
+        let selectedProfileExists = selectedProfile.map { selected in
+            profiles.contains(where: { $0.id == selected.id })
+        } ?? false
+        let teamMismatch: Bool = {
+            guard let certTeam = selectedCertificate?.teamID, !certTeam.isEmpty,
+                  let profileTeam = selectedProfile?.teamID, !profileTeam.isEmpty else { return false }
+            return certTeam != profileTeam
+        }()
+        let profileStale = profilePredatesCertificate(selectedProfile, certificate: selectedCertificate)
+        if selectedProfile == nil || selectedProfile?.status != .valid || !selectedProfileExists || teamMismatch || profileStale {
+            if let best = bestValidProfile(preferredTeamID: selectedCertificate?.teamID) {
+                if let old = selectedProfile, old.id != best.id {
+                    messages.append("默认描述文件「\(old.name)」已失效、不匹配或未包含当前证书，已自动改用「\(best.name)」")
+                }
+                selectedProfile = best
+            }
+        }
+
+        if notify, !messages.isEmpty {
+            showToast(messages.joined(separator: "；"))
+        }
+        return selectedCertificate?.status == .valid && selectedProfile?.status == .valid
+    }
+
+    /// 用户手动设置默认证书（证书页点按）：仅有效证书可设；同时把默认描述文件
+    /// 校正到同 Team 的最新有效项，避免“新证书 + 旧 Team 描述文件”组合。
+    func selectDefaultCertificate(_ certificate: CertificateInfo) {
+        guard certificate.status == .valid else { return }
+        selectedCertificate = certificate
+        let team = certificate.teamID
+        if !team.isEmpty {
+            if selectedProfile?.status != .valid || selectedProfile?.teamID != team {
+                if let matched = bestValidProfile(preferredTeamID: team) {
+                    selectedProfile = matched
+                }
+            }
+        } else if selectedProfile?.status != .valid {
+            selectedProfile = bestValidProfile()
+        }
+    }
+
+    /// 用户手动设置默认描述文件（证书页点按）：仅有效描述文件可设；默认证书
+    /// 与它 Team 不一致时自动换到同 Team 的最新有效证书。
+    func selectDefaultProfile(_ profile: ProvisioningInfo) {
+        guard profile.status == .valid else { return }
+        selectedProfile = profile
+        if let cert = selectedCertificate, cert.status == .valid,
+           !profile.teamID.isEmpty, !cert.teamID.isEmpty,
+           cert.teamID != profile.teamID,
+           let matched = bestValidCertificate(preferredTeamID: profile.teamID) {
+            selectedCertificate = matched
+        }
+    }
+
     func addCertificate(_ certificate: CertificateInfo) {
         // 同一证书（同一 keychainIdentifier）重复导入时更新既有记录而非追加：
         // 两条记录指向同一 Keychain 条目时，删除其中一条会把另一条的私钥与密码
         // 一并删除（deleteCertificate 按共享 identifier 清理），另一条沦为死记录，
         // 选中它签名时报"未找到私钥数据"且用户无从理解。
+        var replaced: CertificateInfo?
         if let identifier = certificate.keychainIdentifier,
            let index = certificates.firstIndex(where: { $0.keychainIdentifier == identifier }) {
-            let replacedID = certificates[index].id
+            replaced = certificates[index]
             certificates[index] = certificate
-            // 被替换的记录若是当前默认选中项，把选中项同步指向新记录
-            if selectedCertificate?.id == replacedID {
-                selectedCertificate = certificate
-            }
+        } else if let identity = certificate.identityKey,
+                  let index = certificates.firstIndex(where: { $0.identityKey == identity }) {
+            // 同一张证书重新打包（p12 换密码/重新加密 → 文件字节变化 →
+            // keychainIdentifier 变化）：按证书身份合并，避免每重新导入一次就
+            // 多一条重复记录、旧记录还占着默认位。
+            replaced = certificates[index]
+            certificates[index] = certificate
         } else {
             certificates.append(certificate)
-            if selectedCertificate == nil {
-                selectedCertificate = certificates.first { $0.status == .valid } ?? certificate
+        }
+
+        // 被替换的旧记录若指向不同的 Keychain 条目，一并清理（ID 相同说明新条目
+        // 已覆盖，绝不能删，否则会把刚写入的私钥/密码删掉）。
+        if let old = replaced, old.keychainIdentifier != certificate.keychainIdentifier {
+            CertificateManager.shared.deleteCertificate(old)
+        }
+
+        // 新导入的有效证书在“当前默认缺失/失效”或“签发时间不早于当前默认”时接管：
+        // 续期换证后无需先删除旧证书；重导一张更旧的备份证书则不会顶掉新证书。
+        // 旧证书即使状态仍显示“有效”也可能已被苹果吊销（本地无法离线判定），
+        // 继续用它签名会产出 iOS 拒绝安装的包（“无法验证其完整性”）。
+        if certificate.status == .valid {
+            let isSelectedRecord = replaced.map { selectedCertificate?.id == $0.id } ?? false
+            let isNewer = (certificate.startDate ?? .distantPast)
+                >= (selectedCertificate?.startDate ?? .distantPast)
+            if isSelectedRecord || selectedCertificate == nil
+                || selectedCertificate?.status != .valid || isNewer {
+                selectedCertificate = certificate
             }
+            // 证书包导入时描述文件先落库：这里把同 Team 的最新有效描述文件选为
+            // 默认，避免证书换了、描述文件还是旧的（Team 不匹配/已过期）。
+            let team = certificate.teamID
+            if !team.isEmpty,
+               selectedProfile?.status != .valid
+                || selectedProfile?.teamID != team
+                || profilePredatesCertificate(selectedProfile, certificate: certificate) {
+                if let matched = bestValidProfile(preferredTeamID: team) {
+                    selectedProfile = matched
+                }
+            }
+        } else if let replacedID = replaced?.id, selectedCertificate?.id == replacedID {
+            // 被替换的记录是当前默认项：同步指向新记录（即使它已过期）
+            selectedCertificate = certificate
+        } else if selectedCertificate == nil {
+            selectedCertificate = bestValidCertificate() ?? certificate
         }
         saveState()
     }
@@ -2210,10 +2383,12 @@ final class AppState: ObservableObject {
     func removeCertificate(_ certificate: CertificateInfo) {
         certificates.removeAll { $0.id == certificate.id }
         if selectedCertificate?.id == certificate.id {
-            selectedCertificate = certificates.first { $0.status == .valid }
+            selectedCertificate = nil
         }
         // 同步清理 Keychain 中的私钥与密码条目，避免删除后残留
         CertificateManager.shared.deleteCertificate(certificate)
+        // 删除默认证书后立即重选最新有效项（并校正 Team 不匹配的描述文件）
+        _ = ensureValidSigningDefaults()
         saveState()
     }
 
@@ -2229,9 +2404,31 @@ final class AppState: ObservableObject {
             }
         } else {
             profiles.append(profile)
-            if selectedProfile == nil {
-                selectedProfile = profiles.first { $0.status == .valid } ?? profile
+        }
+
+        // 默认描述文件校正：新导入的有效描述文件在“当前默认缺失/失效/Team 与默认
+        // 证书不一致”或“同 Team 且更新（创建时间更晚；缺失时比有效期）”时接管。
+        // 续期证书包导入后不再需要手动删除旧描述文件。
+        // 注意不能只看 expireDate：补发的描述文件有效期可能反而更短，但它内嵌的
+        // DeveloperCertificates 才是 zsign 实际使用的签名证书，必须让新文件接管。
+        if profile.status == .valid {
+            let certTeam = selectedCertificate?.teamID ?? ""
+            let sameTeam = certTeam.isEmpty || profile.teamID.isEmpty || profile.teamID == certTeam
+            let currentCreated = selectedProfile?.createdAt ?? .distantPast
+            let newCreated = profile.createdAt ?? .distantPast
+            let currentExpiry = selectedProfile?.expireDate ?? .distantPast
+            let newExpiry = profile.expireDate ?? .distantPast
+            let isFresher = newCreated > currentCreated
+                || (newCreated == currentCreated && newExpiry > currentExpiry)
+            let needsRepair = selectedProfile == nil
+                || selectedProfile?.status != .valid
+                || (!certTeam.isEmpty && selectedProfile?.teamID != certTeam)
+                || isFresher
+            if sameTeam && needsRepair {
+                selectedProfile = profile
             }
+        } else if selectedProfile == nil {
+            selectedProfile = bestValidProfile() ?? profile
         }
         saveState()
     }
@@ -2239,8 +2436,9 @@ final class AppState: ObservableObject {
     func removeProfile(_ profile: ProvisioningInfo) {
         profiles.removeAll { $0.id == profile.id }
         if selectedProfile?.id == profile.id {
-            selectedProfile = profiles.first { $0.status == .valid }
+            selectedProfile = nil
         }
+        _ = ensureValidSigningDefaults()
         saveState()
     }
 

@@ -121,7 +121,7 @@ struct CertificatesView: View {
                 }
             }
         } header: {
-            sectionHeader(icon: "key.fill", title: "企业证书")
+            sectionHeader(icon: "key.fill", title: "企业证书", hint: "点按设为默认")
         }
     }
 
@@ -157,7 +157,7 @@ struct CertificatesView: View {
                 }
             }
         } header: {
-            sectionHeader(icon: "doc.badge.gearshape", title: "描述文件")
+            sectionHeader(icon: "doc.badge.gearshape", title: "描述文件", hint: "点按设为默认")
         }
     }
 
@@ -204,7 +204,7 @@ struct CertificatesView: View {
     }
 
     /// Section 标题：左侧小图标 + 文字，与卡片化布局呼应，不再光秃秃一行字
-    private func sectionHeader(icon: String, title: String) -> some View {
+    private func sectionHeader(icon: String, title: String, hint: String? = nil) -> some View {
         HStack(spacing: 6) {
             Image(systemName: icon)
                 .font(.caption)
@@ -212,6 +212,12 @@ struct CertificatesView: View {
             Text(title)
                 .font(.subheadline.weight(.semibold))
                 .foregroundColor(.secondary)
+            if let hint {
+                Spacer()
+                Text(hint)
+                    .font(.caption2)
+                    .foregroundColor(.secondary.opacity(0.7))
+            }
         }
         .textCase(nil)
         .padding(.vertical, 2)
@@ -323,7 +329,19 @@ struct CertificatesView: View {
                 Spacer(minLength: 4)
             }
         }
-        // 纯展示卡片：不设点击手势，证书页供查看，不承担默认选择等交互
+        // 点按设为默认证书：续期换证后用户无需先删除旧证书。旧实现是纯展示卡片，
+        // 自动签名却提示“请先在证书页设置默认证书”——提示指向一个不存在的操作，
+        // 用户只能靠“删掉旧证书重导”绕路（正是“无法验证其完整性”的现场）。
+        .contentShape(Rectangle())
+        .onTapGesture {
+            guard certificate.status == .valid else {
+                appState.showToast("「\(certificate.name)」已过期，无法设为默认证书")
+                return
+            }
+            guard appState.selectedCertificate?.id != certificate.id else { return }
+            appState.selectDefaultCertificate(certificate)
+            appState.showToast("已设为默认证书：\(certificate.name)")
+        }
     }
 
     private func profileRow(_ profile: ProvisioningInfo) -> some View {
@@ -383,7 +401,18 @@ struct CertificatesView: View {
                 Spacer(minLength: 4)
             }
         }
-        // 纯展示卡片：不设点击手势，证书页供查看，不承担默认选择等交互
+        // 点按设为默认描述文件（仅有效项）；Team 与默认证书不一致时
+        // selectDefaultProfile 会自动换到同 Team 的最新有效证书。
+        .contentShape(Rectangle())
+        .onTapGesture {
+            guard profile.status == .valid else {
+                appState.showToast("「\(profile.name)」已过期，无法设为默认描述文件")
+                return
+            }
+            guard appState.selectedProfile?.uuid != profile.uuid else { return }
+            appState.selectDefaultProfile(profile)
+            appState.showToast("已设为默认描述文件：\(profile.name)")
+        }
     }
 
     /// 有效期范围文案："yyyy-MM-dd ~ yyyy-MM-dd"，缺失端显示"未知"。
