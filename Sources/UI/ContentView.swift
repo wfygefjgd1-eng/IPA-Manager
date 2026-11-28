@@ -204,19 +204,23 @@ private struct PipelineProgressCard: View {
             .frame(height: 5)
             .animation(.linear(duration: 0.2), value: display.overall)
 
-            // 第三行：步骤指示器（左）+ 已用时间（右，0.1s 精度随弹窗一起消失）
+            // 第三行：步骤指示器（左）+ 已用时间（右，0.1s 精度随弹窗一起消失）。
+            // 整行再让出 6pt：底行两端正落在胶囊圆弧收得最窄的位置，左下角步骤
+            // 指示器右移一点点不再贴着药丸左端，右下角时间胶囊的底角也离开圆弧
+            // （此前距胶囊边只剩约 2pt，视觉上像要溢出）。
             HStack(spacing: 6) {
                 stepIndicator
                 Spacer(minLength: 8)
                 TimelineView(.periodic(from: .now, by: 0.1)) { context in
                     Text(elapsedText(at: context.date))
-                        .font(.caption2.weight(.medium).monospacedDigit())
-                        .foregroundColor(.white.opacity(0.9))
-                        .padding(.horizontal, 8)
+                        .font(.system(.caption, design: .rounded).weight(.semibold).monospacedDigit())
+                        .foregroundColor(.white.opacity(0.92))
+                        .padding(.horizontal, 9)
                         .padding(.vertical, 3)
                         .background(Capsule().fill(Color.white.opacity(0.14)))
                 }
             }
+            .padding(.horizontal, 6)
         }
         .padding(.horizontal, 20)
         .padding(.vertical, 13)
@@ -241,7 +245,7 @@ private struct PipelineProgressCard: View {
                 )
                 .rotationEffect(.degrees(-90))
             Text("\(Int((display.overall * 100).rounded()))%")
-                .font(.system(size: 11, weight: .bold))
+                .font(.system(size: 11, weight: .bold, design: .rounded))
                 .monospacedDigit()
                 .foregroundColor(.white)
         }
@@ -301,7 +305,7 @@ private struct PipelineProgressCard: View {
                 }
             }
             Text(label)
-                .font(.caption2)
+                .font(.system(.caption2, design: .rounded).weight(.medium))
                 .foregroundColor(.white.opacity(state == .pending ? 0.45 : 0.9))
         }
     }

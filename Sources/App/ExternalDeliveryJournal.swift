@@ -141,7 +141,7 @@ enum ExternalDeliveryJournal {
         return lines.joined(separator: "\n")
     }
 
-    /// 获取当前所有投递日志条目（按时间正序，供 UI 实时展示）
+    /// 获取当前所有投递日志条目（按时间正序；供摘要查询与诊断报告使用）
     static func getEntries() -> [Entry] {
         lock.lock()
         defer { lock.unlock() }

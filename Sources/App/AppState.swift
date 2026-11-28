@@ -65,18 +65,9 @@ final class AppState: ObservableObject {
     private var autoSignQueue: [AppInfo] = []
     private var isAutoSigning = false
     
-    /// 分享投递实时日志（供 ContentView 底部面板展示）：每条事件含时间戳与事件描述，
-    /// 用户分享文件到 App 后能实时看到投递链路发生了什么（扫描结果/保存成功/失败原因）。
-    @Published var deliveryLogEntries: [ExternalDeliveryJournal.Entry] = []
-    /// 日志面板展开状态（默认折叠）
-    @Published var showDeliveryLog: Bool = false
-
-    /// 投递日志变更后同步 UI 快照（清空/手动扫描等入口调用）
-    func refreshDeliveryLogEntries() {
-        DispatchQueue.main.async {
-            self.deliveryLogEntries = ExternalDeliveryJournal.getEntries()
-        }
-    }
+    /// 分享投递日志不再提供 UI 查看页（v1.0.213 移除「查看分享投递日志」入口）：
+    /// 记录本身保留（ExternalDeliveryJournal，持久化跨启动），内容经设置页
+    /// 「收集全部错误并导出」的诊断报告输出。
 
     /// 在任意线程设置全局轻提示（内部切回主线程并安排自动清除；重复设置会重置计时）。
     func showToast(_ message: String) {
@@ -1435,10 +1426,6 @@ final class AppState: ObservableObject {
         // 跨进程可见性：吞入扩展进程写入共享容器的新增日志行（扩展与主 App 是两个
         // 进程，主 App 的投递日志天然看不到扩展）。
         ingestExtensionLogsIfNeeded()
-        // 实时同步投递日志到 UI
-        DispatchQueue.main.async {
-            self.deliveryLogEntries = ExternalDeliveryJournal.getEntries()
-        }
     }
 
     /// 吞入共享容器中的扩展日志新增行：扩展每次被分享面板唤起都会先写"扩展启动"，
