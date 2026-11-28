@@ -13,6 +13,12 @@ final class DownloadManager: NSObject {
     private var tasks: [UUID: URLSessionDownloadTask] = [:]
     private var taskModels: [UUID: DownloadTask] = [:]
     private let store = UserDefaultsStore()
+    /// 任务持久化专用串行队列：JSON 编码整表（暂停任务带数百 KB base64 resumeData）
+    /// 旧版在主线程同步执行，每 5 秒进度节流都会重编全部任务，长下载期间主线程
+    /// 周期性卡顿。快照在主线程取，编码+写入移到本队列（串行保证写入顺序与调用
+    /// 顺序一致，崩溃恢复语义不变；UserDefaults 线程安全）。启动恢复只读一次，
+    /// 会话内无"写后立即读"的路径，异步落盘无竞态。
+    private let persistQueue = DispatchQueue(label: "ipamanager.download.persist", qos: .utility)
 
     /// 同一任务自动重试的次数上限：校验失败（HTML 错误页 / 截断）时最多自动重下 1 次，避免死循环。
     /// 重试计数持久化在 DownloadTask.retryCount（跨会话累计，超 24 小时自动重置）。
@@ -555,7 +561,12 @@ final class DownloadManager: NSObject {
     }
 
     private func persistTasks() {
-        store.saveDownloadTasks(Array(taskModels.values))
+        // 主线程仅做快照（taskModels 线程约定见类头）；编码与写入异步落盘，
+        // 详见 persistQueue 注释。
+        let snapshot = Array(taskModels.values)
+        persistQueue.async { [store] in
+            store.saveDownloadTasks(snapshot)
+        }
     }
 }
 
@@ -599,35 +610,12 @@ extension DownloadManager: URLSessionDownloadDelegate {
                 && totalBytesWritten >= model.receivedBytes
             if !(remainingSemantics || fullTotalSemantics) {
                 Logger.warning("续传内容与原文件不一致（偏移 \(model.receivedBytes) + 期望 \(totalBytesExpectedToWrite) ≠ 原总大小 \(model.totalBytes)），放弃断点整包重下: \(model.fileName)")
+                // 与 retryDownload 同一套重下序列（旧版此处内联一份逐字段相同的
+                // 拷贝，两处脆弱的崩溃恢复语义会各自漂移）：先取消移除旧任务，
+                // 旧任务残留回调由 didCompleteWithError 的身份守卫忽略。
                 tasks[id]?.cancel()
                 tasks.removeValue(forKey: id)
-                pausingTaskIDs.remove(id)
-                resumeRequestedTaskIDs.remove(id)
-                var retrying = model
-                retrying.retryCount = effectiveRetryCount(for: model) + 1
-                retrying.lastRetryDate = Date()
-                retrying.status = .downloading
-                retrying.error = nil
-                retrying.receivedBytes = 0
-                retrying.totalBytes = 0
-                retrying.resumeData = nil
-                sizePersistedTasks.remove(id)
-                if let url = URL(string: retrying.url) {
-                    let sessionTask = session.downloadTask(with: url)
-                    sessionTask.taskDescription = id.uuidString
-                    taskModels[id] = retrying
-                    tasks[id] = sessionTask
-                    sessionTask.resume()
-                    persistTasks()
-                } else {
-                    // 防御：URL 失效（URLSession 存续期间基本不可达）时按失败收尾，
-                    // 绝不留下"无 sessionTask 却显示下载中"的僵尸任务（永远卡在 0%）
-                    retrying.status = .failed
-                    retrying.error = "无效 URL"
-                    tasks.removeValue(forKey: id)
-                    taskModels[id] = retrying
-                    persistTasks()
-                }
+                retryDownload(id: id, model: model)
                 return
             }
         }

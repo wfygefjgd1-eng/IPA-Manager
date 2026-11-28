@@ -22,7 +22,9 @@ struct HomeView: View {
     ///（解析必然失败，旧实现弹"导入失败"，而证书页选择器此前又选不了文件，
     /// 形成死循环）。mobileprovision 无需密码，直接导入不经过本密码框。
     @State private var showCertPasswordSheet = false
-    @State private var pendingCertURL: URL?
+    /// 待弹密码框的证书队列（多选一次选入多个 p12/pfx 时逐个弹，全部导入；
+    /// 旧版单槽位在 forEach 里被后一个覆盖，前面的证书无声丢失）
+    @State private var pendingCertURLs: [URL] = []
 
     var body: some View {
         NavigationStack {
@@ -126,12 +128,22 @@ struct HomeView: View {
             // 证书密码框：p12/pfx 在首页直接导入。延迟呈现——本 sheet 的触发点在
             // 文件选择器的回调里（此时选择器 sheet 正在 dismiss），"边 dismiss 边
             // present"会被 UIKit 间歇性丢弃（与 CertificatesView 同源问题），
-            // 延迟越过 dismiss 动画后状态仍在（pendingCertURL 非 nil）才呈现。
+            // 延迟越过 dismiss 动画后队列仍有待导证书才呈现。
+            // 队列链式弹出：一张密码框关闭（导入或取消）后出队一张；队列里还有
+            // 证书时同样延迟重弹（密码框→密码框的"边 dismiss 边 present"同理会丢）。
             .sheet(isPresented: $showCertPasswordSheet, onDismiss: {
-                pendingCertURL = nil
+                guard !pendingCertURLs.isEmpty else { return }
+                pendingCertURLs.removeFirst()
+                if !pendingCertURLs.isEmpty {
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) {
+                        if !pendingCertURLs.isEmpty {
+                            showCertPasswordSheet = true
+                        }
+                    }
+                }
             }) {
                 PasswordPromptView(
-                    importURL: pendingCertURL,
+                    importURL: pendingCertURLs.first,
                     onImport: { cert in
                         appState.addCertificate(cert)
                         appState.showToast("证书已导入: \(cert.name.isEmpty ? "未命名证书" : cert.name)")
@@ -312,12 +324,14 @@ struct HomeView: View {
         // 用户感知"导入不进去"）。分流后不打断应用文件的串行批次链。
         switch url.pathExtension.lowercased() {
         case "p12", "pfx":
-            // 需要密码：登记待导入 URL，延迟弹本页密码框。触发点在文件选择器回调
+            // 需要密码：入队待导 URL，延迟弹本页密码框。触发点在文件选择器回调
             // 里（选择器 sheet 正在 dismiss），"边 dismiss 边 present"会被 UIKit
-            // 间歇性丢弃（CertificatesView 同源问题），延迟越过 dismiss 动画再呈现
-            pendingCertURL = url
+            // 间歇性丢弃（CertificatesView 同源问题），延迟越过 dismiss 动画再呈现。
+            // 多选多个证书时全部入队，由 onDismiss 链式逐个弹出（旧版单槽位被
+            // forEach 后一个覆盖，前面的证书无声丢失）。
+            pendingCertURLs.append(url)
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) {
-                if pendingCertURL != nil {
+                if !pendingCertURLs.isEmpty, !showCertPasswordSheet {
                     showCertPasswordSheet = true
                 }
             }

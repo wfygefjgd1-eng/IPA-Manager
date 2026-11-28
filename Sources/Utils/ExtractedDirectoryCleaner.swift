@@ -3,9 +3,9 @@ import Foundation
 /// Consolidates all Extracted / bundle-extract cleanup logic previously duplicated
 /// across `AppState` and `CertificatesView`.
 ///
-/// Entries: `cleanup(matching:)` (per-app extract dirs), `sweepBundleExtractDirs()`
-/// (certificate bundle fallback) and `sweepOrphanExtractDirs(importedApps:installedApps:)`
-/// (startup orphan sweep), all operating on `Documents/Extracted` by default.
+/// Entries: `sweepBundleExtractDirs()` (certificate bundle fallback) and
+/// `sweepOrphanExtractDirs(importedApps:installedApps:)` (startup orphan sweep),
+/// all operating on `Documents/Extracted` by default.
 final class ExtractedDirectoryCleaner {
 
     // MARK: - Convenience wrappers mirroring AppState's old methods
@@ -22,23 +22,6 @@ final class ExtractedDirectoryCleaner {
             if isDirectory, entry.lastPathComponent.hasPrefix("bundle-extract-") {
                 try? AppFileManager.shared.deleteItem(at: entry)
                 Logger.info("已清理 bundle-extract 目录: \(entry.path)")
-            }
-        }
-    }
-
-    /// Delete `Documents/Extracted/<prefix>` or `<prefix>-<UUID>` directories.
-    /// Used when removing a signed/unsigned app's associated extract dirs.
-    static func cleanup(matching prefix: String) {
-        let extractedRoot = AppFileManager.shared.directoryURL(.extracted)
-        guard let entries = try? FileManager.default.contentsOfDirectory(
-            at: extractedRoot, includingPropertiesForKeys: [.isDirectoryKey]
-        ) else { return }
-        for entry in entries {
-            let isDirectory = (try? entry.resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory ?? false
-            guard isDirectory, entry.lastPathComponent != "Icons" else { continue }
-            if entry.lastPathComponent == prefix || entry.lastPathComponent.hasPrefix(prefix + "-") {
-                try? AppFileManager.shared.deleteItem(at: entry)
-                Logger.info("已清理关联解压目录: \(entry.path)")
             }
         }
     }

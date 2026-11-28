@@ -2527,12 +2527,6 @@ final class AppState: ObservableObject {
         }
     }
 
-    /// 删除 Extracted/ 下所有以指定前缀开头的解压目录（兼容旧版 <baseName> 与新版
-    /// <baseName>-<UUID> 两种命名）。已抽取到 `ExtractedDirectoryCleaner`。
-    private func cleanupExtractDirs(matching prefix: String) {
-        ExtractedDirectoryCleaner.cleanup(matching: prefix)
-    }
-
     /// 启动时孤儿清扫：删除 Extracted/ 下不被任何记录引用的解析目录
     /// （parseAppInfo 每次解压都生成 <baseName>-<UUID> 临时目录，路径会随 UUID 变化，
     /// 无法像 Icons/ 图标那样重定位，必须定期清理避免磁盘无限膨胀）。

@@ -52,7 +52,6 @@ final class UserDefaultsStore {
     /// 当前持久化 schema 版本：模型字段增删改都必须提升此版本并在此处补迁移逻辑
     private static let currentSchemaVersion = 1
 
-    private let encoder = JSONEncoder()
     private let decoder = JSONDecoder()
 
     init() {
@@ -279,7 +278,10 @@ final class UserDefaultsStore {
             return
         }
         do {
-            let data = try encoder.encode(value)
+            // 每次保存用独立 encoder：下载任务持久化已移至后台串行队列（长下载
+            // 期间主线程不再周期性编码整表），共享实例在主线程与后台并发 encode
+            // 无线程安全保证，按调用建实例消除竞态（构造开销远小于编码本身）。
+            let data = try JSONEncoder().encode(value)
             defaults.set(data, forKey: key)
             // 保存成功后清理该键的失败备份及时间戳，避免堆积
             defaults.removeObject(forKey: Keys.backupKey(for: key))

@@ -158,6 +158,18 @@ final class BackgroundAudioKeepAlive: NSObject {
                     self.scheduleAutoStop()
                 } else {
                     self.stop()
+                    // 服务器兜底：保活判定放弃安装时，本地监听器与待发 IPA 一并释放。
+                    // 前台驻留场景（关闭"自动回桌面"后用户留在 App 内不再切后台）
+                    // 没有回前台的 AppDelegate 清理点，旧版全接口明文监听会无主残留
+                    // 到下次安装/下次前后台切换。活动窗与 AppDelegate 对齐用 240s
+                    //（比音频侧的 150s 宽松，绝不错杀回前台仍会保留的安装）；判定
+                    // 期间恰有新活动则顺延一轮检查（5 分钟后重查，直到可安全释放）。
+                    // stop 幂等；其内部对保活 stop 的调用有 isActive 守卫，无递归风险。
+                    if LocalInstallServer.shared.hasRecentInstallActivity(within: 240) {
+                        self.scheduleAutoStop()
+                    } else {
+                        LocalInstallServer.shared.stop()
+                    }
                 }
             }
         }
